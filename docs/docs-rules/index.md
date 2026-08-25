@@ -1,0 +1,49 @@
+## docs-write-rules
+
+- updated_at: 2026-04-14
+- path: `docs/docs-rules/docs-write-rules.md`
+- 触发规则：写入任何 `docs/` 正式文档前都需要阅读
+- 内容摘要：docs 文件夹内正式文档编辑的统一规则
+
+## spec-write-rules
+
+- updated_at: 2026-04-14
+- path: `docs/docs-rules/spec-write-rules.md`
+- 触发规则：写入正式 `spec` 时读取
+- 内容摘要：正式 spec 写入规则，定义 spec 的筛选原则、状态、固定结构、frontmatter 和 CI 抓手。
+
+## plan-write-rules
+
+- updated_at: 2026-04-14
+- path: `docs/docs-rules/plan-write-rules.md`
+- 触发规则：写入正式 `plan` 时读取
+- 内容摘要：正式 plan 写入规则，定义 plan 的最小 frontmatter、状态、正文保留原则和模板。
+
+## architecture-write-rules
+
+- updated_at: 2026-04-14
+- path: `docs/docs-rules/architecture-write-rules.md`
+- 触发规则：写入 `docs/ARCHITECTURE.md` 时读取
+- 内容摘要：docs/ARCHITECTURE.md 的专属写作规则，约束其内容边界、必备覆盖面和更新触发条件。
+
+
+## formal-bugs-write-rules.md
+
+- updated_at: 2026-04-19
+- path: `docs\docs-rules\formal-bugs-write-rules.md`
+- 触发规则：编写入正式的`docs\history-bugs`才阅读，编写入`docs/temp/bugs`不需要阅读
+- 内容摘要：history-bugs文档的写入规则
+
+## flow-write-guide
+
+- updated_at: 2026-07-06
+- path: `docs/docs-rules/flow-write-guide.md`
+- 触发规则：编写或修改 `docs/flows/` 目录下的数据流文档时阅读
+- 内容摘要：Flow 文档编写规则，定义 Flow 对象数据结构、耦合关系、反常设计说明的写法，以及 5 类必须记录的节点判断标准
+
+## known-limitations-and-debt-rules
+
+- updated_at: 2026-07-15
+- path: `docs/docs-rules/known-limitations-and-debt-rules.md`
+- 触发规则：写入 `docs/known-limitations/`、`docs/technical-debt/`、`docs/progress/` 任一目录的文档前阅读
+- 内容摘要：定义已知限制、技术债、待办调研三类文档的判定标准、消费场景、写作视角、重叠处理规则和 progress 的生命周期
