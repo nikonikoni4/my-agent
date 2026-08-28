@@ -3,3 +3,5 @@ teach/
 .agents/
 explore/
 架构设计/
+myagent.egg-info/
+__pycache__

@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "myagent"
+version = "0.1.0"
+description = "A stable, observable, extensible agent framework for learning"
+requires-python = ">=3.12"
+authors = [
+    { name = "myagent" },
+]
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["myagent*"]
