@@ -5,3 +5,9 @@ class ToolValueError(MyAgentError):
 
 class ToolExecuteError(MyAgentError):
     pass
+
+class ToolValidateParameterError(MyAgentError):
+    pass
+
+class LLMCallError(MyAgent):
+    pass

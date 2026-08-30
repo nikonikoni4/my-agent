@@ -51,9 +51,17 @@ class Tool(ABC):
                 "parameter_name" : {
                     "type" : "array",
                     "description" : "...",
-                    "items" : { 
+                    "items" : {
                         "type": "string"
                     }
+                }
+
+                example4: 无参数工具
+                <parameters整个直接用空object，properties和required为空>
+                {
+                    "type" : "object",
+                    "properties" : {},
+                    "required" : []
                 }
             }
             "required":[...]

@@ -5,3 +5,4 @@ explore/
 架构设计/
 myagent.egg-info/
 __pycache__
+.env
