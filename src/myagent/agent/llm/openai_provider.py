@@ -3,7 +3,7 @@
 任何提供 chat.completions 兼容接口的供应商都可用，
 火山方舟只需 base_url 传入 https://ark.cn-beijing.volces.com/api/v3。
 """
-from openai import OpenAI
+from openai import AsyncOpenAI
 import openai
 from myagent.agent.core.provider import ChatParams, LLMProvider, LLMResponse, Message
 from myagent.agent.execption import LLMCallError
@@ -21,9 +21,9 @@ class OpenAIProvider(LLMProvider):
             base_url: 兼容接口地址，None 表示使用 OpenAI 官方地址
         """
         self._model = model
-        self._client = OpenAI(api_key=api_key, base_url=base_url)
+        self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
 
-    def chat(self, messages: list[Message], tools : list[dict] | None = None,params: ChatParams | None = None) -> LLMResponse:
+    async def chat(self, messages: list[Message], tools : list[dict] | None = None,params: ChatParams | None = None) -> LLMResponse:
         """发送消息列表，返回模型回复
 
         Args:
@@ -49,7 +49,7 @@ class OpenAIProvider(LLMProvider):
                     kwargs["extra_body"] = {"top_k": params.top_k}
             if tools is not None:
                 kwargs["tools"] = tools
-            completion = self._client.chat.completions.create(**kwargs)
+            completion = await self._client.chat.completions.create(**kwargs)
 
             choice = completion.choices[0]
             usage = None
@@ -76,6 +76,7 @@ class OpenAIProvider(LLMProvider):
         )
 
 if __name__ == "__main__":
+    import asyncio
     import os
     from dotenv import load_dotenv
     from myagent.agent.core.tool import Tool
@@ -112,7 +113,7 @@ if __name__ == "__main__":
     llm= OpenAIProvider("doubao-seed-1-6-flash-250828",api_key=os.getenv("ARK_API_KEY"),base_url="https://ark.cn-beijing.volces.com/api/v3")
     
     message = Message("user","请查询2026-07-12号的天气")
-    llm_response:LLMResponse= llm.chat([message],[WeatherTool().to_schema()])
+    llm_response:LLMResponse = asyncio.run(llm.chat([message],[WeatherTool().to_schema()]))
     print(llm_response.reasoning_content)
     print(llm_response.content)
     print(llm_response.tool_call_request)

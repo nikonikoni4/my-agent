@@ -7,7 +7,7 @@ from abc import ABC, abstractmethod
 import json
 from dataclasses import dataclass,field
 from typing import Any
-
+import datetime
 @dataclass
 class ToolCallRequest:
     id : str
@@ -34,13 +34,14 @@ class Message:
     Attributes:
         role: 角色，取值 system / user / assistant / tool
         content: 消息文本内容
+        timestamp : 用于保存消息时添加，llm请求时不会把这个添加到对话中
     """
     role: str
     content: str | list 
     tool_calls : list[ToolCallRequest] | None = None
     tool_call_id : str |None = None 
     reasoning_content : str | None = None 
-
+    timestamp: str = field(default_factory=lambda: datetime.datetime.now(datetime.timezone.utc).isoformat())
     def to_dict(self)->dict:
         """
         将message转化为 OpenAI wire 格式的 dict
@@ -69,6 +70,10 @@ class Message:
         if self.reasoning_content:
             d["reasoning_content"] = self.reasoning_content
         return d
+    def to_dict_with_timestamp(self)->dict:
+        d= self.to_dict()
+        d['timestamp'] = self.timestamp
+        return d
 @dataclass
 class LLMResponse:
     """一次对话调用的结果
@@ -83,7 +88,7 @@ class LLMResponse:
     """
     content: str | None
     reasoning_content : str  | None = None
-    tool_call_request : list[ToolCallRequest] = field(default_factory=list)
+    tool_call_requests : list[ToolCallRequest] = field(default_factory=list)
     finish_reason: str | None = None
     usage: dict  = field(default_factory=dict)
 
@@ -112,7 +117,7 @@ class LLMProvider(ABC):
     """LLM 调用接口，由上层注入具体实现（依赖倒置）"""
 
     @abstractmethod
-    def chat(self, messages: list[Message], params: ChatParams | None = None) -> LLMResponse:
+    async def chat(self, messages: list[Message], params: ChatParams | None = None) -> LLMResponse:
         """发送消息列表，返回模型回复
 
         Args:
