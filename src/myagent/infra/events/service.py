@@ -5,19 +5,17 @@ from typing import Any, Callable, Protocol
 from enum import Enum
 from collections import defaultdict
 import logging 
-from dataclasses import dataclass
-
+from myagent.infra.events.eventspec import EventSpec
+from myagent.infra.events.payload import Payload
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
-@dataclass
-class Payload:
-    pass
 
 
-class DispatchMode(str, Enum):
-    """消息派发类型，包含emit，waterfall"""
-    emit = "emit"
-    waterfall = "waterfall"
+
+# class DispatchMode(str, Enum):
+#     """消息派发类型，包含emit，waterfall"""
+#     emit = "emit"
+#     waterfall = "waterfall"
 
 
 
@@ -85,3 +83,11 @@ class EventService:
             logger.warning(f"waterfall 回调函数错误: {e}")
             
 
+    def trigger(self,event_spec:EventSpec,payload):
+        """
+        使用spec进行触发事件
+        """
+        if event_spec.semantics == "emit":
+            self.emit(event_spec.semantics,payload)
+        elif event_spec.semantics == "waterfall":
+            self.waterfall(event_spec.name,payload)
