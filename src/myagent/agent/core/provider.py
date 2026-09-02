@@ -81,6 +81,7 @@ class LLMResponse:
     Attributes:
         content: 模型回复的文本内容
         reasoning_content : 推理过程
+        tool_call_requests: 模型发起的工具调用请求列表，无调用时为空列表
         finish_reason: 结束原因，如 stop（正常结束）、length（达到 max_tokens）
         usage: token 用量统计，格式为
             {"prompt_tokens": int, "completion_tokens": int, "total_tokens": int}，
@@ -124,14 +125,24 @@ class LLMProvider(ABC):
 
         Args:
             messages: 完整的对话消息列表，按时间顺序排列
-            params: 采样参数，None 表示全部使用供应商默认值
+            tools: 工具 schema 列表（各工具 to_schema() 的输出），None 或空表示本次不提供工具
 
         Returns:
             LLMResponse: 模型回复及结束原因、token 用量
         """
     def parse_tool_call(self,response_message)->list[ToolCallRequest]:
+        """把 SDK 响应里的 tool_calls 解析为项目内的 ToolCallRequest 列表。
+
+        Args:
+            response_message: SDK 响应中的 choices[0].message 对象，
+                可为 None（部分供应商无工具调用时该位置为空）。
+
+        Returns:
+            ToolCallRequest 列表，arguments 已从 JSON 字符串解析为 dict；
+            无工具调用时返回 None（输入为 None）或空列表。
+        """
         if not response_message:
-            return 
+            return
         tool_call_list = []
         for tool_call in response_message.tool_calls :
             tool_call_list.append(

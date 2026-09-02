@@ -13,14 +13,14 @@ logger.setLevel(logging.INFO)
 class OpenAIProvider(LLMProvider):
     """基于 openai SDK 的实现，model 和 base_url 由调用方指定"""
 
-    def __init__(self, model: str, api_key: str, base_url: str | None = None,chat_params:ChatParams|None = None):
+    def __init__(self, model: str, api_key: str, base_url: str  ,chat_params:ChatParams|None = None):
         """
         Args:
             model: 模型名或接入点 ID（如火山方舟的 ep-xxx）
             api_key: 供应商的 API Key
             base_url: 兼容接口地址，None 表示使用 OpenAI 官方地址
         """
-        super.__init__(chat_params)
+        super().__init__(chat_params)
         self._model = model
         self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
 
@@ -62,7 +62,7 @@ class OpenAIProvider(LLMProvider):
                 }
 
             # 工具调用解析
-            tool_call_request=self.parse_tool_call(choice.message) if choice.finish_reason=='tool_calls' else None
+            tool_call_requests=self.parse_tool_call(choice.message) if choice.finish_reason=='tool_calls' else None
         except openai.APIError as e :
             logger.debug(f"llm call 错误 {e}")
             raise LLMCallError(f"llm call 错误：{e}") from e
@@ -72,7 +72,7 @@ class OpenAIProvider(LLMProvider):
             content=choice.message.content,
             reasoning_content=choice.message.reasoning_content,
             finish_reason=choice.finish_reason,
-            tool_call_request=tool_call_request,
+            tool_call_requests=tool_call_requests,
             usage=usage,
         )
 
@@ -117,5 +117,5 @@ if __name__ == "__main__":
     llm_response:LLMResponse = asyncio.run(llm.chat([message],[WeatherTool().to_schema()]))
     print(llm_response.reasoning_content)
     print(llm_response.content)
-    print(llm_response.tool_call_request)
-    print(WeatherTool().execute(**llm_response.tool_call_request[0].arguments))
+    print(llm_response.tool_call_requests)
+    print(WeatherTool().execute(**llm_response.tool_call_requests[0].arguments))
