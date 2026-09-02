@@ -1,7 +1,6 @@
 from abc import ABC,abstractmethod
 import json
 from typing import Any
-from myagent.agent.core import Tool
 from myagent.agent.execption import ToolValueError,ToolExecuteError,ToolValidateParameterError
 import logging 
 logger = logging.getLogger(__name__)
@@ -102,7 +101,7 @@ class ToolRegister:
 
     def __init__(self, ):
         """初始化一个空的工具注册表。"""
-        self._tools = {}
+        self._tools :dict[str,Tool]= {}
     
     def _validate_required_parameters(self, parameter_schemas: dict, parameters: dict):
         """校验模型传入的参数是否覆盖 schema 中声明的必填字段。
@@ -248,3 +247,12 @@ class ToolRegister:
         except Exception as e:
             logger.error(f"{tool_name}工具调用错误，参数:{kwargs}")
             raise ToolExecuteError(f"{tool_name}工具调用错误，参数:{kwargs}") from e
+
+    def to_schemas(self)->list[dict]:
+        """
+        返回已经注册的所有工具的schemas
+        """
+        schemas = []
+        for tool in self._tools.values():
+            schemas.append(tool.to_schema())
+        return schemas
