@@ -1,10 +1,15 @@
+"""会话与持久化：定义 Session 数据模型和 SessionManager 存取器。
+
+Session 只负责消息数据和元信息；落盘格式为 jsonl（第一行 meta_data，
+之后每行一条 Message 的持久化 dict）。
+"""
 from dataclasses import dataclass,field
 from myagent.agent.core.provider import Message, ToolCallRequest
 import datetime
 import uuid,json
 from pathlib import Path
 @dataclass
-class Session:  
+class Session:
     """
     Attributes:
         messages : 消息列表
@@ -23,15 +28,33 @@ class Session:
     updated_at : str = ""
 
     def __post_init__(self):
+        """name 为空时回退为 session_id，保证每个会话总有可读的名称。"""
         if not self.name:
             self.name = self.session_id
 
     def add_message(self,message : Message):
+        """向会话追加一条消息。
+
+        Args:
+            message: 待追加的 Message 实例。
+
+        Raises:
+            TypeError: message 不是 Message 类型时抛出。
+        """
         if not isinstance(message,Message):
             raise TypeError(f"输入的类型错误 ")
         self.messages.append(message)
 
     def meta_data(self,updated_at:str |None = None)->dict:
+        """生成会话的元信息 dict（落盘文件第一行的内容）。
+
+        Args:
+            updated_at: 显式指定的更新时间；不传时优先用实例的 updated_at，
+                实例也为空则取当前 UTC 时间。
+
+        Returns:
+            含 type/session_id/name/last_compact_loc/created_at/updated_at 的 dict。
+        """
         if not updated_at:
             updated_at =self.updated_at if self.updated_at else datetime.datetime.now(datetime.timezone.utc).isoformat() 
         return {
@@ -44,10 +67,19 @@ class Session:
         }
 
     def compact(self):
+        """压缩历史消息（长对话摘要等），尚未实现。"""
         pass
-    
+
 class SessionManager:
+    """会话管理器：维护 id 到 Session 的内存缓存，并负责落盘与从文件还原。"""
+
     def __init__(self,session_file_path : Path | str | None):
+        """初始化会话管理器。
+
+        Args:
+            session_file_path: 会话 jsonl 文件所在目录；传 str 会转为 Path，
+                传 None 时使用默认目录 ./localData/session。
+        """
         self._sessions : dict[str,Session]= {} # id ->
         if session_file_path and isinstance(session_file_path,str):
             self._session_file = Path(session_file_path)
@@ -137,6 +169,11 @@ class SessionManager:
         )
                     
     def get_session_id_from_files(self)->list[str]:
+        """列出目录下已落盘的所有会话 id。
+
+        Returns:
+            各 jsonl 文件名去掉后缀组成的列表，即 session_id 列表。
+        """
         # 打开文件夹，获取文件夹下所有的jsonl的文件名称
         # 文件名（不含 .jsonl 后缀）即 session_id
         return [p.stem for p in self._session_file.glob("*.jsonl")]
