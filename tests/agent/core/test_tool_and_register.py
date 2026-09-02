@@ -1,7 +1,8 @@
 from typing import Any
 
 from myagent.agent.core import Tool
-from myagent.agent.tools.register import ToolRegister,ToolValueError
+from myagent.agent.core.tool import ToolRegister
+from myagent.agent.execption import ToolValueError
 import pytest
 
 class WeatherTool(Tool):
@@ -31,6 +32,25 @@ class WeatherTool(Tool):
     def execute(self, **kwargs) -> str:
         date = kwargs.get("date", None)
         return f"{date}的天气是晴天"
+
+
+class AnotherTool(Tool):
+    """无参数工具，用于多工具注册场景"""
+
+    @property
+    def name(self) -> str:
+        return "get_time"
+
+    @property
+    def description(self) -> str:
+        return "获取当前时间"
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {"type": "object", "properties": {}, "required": []}
+
+    def execute(self, **kwargs) -> str:
+        return "12:00"
 
 ALLOWED_TYPES = {"string", "number", "integer", "boolean", "array", "object"}
 
@@ -128,3 +148,26 @@ def test_tool_register(register:ToolRegister):
         register.unregister(1)
     
     register.unregister("123")
+
+
+def test_to_schemas(register: ToolRegister):
+    """测试场景：
+    1. 注册表为空时返回空列表
+    2. 注册多个工具后返回对应数量的 schema
+    3. 每个 schema 内容与工具自身的 to_schema() 一致
+    """
+    # 空注册表
+    assert register.to_schemas() == []
+
+    # 注册多个工具后，schema 数量与工具数量一致
+    tool1 = WeatherTool()
+    tool2 = AnotherTool()
+    register.register([tool1, tool2])
+    schemas = register.to_schemas()
+    assert len(schemas) == 2, "schema 数量应与注册的工具数量一致"
+
+    # 每个 schema 与对应工具的 to_schema() 输出一致
+    expected = {tool1.name: tool1.to_schema(), tool2.name: tool2.to_schema()}
+    for schema in schemas:
+        name = schema["function"]["name"]
+        assert schema == expected[name], f"工具 {name} 的 schema 与 to_schema() 不一致"

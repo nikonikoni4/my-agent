@@ -6,7 +6,12 @@ import logging
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 class Tool(ABC):
-    
+    """工具抽象基类。
+
+    子类实现 name / description / parameters / execute 四个成员，
+    即可被 ToolRegister 注册，并通过 to_schema() 编译为 OpenAI 工具 schema。
+    """
+
     def __init__(self):
         pass
 
@@ -28,7 +33,7 @@ class Tool(ABC):
     @abstractmethod
     def parameters(self)-> dict[str, Any]:
         """
-        {
+        返回工具参数的 JSON Schema（首层固定为 object）。格式约定与示例：
             "type" : "object" , <- 第一层嵌套固定是object
             "properties" : {
                 "<parameter_name>" : {
@@ -75,16 +80,27 @@ class Tool(ABC):
 
     @abstractmethod
     async def execute(self,)->str:
+        """执行工具的具体逻辑。
+
+        Args:
+            **kwargs: 模型 arguments 经 json.loads 后的键值对，
+                键与 parameters schema 中 properties 声明对应。
+
+        Returns:
+            执行结果字符串，会作为 tool 消息的 content 回传给模型。
         """
-        具体执行
-        """
-        pass 
+        pass
 
     def validate(self):
         """参数校验"""
         pass
 
     def to_schema(self)->dict[str,Any]:
+        """编译为 OpenAI tools 顶层的单个 function schema。
+
+        Returns:
+            形如 {"type": "function", "function": {name, description, parameters}} 的 dict。
+        """
         return {
             "type" : "function",
             "function":{
@@ -249,8 +265,10 @@ class ToolRegister:
             raise ToolExecuteError(f"{tool_name}工具调用错误，参数:{kwargs}") from e
 
     def to_schemas(self)->list[dict]:
-        """
-        返回已经注册的所有工具的schemas
+        """编译所有已注册工具的 schema。
+
+        Returns:
+            每个已注册工具 to_schema() 结果组成的列表，注册表为空时返回空列表。
         """
         schemas = []
         for tool in self._tools.values():
