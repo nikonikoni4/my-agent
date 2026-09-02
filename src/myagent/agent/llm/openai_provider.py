@@ -13,22 +13,23 @@ logger.setLevel(logging.INFO)
 class OpenAIProvider(LLMProvider):
     """基于 openai SDK 的实现，model 和 base_url 由调用方指定"""
 
-    def __init__(self, model: str, api_key: str, base_url: str | None = None):
+    def __init__(self, model: str, api_key: str, base_url: str | None = None,chat_params:ChatParams|None = None):
         """
         Args:
             model: 模型名或接入点 ID（如火山方舟的 ep-xxx）
             api_key: 供应商的 API Key
             base_url: 兼容接口地址，None 表示使用 OpenAI 官方地址
         """
+        super.__init__(chat_params)
         self._model = model
         self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
 
-    async def chat(self, messages: list[Message], tools : list[dict] | None = None,params: ChatParams | None = None) -> LLMResponse:
+    async def chat(self, messages: list[Message], tools : list[dict] | None = None) -> LLMResponse:
         """发送消息列表，返回模型回复
 
         Args:
             messages: 完整的对话消息列表，按时间顺序排列
-            params: 采样参数，None 表示全部使用供应商默认值
+            self._params: 采样参数，None 表示全部使用供应商默认值
 
         Returns:
             LLMResponse: 模型回复及结束原因、token 用量
@@ -39,14 +40,14 @@ class OpenAIProvider(LLMProvider):
                 "model": self._model,
                 "messages": [m.to_dict() for m in messages],
             }
-            if params is not None:
+            if self._params is not None:
                 for name in ("temperature", "top_p", "max_tokens"):
-                    value = getattr(params, name)
+                    value = getattr(self._params, name)
                     if value is not None:
                         kwargs[name] = value
                 # top_k 不在 OpenAI 标准参数里，通过 extra_body 传给兼容的供应商
-                if params.top_k is not None:
-                    kwargs["extra_body"] = {"top_k": params.top_k}
+                if self._params.top_k is not None:
+                    kwargs["extra_body"] = {"top_k": self._params.top_k}
             if tools is not None:
                 kwargs["tools"] = tools
             completion = await self._client.chat.completions.create(**kwargs)

@@ -115,9 +115,11 @@ class ChatParams:
 
 class LLMProvider(ABC):
     """LLM 调用接口，由上层注入具体实现（依赖倒置）"""
+    def __init__(self,params: ChatParams | None = None):
+        self._params = params if params else None
 
     @abstractmethod
-    async def chat(self, messages: list[Message], params: ChatParams | None = None) -> LLMResponse:
+    async def chat(self, messages: list[Message],tools : list[dict] | None = None ) -> LLMResponse:
         """发送消息列表，返回模型回复
 
         Args:
