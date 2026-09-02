@@ -6,3 +6,5 @@ explore/
 myagent.egg-info/
 __pycache__
 .env
+localData/
+.pytest_cache
