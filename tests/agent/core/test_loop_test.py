@@ -1,3 +1,5 @@
+import time
+
 from myagent.agent.core.loop import Loop,EventService,ToolRegister,Session,Message,LLMResponse
 from myagent.agent.core.provider import ToolCallRequest
 from myagent.agent.core.tool import Tool
@@ -5,7 +7,7 @@ from myagent.agent.llm.openai_provider import OpenAIProvider
 from unittest.mock import AsyncMock
 from types import SimpleNamespace
 from typing import Any
-import pytest
+import pytest,asyncio
 
 @pytest.fixture
 def loop():
@@ -38,6 +40,7 @@ def make_fake_chat_response_with_tool_call():
         )],
         usage = SimpleNamespace(prompt_tokens=1, completion_tokens=2, total_tokens=3)
     )
+    time.sleep(3)
     return response
 class WeatherTool(Tool):
     def __init__(self):
@@ -94,6 +97,5 @@ async def test_loop_followup(loop:Loop):
     assert msgs[3].content == "晴天"
     assert msgs[3].reasoning_content == "测试推理过程"
     assert msgs[3].tool_calls == []
-
 
     

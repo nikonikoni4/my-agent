@@ -1,10 +1,19 @@
+from attr import dataclass
+
 from myagent.agent import execption
 from myagent.infra.events import EventService
 from myagent.agent.core.tool import ToolRegister
-from myagent.agent.core.provider import LLMProvider,ChatParams, LLMResponse,Message
-from myagent.agent.core.session import Session
+from myagent.agent.core.provider import LLMProvider,ChatParams, LLMResponse,Message, StreamChunk, ToolCallRequest,Usage
+from myagent.agent.core.session.types import (
+    SessionMetaData,ToolCallChunksData,AssistantMessageData, StepEndData,CompactionStartData,
+    SessionRecordData,ReasoningChunksData,ToolCallData,ToolResultData,TurnEndData,CompactionSummaryData,
+    TurnStartData,StepStartData,UserMessageData,ContentChunksData,RequestHeaderData,CompactionEndData
+)
+from myagent.agent.core.session.session import Session
+
 from myagent.utils.time import now
 import asyncio 
+
 class Loop:
     """单个会话的对话循环：调用 LLM → 记录回复 → 执行工具，直到模型不再请求工具。
 
@@ -49,25 +58,37 @@ class Loop:
         return await self._task
 
 
-    async def _run_loop(self,message:Message)->LLMResponse:
+    async def _run_loop(self,message:Message)->LLMResponse|None:
         """对话循环主体：调 LLM → 记录 assistant 回复 → 执行工具并记录结果 → 循环。
 
         Args:
             message: 用户输入的消息，作为本轮第一条消息写入 session。
 
-        Returns:
+        event:
+            llm_call -> stream chunk (<loop_llm_call_chunk>) -> <after_loop_llm_call> -> tool_use -> <after_tool_use>
+
+
             
         """
+
         try:
             self._session.add_message(message) # 加入第一条消息
             while True:
-                response = await self._llm_client.chat(self._session.messages,self._tool_register.to_schemas())
+                response = None 
+                chunks = []
+                async for item in self._llm_client.stream_chat(self._session.messages,self._tool_register.to_schemas()):
+                    if isinstance(item, LLMResponse):
+                        response = item
+                    else:
+                        chunks.append(item)
+                        self._event_service.trigger(loop_llm_call_chunk,LoopLLMCallChunk())
                 self._session.add_message(Message(
                     role = "assistant",
                     content = response.content,
                     tool_calls=response.tool_call_requests,
                     reasoning_content=response.reasoning_content,
                 ))
+                self._event_service.trigger(after_loop_llm_call,AfterLLmCallPayload(response =response ))
                 if response.tool_call_requests:
                     for tool_call in response.tool_call_requests:
                         result = await self._tool_register.execute(tool_call.name,**tool_call.arguments)
@@ -76,10 +97,39 @@ class Loop:
                             content=result,
                             tool_call_id=tool_call.id
                         ))
+                        self._event_service.trigger(after_tool_use,AfterToolUserPayload(result))
                 else:
                     return response
         except asyncio.CancelledError:
-            pass
+           self.handle_cancel()
+
         except asyncio.TimeoutError:
             pass
             
+    def handle_cancel(session:Session , response:LLMResponse|None=None ,chunks:list[StreamChunk]|None=None ,tool_call_requests :list[ToolCallRequest]|None = None,):
+        # 先判断中断之后进行到哪一步了
+        pass 
+        # if response is None and chunks is None:
+        #     # llm 还未开始调用
+        #     return None 
+        # elif response is None and chunks is not None:
+        #     # llm开始调用但未完成，仅仅组装content
+        #     content = ""
+        #     for chunk in chunks:
+        #         content +=chunk.content
+        #     if content :
+        #         session.add_message(Message(role="assistant",content=content))
+        #         return LLMResponse(
+        #             content = content,
+        #             usage=Usage(),
+        #             interrupted=False
+        #         )
+        #     else : 
+        #         return None 
+        # elif response and  tool_call_requests is None:
+        #     # llm调用结束，且无工具调用，直接返回
+        #     return response
+        # elif response and tool_call_requests :
+        #     # 已经记录的工具调用id
+            
+

@@ -8,6 +8,17 @@ from myagent.agent.core.provider import Message, ToolCallRequest
 import datetime
 import uuid,json
 from pathlib import Path
+
+@dataclass
+class SessionRecord:
+    """
+    session文件每一行保存的单位
+    """
+    uuid : str = field(default_factory=lambda : str(uuid.uuid4()))
+    turn : int  # 每次写入+1
+    message : Message 
+    
+
 @dataclass
 class Session:
     """
@@ -22,10 +33,11 @@ class Session:
     """
     session_id : str = field(default_factory=lambda : str(uuid.uuid4()))
     name : str = ""  # 为空时在 __post_init__ 中取 session_id
-    messages : list[Message] = field(default_factory=list)
     last_compact_loc : int = 0
     created_at : str = field(default_factory=lambda: datetime.datetime.now(datetime.timezone.utc).isoformat())
     updated_at : str = ""
+    messages : list[Message] = field(default_factory=list)
+    
 
     def __post_init__(self):
         """name 为空时回退为 session_id，保证每个会话总有可读的名称。"""

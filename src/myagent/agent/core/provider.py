@@ -41,7 +41,6 @@ class Message:
     tool_calls : list[ToolCallRequest] | None = None
     tool_call_id : str |None = None 
     reasoning_content : str | None = None 
-    timestamp: str = field(default_factory=lambda: datetime.datetime.now(datetime.timezone.utc).isoformat())
     def to_dict(self)->dict: # 需要把这个改为to_llm_call_dict
         """
         将message转化为 OpenAI wire 格式的 dict
@@ -69,10 +68,6 @@ class Message:
             d["tool_calls"] = [tool_call.to_dict() for tool_call in self.tool_calls]
         if self.reasoning_content:
             d["reasoning_content"] = self.reasoning_content
-        return d
-    def to_dict_with_timestamp(self)->dict:  # 需要从message中删除timestamp
-        d= self.to_dict()
-        d['timestamp'] = self.timestamp
         return d
 @dataclass
 class Usage:

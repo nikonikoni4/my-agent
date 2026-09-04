@@ -1,13 +1,13 @@
 import pytest
 from unittest.mock import AsyncMock
-from myagent.agent.core.provider import ToolCallRequest
+from myagent.agent.core.provider import ToolCallRequest, Usage
 from myagent.agent.llm.openai_provider import OpenAIProvider,LLMCallError
 from myagent.agent.core.provider import Message
 from types import SimpleNamespace
 import openai
 @pytest.fixture
 def provider():
-    p = OpenAIProvider("test-model", api_key="test-key")  # key 是假的，反正不会真发请求
+    p = OpenAIProvider("test-model", api_key="test-key", base_url="https://test.local/v1")  # key 是假的，反正不会真发请求
     p._client = AsyncMock()      # 把真客户端换成替身
     return p
 
@@ -30,7 +30,7 @@ async def test_openai_provider_response(provider):
     assert response.content == "ok" , "输出返回错误"
     assert response.reasoning_content == "测试" ,  "输出返回错误"
     assert response.tool_call_requests == [ToolCallRequest(id= "call_xxx",name = "test",arguments ={"test":"a"})],"输出返回错误"
-    assert response.usage == {"prompt_tokens" : 1 , "completion_tokens":2,"total_tokens":3},"输出返回错误"
+    assert response.usage == Usage(prompt_tokens=1, completion_tokens=2, total_tokens=3),"输出返回错误"
     assert response.finish_reason == "tool_calls","输出返回错误"
 
     provider._client.chat.completions.create.side_effect  = LLMCallError()
