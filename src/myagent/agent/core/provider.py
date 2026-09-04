@@ -42,7 +42,7 @@ class Message:
     tool_call_id : str |None = None 
     reasoning_content : str | None = None 
     timestamp: str = field(default_factory=lambda: datetime.datetime.now(datetime.timezone.utc).isoformat())
-    def to_dict(self)->dict:
+    def to_dict(self)->dict: # 需要把这个改为to_llm_call_dict
         """
         将message转化为 OpenAI wire 格式的 dict
 
@@ -70,10 +70,23 @@ class Message:
         if self.reasoning_content:
             d["reasoning_content"] = self.reasoning_content
         return d
-    def to_dict_with_timestamp(self)->dict:
+    def to_dict_with_timestamp(self)->dict:  # 需要从message中删除timestamp
         d= self.to_dict()
         d['timestamp'] = self.timestamp
         return d
+@dataclass
+class Usage:
+    """一次调用的 token 用量统计
+
+    Attributes:
+        prompt_tokens: 输入消耗的 token 数
+        completion_tokens: 输出消耗的 token 数
+        total_tokens: 总 token 数
+    """
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+
 @dataclass
 class LLMResponse:
     """一次对话调用的结果
@@ -83,17 +96,34 @@ class LLMResponse:
         reasoning_content : 推理过程
         tool_call_requests: 模型发起的工具调用请求列表，无调用时为空列表
         finish_reason: 结束原因，如 stop（正常结束）、length（达到 max_tokens）
-        usage: token 用量统计，格式为
-            {"prompt_tokens": int, "completion_tokens": int, "total_tokens": int}，
-            供应商未返回时为 None
+        usage: token 用量统计，供应商未返回时各字段为 0
     """
     content: str | None
     reasoning_content : str  | None = None
     tool_call_requests : list[ToolCallRequest] = field(default_factory=list)
     finish_reason: str | None = None
-    usage: dict  = field(default_factory=dict)
+    usage: Usage  = field(default_factory=Usage)
+    interrupted : bool = False 
 
+@dataclass
+class StreamChunk:
+    """流式输出过程中的一个增量片段
 
+    Attributes:
+        content: 正文增量文本，本次片段没有则为 None
+        reasoning_content: 推理过程增量文本，本次片段没有则为 None
+        tool_index: 工具调用增量的槽位号（并行调用时的第几个调用），非工具片段为 None
+        tool_id: 工具调用标识，仅每个调用的首个片段携带，后续片段为 None
+        tool_name: 工具名，仅每个调用的首个片段携带，后续片段为 None
+        tool_arguments_delta: 参数 JSON 的增量碎片。单个碎片不是合法 JSON，
+            只能在流结束后拼接再解析
+    """
+    content: str | None = None
+    reasoning_content: str | None = None
+    tool_index: int | None = None
+    tool_id: str | None = None
+    tool_name: str | None = None
+    tool_arguments_delta: str | None = None
 @dataclass
 class ChatParams:
     """采样参数，字段为 None 时使用供应商默认值
@@ -130,6 +160,19 @@ class LLMProvider(ABC):
         Returns:
             LLMResponse: 模型回复及结束原因、token 用量
         """
+    @abstractmethod
+    def stream_chat(self, messages: list[Message], tools: list[dict] | None = None):
+        """流式发送消息列表，逐步返回增量片段
+
+        Args:
+            messages: 完整的对话消息列表，按时间顺序排列
+            tools: 工具 schema 列表（各工具 to_schema() 的输出），None 或空表示本次不提供工具
+
+        Yields:
+            StreamChunk: 正文或推理过程的增量片段
+            LLMResponse: 流结束时的最终完整结果，含工具调用、finish_reason、token 用量
+        """
+
     def parse_tool_call(self,response_message)->list[ToolCallRequest]:
         """把 SDK 响应里的 tool_calls 解析为项目内的 ToolCallRequest 列表。
 
