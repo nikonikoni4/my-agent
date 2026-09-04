@@ -88,6 +88,6 @@ class EventService:
         使用spec进行触发事件
         """
         if event_spec.semantics == "emit":
-            self.emit(event_spec.semantics,payload)
+            self.emit(event_spec.name,payload)
         elif event_spec.semantics == "waterfall":
             self.waterfall(event_spec.name,payload)
