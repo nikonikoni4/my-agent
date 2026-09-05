@@ -70,7 +70,7 @@ class SessionPresist:
                     self._pending_truncate = None
             except OSError:
                 pass
-            raise
+            raise 
         self._buffer = []  # 整批落盘成功才清空
 
     async def loop(self):

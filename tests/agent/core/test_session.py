@@ -10,6 +10,8 @@ from myagent.agent.core.session.types import (
     AssistantMessageData,
     TurnStartData,
     StepStartData,
+    TurnEndData,
+    CompactionEndData,
     CompactionSummaryData,
 )
 
@@ -17,6 +19,12 @@ from myagent.agent.core.session.types import (
 # ---------------------------------------------------------------------------
 # 测试固件
 # ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _isolated_data_path(tmp_path, monkeypatch):
+    """把持久化路径指向临时目录，测试不污染真实 local_data_path。"""
+    monkeypatch.setattr("myagent.agent.core.session.session.local_data_path", tmp_path)
+
 
 @pytest.fixture
 def event_service():
@@ -31,37 +39,47 @@ def meta_data():
 
 
 @pytest.fixture
-def session(event_service, meta_data):
-    """空会话：没有任何记录，turn=0、step=0。"""
-    return Session(event_service, meta_data)
+def make_session(event_service, meta_data):
+    """工厂固件：构造 Session。
+
+    SessionPresist 构造时需要运行中的事件循环，所以必须在
+    async 测试体内部调用本工厂，不能在 fixture 里直接构造。
+    """
+    def _make(record_list: list[SessionRecordData] | None = None) -> Session:
+        return Session(event_service, meta_data, record_list)
+    return _make
 
 
 @pytest.fixture
-def add_exchange(session):
-    """工厂固件：向会话追加一轮完整对话并返回追加函数，可连续调用追加多轮。
+def add_exchange(make_session):
+    """工厂固件：返回一个初始化函数，在测试体内调用得到 (session, 追加一轮对话的函数)。
 
     每轮写入 turn/start（不进可见面）+ user/message + assistant/message（surface_op="append"）。
+    data 只带事件内容，turn/step 由 Session 写在信封上。
+    Session 必须在事件循环内构造，所以测试要先调用本工厂再操作。
     """
-    def _add(user_content: str, assistant_content: str):
-        session.append("turn/start", TurnStartData(turn=1), None, None)
-        session.append("user/message",
-                       UserMessageData(turn=1, step=1,
-                                       message=Message(role="user", content=user_content)),
-                       "append", None)
-        session.append("assistant/message",
-                       AssistantMessageData(turn=1, step=1,
-                                            message=Message(role="assistant", content=assistant_content)),
-                       "append", None)
-    return _add
+    def _setup():
+        session = make_session()
+
+        def _add(user_content: str, assistant_content: str):
+            session.append("turn/start", TurnStartData(), None, None)
+            session.append("user/message",
+                           UserMessageData(message=Message(role="user", content=user_content)),
+                           "append", None)
+            session.append("assistant/message",
+                           AssistantMessageData(message=Message(role="assistant", content=assistant_content)),
+                           "append", None)
+        return session, _add
+    return _setup
 
 
 @pytest.fixture
-def compact_range(session):
-    """工厂固件：追加一条 compaction/summary 记录，用 replace surface_op 遮蔽一段消息。
+def compact_range():
+    """工厂固件：向会话追加一条 compaction/summary 记录，用 replace surface_op 遮蔽一段消息。
 
     start/end 是被遮蔽消息的 seq 闭区间，source_event_seqs 必须与区间内实际 seq 一致。
     """
-    def _compact(start: int, end: int, shadowed_seqs: list[int], summary: str = "摘要"):
+    def _compact(session, start: int, end: int, shadowed_seqs: list[int], summary: str = "摘要"):
         session.append("compaction/summary",
                        CompactionSummaryData(
                            compaction_id="c-1",
@@ -83,8 +101,10 @@ def compact_range(session):
 class TestSessionInit:
     """测试 Session 构造与初始状态。"""
 
-    def test_fresh_session_state(self, session, meta_data, event_service):
+    @pytest.mark.asyncio
+    async def test_fresh_session_state(self, make_session, meta_data, event_service):
         """测试场景：空会话的初始状态——无记录、turn/step 归零、注入对象原样保存"""
+        session = make_session()
         assert session.record_list == []
         assert session.record_list_seq == 0
         assert session.turn == 0
@@ -98,45 +118,66 @@ class TestSessionInit:
         with pytest.raises(TypeError):
             Session(event_service)
 
-    def test_init_with_loaded_records(self, event_service, meta_data):
-        """测试场景：带历史记录构造时 turn 恢复为最后一条记录的 turn，node 同步还原"""
+    @pytest.mark.asyncio
+    async def test_init_with_loaded_records(self, make_session):
+        """测试场景：带历史记录构造时 turn 恢复为信封上的 turn，node 同步还原"""
         records = [
-            SessionRecordData(type="turn/start", seq=1, surface_op=None, data=TurnStartData(turn=3)),
-            SessionRecordData(type="user/message", seq=2, surface_op="append",
-                              data=UserMessageData(turn=3, step=1,
-                                                   message=Message(role="user", content="hi"))),
+            SessionRecordData(type="turn/start", seq=1, turn=3, surface_op=None,
+                              data=TurnStartData()),
+            SessionRecordData(type="user/message", seq=2, turn=3, step=1, surface_op="append",
+                              data=UserMessageData(message=Message(role="user", content="hi"))),
         ]
-        s = Session(event_service, meta_data, records)
+        s = make_session(records)
         assert s.turn == 3
         assert s.surface_manager.node == [2]
+
+    @pytest.mark.asyncio
+    async def test_init_skips_turn_none_records(self, make_session):
+        """测试场景：最后一条是轮间压缩记录（信封 turn=None）时，向前找最近一条带 turn 的记录恢复"""
+        records = [
+            SessionRecordData(type="turn/start", seq=1, turn=1, step=None, data=TurnStartData()),
+            SessionRecordData(type="turn/end", seq=2, turn=1, step=None,
+                              data=TurnEndData(reason="success")),
+            SessionRecordData(type="compaction/end", seq=3, turn=None, step=None,
+                              data=CompactionEndData(compaction_id="c-1")),
+        ]
+        s = make_session(records)
+        assert s.turn == 1
 
 
 class TestSessionAppend:
     """测试 append 的写入边界：校验、seq 分配、序列化。"""
 
-    def test_append_unknown_event_type_raises(self, session):
+    @pytest.mark.asyncio
+    async def test_append_unknown_event_type_raises(self, make_session):
         """测试场景：event_type 不在登记处时抛 ValueError"""
+        session = make_session()
         with pytest.raises(ValueError):
-            session.append("no/such", TurnStartData(turn=1), None, None)
+            session.append("no/such", TurnStartData(), None, None)
 
-    def test_append_wrong_data_type_raises(self, session):
+    @pytest.mark.asyncio
+    async def test_append_wrong_data_type_raises(self, make_session):
         """测试场景：data 类型与 event_type 登记的不符时抛 TypeError"""
+        session = make_session()
         with pytest.raises(TypeError):
             session.append("turn/start",
-                           UserMessageData(turn=1, step=1,
-                                           message=Message(role="user", content="x")),
+                           UserMessageData(message=Message(role="user", content="x")),
                            None, None)
 
-    def test_append_assigns_sequential_seq(self, session):
+    @pytest.mark.asyncio
+    async def test_append_assigns_sequential_seq(self, make_session):
         """测试场景：seq 从 1 开始按写入顺序连续递增"""
-        session.append("turn/start", TurnStartData(turn=1), None, None)
-        session.append("step/start", StepStartData(turn=1, step=1), None, None)
+        session = make_session()
+        session.append("turn/start", TurnStartData(), None, None)
+        session.append("step/start", StepStartData(), None, None)
         assert [r.seq for r in session.record_list] == [1, 2]
         assert session.record_list_seq == 2
 
-    def test_append_keeps_typed_data(self, session, add_exchange):
+    @pytest.mark.asyncio
+    async def test_append_keeps_typed_data(self, add_exchange):
         """测试场景：data 以类型实例落库（不做 asdict），uuid/timestamp 自动填充，surface_op 原样保存"""
-        add_exchange("hi", "hello")
+        session, add = add_exchange()
+        add("hi", "hello")
         record = session.record_list[1]  # user/message
         assert record.type == "user/message"
         assert isinstance(record.data, UserMessageData)
@@ -147,69 +188,153 @@ class TestSessionAppend:
         assert record.uuid
         assert record.timestamp is not None
 
+    @pytest.mark.asyncio
+    async def test_to_record_dict_puts_turn_step_on_envelope(self, add_exchange):
+        """测试场景：序列化后 turn/step 在记录顶层，data 里只有事件内容、不含定位字段"""
+        session, add = add_exchange()
+        add("hi", "hello")
+        d = session.record_list[1].to_record_dict()
+        assert d["turn"] == 1
+        assert d["step"] == 0
+        assert "turn" not in d["data"]
+        assert "step" not in d["data"]
+
 
 class TestTurnStepTracking:
-    """测试 turn/step 坐标跟踪。"""
+    """测试 turn/step 坐标跟踪：定位信息统一写在信封上。"""
 
-    def test_turn_start_increments_turn_and_resets_step(self, session, add_exchange):
+    @pytest.mark.asyncio
+    async def test_turn_start_increments_turn_and_resets_step(self, add_exchange):
         """测试场景：每次 turn/start 使 turn 加一、step 归零"""
-        add_exchange("u1", "a1")
+        session, add = add_exchange()
+        add("u1", "a1")
         assert session.turn == 1
         assert session.step == 0
-        add_exchange("u2", "a2")
+        add("u2", "a2")
         assert session.turn == 2
         assert session.step == 0
 
-    def test_step_start_increments_step(self, session):
+    @pytest.mark.asyncio
+    async def test_step_start_increments_step(self, make_session):
         """测试场景：同一 turn 内 step/start 使 step 递增"""
-        session.append("turn/start", TurnStartData(turn=1), None, None)
-        session.append("step/start", StepStartData(turn=1, step=1), None, None)
-        session.append("step/start", StepStartData(turn=1, step=2), None, None)
+        session = make_session()
+        session.append("turn/start", TurnStartData(), None, None)
+        session.append("step/start", StepStartData(), None, None)
+        session.append("step/start", StepStartData(), None, None)
         assert session.turn == 1
         assert session.step == 2
 
-    def test_turn_step_in_data_overridden_by_session(self, session):
-        """测试场景：data 里自带的 turn/step 被会话当前坐标覆盖，且不改动调用方传入的原对象"""
-        session.append("turn/start", TurnStartData(turn=1), None, None)
-        caller_data = UserMessageData(turn=99, step=99,
-                                      message=Message(role="user", content="hi"))
-        session.append("user/message", caller_data, "append", None)
-        record = session.record_list[1]
-        assert record.data.turn == 1
-        assert record.data.step == 0  # turn/start 后 step 重置为 0
-        assert record.data is not caller_data  # replace 生成了副本
-        assert caller_data.turn == 99  # 原对象未被改动
+    @pytest.mark.asyncio
+    async def test_envelope_positions_for_full_turn(self, make_session):
+        """测试场景：一整轮内各类事件的信封坐标——
+
+        turn 边界事件（turn/start、turn/end）step 记 None；
+        step/start 前的事件 step 记 0；step 内事件记当前 step。
+        """
+        session = make_session()
+        session.append("turn/start", TurnStartData(), None, None)
+        session.append("user/message",
+                       UserMessageData(message=Message(role="user", content="hi")),
+                       "append", None)
+        session.append("step/start", StepStartData(), None, None)
+        session.append("assistant/message",
+                       AssistantMessageData(message=Message(role="assistant", content="ok")),
+                       "append", None)
+        session.append("step/start", StepStartData(), None, None)
+        session.append("turn/end", TurnEndData(reason="success"), None, None)
+
+        got = [(r.type, r.turn, r.step) for r in session.record_list]
+        assert got == [
+            ("turn/start", 1, None),
+            ("user/message", 1, 0),
+            ("step/start", 1, 1),
+            ("assistant/message", 1, 1),
+            ("step/start", 1, 2),
+            ("turn/end", 1, None),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_data_does_not_carry_position(self, add_exchange):
+        """测试场景：data 不再保存 turn/step，定位只在信封上"""
+        session, add = add_exchange()
+        add("hi", "hello")
+        for record in session.record_list:
+            assert not hasattr(record.data, "turn")
+            assert not hasattr(record.data, "step")
+
+    @pytest.mark.asyncio
+    async def test_compaction_events_step_is_none(self, add_exchange, compact_range):
+        """测试场景：压缩事件的 step 记 None，turn 记当前轮"""
+        session, add = add_exchange()
+        add("u1", "a1")  # seq 1-3, 当前轮 1
+        compact_range(session, start=2, end=3, shadowed_seqs=[2, 3])
+        record = session.record_list[-1]
+        assert record.type == "compaction/summary"
+        assert record.turn == 1
+        assert record.step is None
+
+
+class TestResumeTurn:
+    """测试从历史记录恢复会话后的坐标延续。"""
+
+    @pytest.mark.asyncio
+    async def test_resume_continues_turn_numbering(self, add_exchange):
+        """测试场景：用已有记录重建会话后，下一轮 turn/start 从上次轮次继续递增"""
+        session, add = add_exchange()
+        add("u1", "a1")
+        resumed = Session(session._event_service, session.meta_data, session.record_list)
+        resumed.append("turn/start", TurnStartData(), None, None)
+        assert resumed.record_list[-1].turn == 2
+
+    @pytest.mark.asyncio
+    async def test_resume_resets_step_to_zero(self, make_session):
+        """测试场景：恢复时 step 不还原，从 0 重新计（步骤坐标只在单次运行内有效）"""
+        records = [
+            SessionRecordData(type="step/start", seq=1, turn=1, step=3,
+                              data=StepStartData()),
+        ]
+        s = make_session(records)
+        assert s.turn == 1
+        assert s.step == 0
 
 
 class TestDeriveMessages:
     """测试 derive_messages：从可见面还原 LLM 输入用的消息序列。"""
 
-    def test_derive_empty_session(self, session):
+    @pytest.mark.asyncio
+    async def test_derive_empty_session(self, make_session):
         """测试场景：空会话派发出空列表"""
+        session = make_session()
         assert session.derive_messages() == []
 
-    def test_derive_returns_visible_messages_in_order(self, session, add_exchange):
+    @pytest.mark.asyncio
+    async def test_derive_returns_visible_messages_in_order(self, add_exchange):
         """测试场景：只有 user/assistant 消息进可见面，turn/start 被排除，顺序与写入一致，返回 Message 对象"""
-        add_exchange("u1", "a1")
-        add_exchange("u2", "a2")
+        session, add = add_exchange()
+        add("u1", "a1")
+        add("u2", "a2")
         messages = session.derive_messages()
         assert all(isinstance(m, Message) for m in messages)
         assert [m.role for m in messages] == ["user", "assistant", "user", "assistant"]
         assert [m.content for m in messages] == ["u1", "a1", "u2", "a2"]
 
-    def test_derive_excludes_compacted_messages(self, session, add_exchange, compact_range):
+    @pytest.mark.asyncio
+    async def test_derive_excludes_compacted_messages(self, add_exchange, compact_range):
         """测试场景：replace 压缩后，被遮蔽区间的消息不再派发，区间外消息保留"""
-        add_exchange("u1", "a1")   # seq 1=turn/start, 2=user, 3=assistant
-        add_exchange("u2", "a2")   # seq 4=turn/start, 5=user, 6=assistant
-        compact_range(start=2, end=3, shadowed_seqs=[2, 3])  # seq 7
+        session, add = add_exchange()
+        add("u1", "a1")   # seq 1=turn/start, 2=user, 3=assistant
+        add("u2", "a2")   # seq 4=turn/start, 5=user, 6=assistant
+        compact_range(session, start=2, end=3, shadowed_seqs=[2, 3])  # seq 7
         messages = session.derive_messages()
         assert [m.content for m in messages] == ["u2", "a2"]
 
-    def test_derive_after_compaction_appends_new_messages(self, session, add_exchange, compact_range):
+    @pytest.mark.asyncio
+    async def test_derive_after_compaction_appends_new_messages(self, add_exchange, compact_range):
         """测试场景：压缩之后再追加的新消息正常进可见面"""
-        add_exchange("u1", "a1")
-        compact_range(start=2, end=3, shadowed_seqs=[2, 3])
-        add_exchange("u2", "a2")
+        session, add = add_exchange()
+        add("u1", "a1")
+        compact_range(session, start=2, end=3, shadowed_seqs=[2, 3])
+        add("u2", "a2")
         messages = session.derive_messages()
         assert [m.content for m in messages] == ["u2", "a2"]
 
@@ -217,7 +342,9 @@ class TestDeriveMessages:
 class TestCompactNotImplemented:
     """测试 compact 占位行为。"""
 
-    def test_compact_is_placeholder(self, session):
+    @pytest.mark.asyncio
+    async def test_compact_is_placeholder(self, make_session):
         """测试场景：compact 尚未实现，调用不报错也不产生记录"""
+        session = make_session()
         session.compact()
         assert session.record_list == []

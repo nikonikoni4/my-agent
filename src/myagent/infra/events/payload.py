@@ -73,3 +73,8 @@ class StepEndPayload(Payload):
 class TurnEndPayload(Payload):
     """turn/end : reason(success, interrupted)"""
     pass
+
+@dataclass 
+class SessionEventPayload[T](Payload):
+    "session/event"
+    session_record : T 

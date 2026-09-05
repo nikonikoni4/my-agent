@@ -11,6 +11,7 @@ from myagent.infra.events.payload import (
     ToolResultPayload,
     StepEndPayload,
     TurnEndPayload,
+    SessionEventPayload
 )
 
 class EventSpec:
@@ -38,7 +39,7 @@ TOOL_CALL = EventSpec("tool/call", "emit", ToolCallPayload)
 TOOL_RESULT = EventSpec("tool/result", "emit", ToolResultPayload)
 STEP_END = EventSpec("step/end", "emit", StepEndPayload)
 TURN_END = EventSpec("turn/end", "emit", TurnEndPayload)
-SESSION_EVENT = EventSpec("session/event", "emit", Payload)
+SESSION_EVENT = EventSpec("session/event", "emit", SessionEventPayload)
 # 集中聚合所有事件，用于完整性校验（名称唯一、命名规范）
 ALL_EVENTS: list[EventSpec] = [
     TURN_START,

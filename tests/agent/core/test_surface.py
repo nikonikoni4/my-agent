@@ -16,7 +16,7 @@ def make_record(seq: int, surface_op=None, source_event_seqs=None,
         seq=seq,
         surface_op=surface_op,
         source_event_seqs=source_event_seqs,
-        data=data if data is not None else TurnStartData(turn=1),
+        data=data if data is not None else TurnStartData(),
     )
 
 
