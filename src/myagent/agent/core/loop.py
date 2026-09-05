@@ -1,11 +1,12 @@
 from attr import dataclass
 
 from myagent.agent import execption
+from myagent.agent.core.session import session
 from myagent.infra.events import EventService
 from myagent.agent.core.tool import ToolRegister
 from myagent.agent.core.provider import LLMProvider,ChatParams, LLMResponse,Message, StreamChunk, ToolCallRequest,Usage
 from myagent.agent.core.session.types import (
-    SessionMetaData,ToolCallChunksData,AssistantMessageData, StepEndData,CompactionStartData,
+    AssistantChunkData, SessionMetaData,ToolCallChunksData,AssistantMessageData, StepEndData,CompactionStartData,
     SessionRecordData,ReasoningChunksData,ToolCallData,ToolResultData,TurnEndData,CompactionSummaryData,
     TurnStartData,StepStartData,UserMessageData,ContentChunksData,RequestHeaderData,CompactionEndData
 )
@@ -13,7 +14,9 @@ from myagent.agent.core.session.session import Session
 
 from myagent.utils.time import now
 import asyncio 
-
+import logging
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 class Loop:
     """单个会话的对话循环：调用 LLM → 记录回复 → 执行工具，直到模型不再请求工具。
 
@@ -58,6 +61,14 @@ class Loop:
         return await self._task
 
 
+    def persist_now(self,loc:str):
+        try:
+            self._session.presistence.presist()
+        except OSError as e:
+            # 所有专门错误处理，类型等暂时先跳过
+            logger.error(f"{loc} persist_now 出错{e}")
+             
+
     async def _run_loop(self,message:Message)->LLMResponse|None:
         """对话循环主体：调 LLM → 记录 assistant 回复 → 执行工具并记录结果 → 循环。
 
@@ -72,36 +83,50 @@ class Loop:
         """
 
         try:
-            self._session.add_message(message) # 加入第一条消息
+            # 注system prompt部分暂时没有做
+            # turn start step start end 等4个可以写在外名，具体看需要之后需要什么数据，暂时写里面没有问题
+            self._session.append("turn/start",TurnStartData())
+            self._session.append("step/start",StepStartData())
+            # TODO 暂时设置为initial 后续应该考虑resume change等
+            self._session.append("request/header",RequestHeaderData(reason='initial',model_name=self._llm_client.model,system_prompt='',tools=self._tool_register.to_schemas(),params=self._llm_client.params))
+            self._session.append("user/message",UserMessageData(message),surface_op="append")
             while True:
+                
                 response = None 
                 chunks = []
-                async for item in self._llm_client.stream_chat(self._session.messages,self._tool_register.to_schemas()):
+                self.persist_now("before assistant/message")
+                async for item in self._llm_client.stream_chat(self._session.derive_messages(),self._tool_register.to_schemas()):
                     if isinstance(item, LLMResponse):
                         response = item
+                        self._session.append("assistant/message",AssistantMessageData(Message(
+                            role = "assistant",
+                            content = response.content,
+                            tool_calls=response.tool_call_requests,
+                            reasoning_content=response.reasoning_content,
+                        ),usage=response.usage),surface_op="append")
                     else:
                         chunks.append(item)
-                        self._event_service.trigger(loop_llm_call_chunk,LoopLLMCallChunk())
-                self._session.add_message(Message(
-                    role = "assistant",
-                    content = response.content,
-                    tool_calls=response.tool_call_requests,
-                    reasoning_content=response.reasoning_content,
-                ))
-                self._event_service.trigger(after_loop_llm_call,AfterLLmCallPayload(response =response ))
-                if response.tool_call_requests:
+                        self._session.append("assistant/chunk",AssistantChunkData(item))
+                if response and response.tool_call_requests:
                     for tool_call in response.tool_call_requests:
-                        result = await self._tool_register.execute(tool_call.name,**tool_call.arguments)
-                        self._session.add_message(Message(
-                            role="tool",
-                            content=result,
-                            tool_call_id=tool_call.id
-                        ))
-                        self._event_service.trigger(after_tool_use,AfterToolUserPayload(result))
+                        id = tool_call.id
+                        name = tool_call.name
+                        arguments = tool_call.arguments
+
+                        self._session.append("tool/call",ToolCallData(tool_name=name,call_id = id ,arguments=arguments))
+                        self.persist_now("tool/call")
+                        # TODO 工具出错相关处理
+                        result = await self._tool_register.execute(name,**arguments if arguments else None )
+                        self._session.append("tool/result",ToolResultData(call_id=id,tool_name=name,message=Message(role="tool",content=result,tool_call_id=id)),surface_op="append")
+                    self._session.append("step/end",StepEndData())
+                    self.persist_now("step/end")
+                    self._session.append("step/start",StepStartData())
                 else:
+                    self._session.append("turn/end",TurnEndData('success'))
                     return response
+            
         except asyncio.CancelledError:
-           self.handle_cancel()
+           pass 
 
         except asyncio.TimeoutError:
             pass
