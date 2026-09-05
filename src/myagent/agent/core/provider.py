@@ -51,7 +51,7 @@ class Message:
         """
         if not self.role:
             raise ValueError("role 为空")
-        if self.role not in ["assistant", "user", "system", "tool"]:
+        if self.role not in ["assistant", "user",  "tool"]: # system 提示词不写入，而是动态编排
             raise ValueError(f"{self.role} 不在['assistant','user','system','tool']之中")
 
         # content 为 None 仅在 assistant 发起工具调用时合法（wire 格式中该消息 content 为 null）
@@ -119,6 +119,8 @@ class StreamChunk:
     tool_id: str | None = None
     tool_name: str | None = None
     tool_arguments_delta: str | None = None
+        
+
 @dataclass
 class ChatParams:
     """采样参数，字段为 None 时使用供应商默认值
@@ -141,8 +143,19 @@ class ChatParams:
 
 class LLMProvider(ABC):
     """LLM 调用接口，由上层注入具体实现（依赖倒置）"""
-    def __init__(self,params: ChatParams | None = None):
+    def __init__(self,model: str,params: ChatParams | None = None):
         self._params = params if params else None
+        self._model = model
+
+    @property
+    def model(self) -> str:
+        """本次使用的模型名，供调用方写 request/header 快照"""
+        return self._model
+
+    @property
+    def params(self) -> ChatParams | None:
+        """采样参数，None 表示全部使用供应商默认值"""
+        return self._params
 
     @abstractmethod
     async def chat(self, messages: list[Message],tools : list[dict] | None = None ) -> LLMResponse:

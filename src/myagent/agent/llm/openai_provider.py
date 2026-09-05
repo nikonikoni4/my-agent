@@ -21,8 +21,7 @@ class OpenAIProvider(LLMProvider):
             api_key: 供应商的 API Key
             base_url: 兼容接口地址，None 表示使用 OpenAI 官方地址
         """
-        super().__init__(chat_params)
-        self._model = model
+        super().__init__(model,chat_params)
         self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
 
     async def chat(self, messages: list[Message], tools : list[dict] | None = None) -> LLMResponse:
