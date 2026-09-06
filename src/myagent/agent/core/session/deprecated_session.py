@@ -14,9 +14,9 @@ class SessionRecord:
     """
     session文件每一行保存的单位
     """
-    uuid : str = field(default_factory=lambda : str(uuid.uuid4()))
     turn : int  # 每次写入+1
-    message : Message 
+    message : Message
+    uuid : str = field(default_factory=lambda : str(uuid.uuid4()))
     
 
 @dataclass
