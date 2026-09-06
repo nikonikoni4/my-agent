@@ -1,11 +1,12 @@
 
 import asyncio
+import datetime
 import json
 import logging
 from pathlib import Path
 
 from myagent.infra.events import EventService
-from myagent.agent.core.session.types import SessionRecordData
+from myagent.agent.core.session.types import SessionRecordData,TextChunkData,AssistantChunkData,SessionMetaData
 
 logger = logging.getLogger(__name__)
 
@@ -20,10 +21,11 @@ class SessionPresist:
        失败时截断回原大小；当场截断失败则记下目标大小，下次写入前先补截断，
        补截断没完成之前绝不写入新数据
     """
-    def __init__(self, event_service: EventService, file_path: Path):
+    def __init__(self, event_service: EventService, file_path: Path, meta_data: SessionMetaData):
         self.file_path = file_path
+        self.meta_data = meta_data
         event_service.on("session/event", self.cache_data)
-        self._buffer = []
+        self._buffer :list[SessionRecordData] = []
         # 上次写入失败后文件应回滚到的字节数；None 表示没有待补的回滚
         self._pending_truncate: int | None = None
         self._presist_loop = asyncio.create_task(self.loop())
@@ -38,15 +40,107 @@ class SessionPresist:
         """session/event触发，写入缓存"""
         self._buffer.append(record)
 
+    def _conserve_chunk_type(self):
+        """将assistant/chunk 类型 的recorddata -> text-chunk 进行合并"""
+        merged_buffer = [] # 构造新的buffer
+        pending: list[SessionRecordData] = []  # 当前连续的 assistant/chunk 段
+        for record in self._buffer:
+            if record.type == "assistant/chunk":
+                pending.append(record)
+                continue
+            if pending:
+                # 合并
+                merged_buffer.extend(self._merge_chunks(pending))
+                pending = []
+            merged_buffer.append(record)
+        if pending:
+            merged_buffer.extend(self._merge_chunks(pending))
+        self._buffer = merged_buffer
+        
+    def _merge_chunks(self,assistant_records:list[SessionRecordData])->list[SessionRecordData]:
+        """
+        把一些assistant/chunk 的 record 改为 data 合并为 TextChunkData 的 record
+        
+        """
+        assert assistant_records is not None , "传入的assistant_records为空"
+        # 先以第一个开始
+        assistant_data : AssistantChunkData= assistant_records[0].data
+        text_chunk_records  = []
+        text_chunk_records.append(SessionRecordData(
+                type="text-chunk",
+                seq = assistant_records[0].seq,
+                turn = assistant_records[0].turn,
+                step= assistant_records[0].step,
+                timestamp=assistant_records[0].timestamp,
+                source_event_seqs=[assistant_records[0].seq],
+                data = TextChunkData(
+                    type = assistant_data.type,
+                    uuid = [assistant_records[0].uuid],
+                    dt = [0],
+                    first_seq=assistant_records[0].seq,
+                    index = assistant_data.index if assistant_data.index else None,
+                    id=assistant_data.id if assistant_data.id else None,
+                    name = assistant_data.name if assistant_data.name else None,
+                    args=[assistant_data.args] if assistant_data.args else None,
+                    texts=[assistant_data.texts] if assistant_data.texts else None
+                )
+            )
+        )
+
+        # dt 是组内相邻片段的毫秒间隔，追加时参照组内上一条记录
+        last_record = assistant_records[0]
+        for record in assistant_records[1:]:
+            data :AssistantChunkData = record.data
+            if data.type == text_chunk_records[-1].data.type and data.index == text_chunk_records[-1].data.index:
+                # 追加
+                text_chunk_records[-1].data.uuid.append(record.uuid)
+                text_chunk_records[-1].data.dt.append((record.timestamp - last_record.timestamp).total_seconds() * 1000)
+                text_chunk_records[-1].source_event_seqs.append(record.seq)
+                if data.type == "tool-call":
+                    text_chunk_records[-1].data.args.append(record.data.args)
+                else:
+                    text_chunk_records[-1].data.texts.append(record.data.texts)
+            else:
+                # 重新新建一条
+                text_chunk_records.append(SessionRecordData(
+                        type="text-chunk",
+                        seq = record.seq,
+                        turn = record.turn,
+                        step= record.step,
+                        timestamp=record.timestamp,
+                        source_event_seqs=[record.seq],
+                        data = TextChunkData(
+                            type = record.data.type,
+                            uuid = [record.uuid],
+                            dt = [0],
+                            first_seq=record.seq,
+                            index = record.data.index if record.data.index or record.data.index == 0 else None,
+                            id=record.data.id if record.data.id else None,
+                            name=record.data.name if record.data.name else None,
+                            args=[record.data.args] if record.data.args else None,
+                            texts=[record.data.texts] if record.data.texts else None
+                        )
+                    )
+                )
+            # 新建分支的组首就是当前记录，统一推进参照点
+            last_record = record
+        return text_chunk_records
+
     def presist(self):
         """持久化写入函数，将buffer整批写入文件，失败时回滚本次写入并保留buffer"""
         if not self._buffer:
             return
+        # 序列化前先归并：assistant/chunk 在文件里以 text-chunk 打包行存储
+        self._conserve_chunk_type()
         # 序列化先于打开文件：序列化出错时文件还未被触碰，属于代码 bug，直接抛出
         content = "".join(
             json.dumps(record.to_record_dict(), ensure_ascii=False) + "\n"
             for record in self._buffer
         )
+        # 首次写入（文件不存在）时先落 meta 行，meta 与记录同批写入，回滚逻辑统一覆盖
+        first_write = not self.file_path.exists()
+        if first_write:
+            content = json.dumps(self.meta_data.meta_data(), ensure_ascii=False) + "\n" + content
         # 有待补的回滚：先把文件截回上次写入前的大小。文件已消失则无需回滚。
         # 截不动（打不开文件）就抛异常中止本次写入，绝不在残缺数据上追加
         if self._pending_truncate is not None:
@@ -72,6 +166,38 @@ class SessionPresist:
                 pass
             raise 
         self._buffer = []  # 整批落盘成功才清空
+        # 收尾：非首写时刷新首行 meta 的 updated_at（首写的 meta 行时间就是新的）
+        if not first_write:
+            self._update_meta_line()
+
+    def _update_meta_line(self):
+        """尽力刷新文件首行 meta 的 updated_at，非关键收尾步骤，只尝试一次。
+
+        任何 OSError（文件被占用、被删等）直接放弃：不重试、不抛出、不进入
+        写入回滚记账。重写整个文件代价太大，这里按旧首行等长原位覆盖：
+        沿用旧行的行尾符（\n 或 \r\n），新行变短用空格补在行尾符之前，
+        变长或首行不是 meta 行则跳过，保证第二行起的内容永不被触碰。
+        """
+        try:
+            self.meta_data.updated_at = datetime.datetime.now(datetime.timezone.utc)
+            new_bytes = json.dumps(self.meta_data.meta_data(), ensure_ascii=False).encode("utf-8")
+            with self.file_path.open("r+b") as f:
+                old_line = f.readline()
+                try:
+                    is_meta = json.loads(old_line).get("type") == "meta_data"
+                except (ValueError, AttributeError):
+                    is_meta = False
+                if not is_meta or not old_line.endswith(b"\n"):
+                    return
+                ending = b"\r\n" if old_line.endswith(b"\r\n") else b"\n"
+                old_body = old_line[: -len(ending)]
+                if len(new_bytes) > len(old_body):
+                    logger.warning("meta 行变长，无法原位刷新 updated_at，跳过")
+                    return
+                f.seek(0)
+                f.write(new_bytes + b" " * (len(old_body) - len(new_bytes)) + ending)
+        except OSError as e:
+            logger.warning("刷新 meta updated_at 失败（不影响已落盘记录）: %s", e)
 
     async def loop(self):
         while True:

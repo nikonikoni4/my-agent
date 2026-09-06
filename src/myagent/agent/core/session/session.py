@@ -47,7 +47,7 @@ class Session:
         self.record_list : list[SessionRecordData] = record_list if record_list else []
         self._event_service = event_service
         self.surface_manager = SurfaceManager(record_list)
-        self.presistence = SessionPresist(event_service,local_data_path / f"session/{meta_data.session_id}.jsonl" )
+        self.presistence = SessionPresist(event_service,local_data_path / f"session/{meta_data.session_id}.jsonl", meta_data )
         # 恢复坐标：轮间压缩的记录 turn 为 None，向前找最近一条带 turn 的记录
         self.turn = 0
         for record in reversed(self.record_list):

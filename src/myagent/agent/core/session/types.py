@@ -87,9 +87,8 @@ class AssistantChunkData(SessionData):
     index: int | None = None  # 槽位号，并行调用时区分归属；非工具片段为 None
     id: str | None = None  # 调用标识，仅每个调用的首个片段携带，后续片段为 None
     name: str | None = None  # 工具名，携带规则同 id
-    dt: list[int] | None = None  # 内存事件阶段不填（None），打包持久化时才计算相邻片段间隔
-    args: list[str] | None = None  # 参数 JSON 碎片逐片保存，单个碎片不是合法 JSON；非工具片段为 None
-    texts: list[str] | None = None  # 文本增量碎片；工具调用片段为 None
+    args: str | None = None  # 本片段的参数 JSON 碎片，单个碎片不是合法 JSON；非工具片段为 None
+    texts: str | None = None  # 本片段的文本增量；工具调用片段为 None
 
     def __init__(self, chunk: StreamChunk):
         # provider 流每个片段只填一类字段（见 openai_provider.stream_chat），按字段推断类型
@@ -98,15 +97,16 @@ class AssistantChunkData(SessionData):
             self.index = chunk.tool_index
             self.id = chunk.tool_id
             self.name = chunk.tool_name
-            self.args = [chunk.tool_arguments_delta] if chunk.tool_arguments_delta is not None else None
+            self.args = chunk.tool_arguments_delta
         elif chunk.content is not None:
             self.type = "content"
-            self.texts = [chunk.content]
+            self.texts = chunk.content
         elif chunk.reasoning_content is not None:
             self.type = "reasoning"
-            self.texts = [chunk.reasoning_content]
+            self.texts = chunk.reasoning_content
         else:
             self.type = None
+
 
 @dataclass
 class AssistantMessageData(SessionData):
@@ -196,6 +196,7 @@ class SessionMetaData:
             "type":"meta_data",
             "format_version" : self.format_version,
             "session_id":self.session_id,
+            "cwd" : self.cwd,
             "name" : self.name,
             "created_at":self.created_at.isoformat(),
             "updated_at":updated_at.isoformat(),
@@ -218,3 +219,16 @@ class SessionRecordData:
         d = asdict(self)
         d["timestamp"] = self.timestamp.isoformat()
         return d
+
+@dataclass
+class TextChunkData:
+    type : Literal["content","reasoning","tool-call"]
+    first_seq : int
+    index : int 
+    uuid : list[str] 
+    dt : list[int] 
+    id : str | None 
+    name : str | None
+    args : list[str] | None
+    texts : list[str] | None
+    
