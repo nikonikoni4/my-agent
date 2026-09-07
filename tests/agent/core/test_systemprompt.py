@@ -1,0 +1,151 @@
+"""SystemPrompt 组装器的行为测试。
+
+规格来源：systemprompt.py 头部注释的三条设计意图
+1. 隔离机制：agent_name -> prompt 的显式注册
+2. 遮蔽机制：agent 层同名 section 顶替全球层
+3. 动态变化：context 走快照路（不进 system 文本）
+"""
+
+import logging
+
+import pytest
+
+from myagent.agent.core.systemprompt.systemprompt import SystemPrompt
+from myagent.agent.core.systemprompt.types import PrompSection
+
+
+def make_section(name: str, order: int, text: str) -> PrompSection:
+    return PrompSection(name=name, order=order, text=text)
+
+
+@pytest.fixture
+def sp() -> SystemPrompt:
+    return SystemPrompt()
+
+
+# ---------- 全球层默认内容 ----------
+
+def test_default_global_prompt(sp):
+    """测试场景：构造后全球层应包含 identity 段，order 为 -100"""
+    assert "identity" in sp._global_prompt
+    assert sp._global_prompt["identity"].order == -100
+
+
+# ---------- 注册与遮蔽 ----------
+
+def test_register_section_to_agent(sp):
+    """测试场景：agent 注册的 section 出现在该 agent 的组装结果中"""
+    sp.register_section("coder", make_section("tool:bash", 100, "bash 指导"))
+    assembly = sp.assemble("coder")
+    names = [s.name for s in assembly.sections.values()]
+    assert "tool:bash" in names
+    assert "identity" in names  # 全球段仍存在
+
+
+def test_agent_section_shadows_global(sp):
+    """测试场景：agent 注册与全球同名的 section，遮蔽后只出现 agent 版本"""
+    sp.register_section(
+        "coder",
+        make_section("identity", -100, "你是代码审查员"),
+    )
+    assembly = sp.assemble("coder")
+    identity_sections = [s for s in assembly.sections.values() if s.name == "identity"]
+    assert len(identity_sections) == 1, "同名段遮蔽后不应重复出现"
+    assert identity_sections[0].text == "你是代码审查员"
+
+
+def test_sections_isolated_between_agents(sp):
+    """测试场景：agent A 注册的段不出现在 agent B 的组装结果中"""
+    sp.register_section("coder", make_section("tool:bash", 100, "bash 指导"))
+    coder_names = [s.name for s in sp.assemble("coder").sections.values()]
+    writer_names = [s.name for s in sp.assemble("writer").sections.values()]
+    assert "tool:bash" in coder_names
+    assert "tool:bash" not in writer_names
+
+
+# ---------- 排序 ----------
+
+def test_sorted_section_by_order(sp):
+    """测试场景：组装结果的段按 order 升序排列"""
+    sp.register_section("coder", make_section("tool:bash", 100, "b"))
+    sp.register_section("coder", make_section("policy", 50, "p"))
+    sp.register_section("coder", make_section("persona", 0, "u"))
+    orders = [s.order for s in sp.assemble("coder").sorted_sections()]
+    assert orders == sorted(orders)
+
+
+# ---------- context（快照路） ----------
+
+def test_register_context_into_assembly(sp):
+    """测试场景：register_context 的内容出现在 assembly.context 中"""
+    sp.register_context("coder", "当前时间: 2026-09-07")
+    assembly = sp.assemble("coder")
+    assert "当前时间: 2026-09-07" in assembly.context
+
+
+def test_context_isolated_between_agents(sp):
+    """测试场景：agent A 的 context 不出现在 agent B 的组装结果中"""
+    sp.register_context("coder", "终端位置: /home/coder")
+    assert "终端位置" not in sp.assemble("writer").context
+
+
+# ---------- 注销 ----------
+
+def test_unregister_removes_agent_content(sp):
+    """测试场景：注销后该 agent 的段与 context 全部消失，回落全球层"""
+    sp.register_section("coder", make_section("tool:bash", 100, "bash 指导"))
+    sp.register_context("coder", "当前时间: 2026-09-07")
+    sp.unregister("coder")
+    names = [s.name for s in sp.assemble("coder").sections.values()]
+    assert "tool:bash" not in names
+    assert "identity" in names
+    assert "当前时间" not in sp.assemble("coder").context
+
+
+def test_unregister_unknown_agent_does_not_raise(sp):
+    """测试场景：注销未注册的 agent 不应抛错"""
+    sp.unregister("ghost")
+
+
+# ---------- 渲染 ----------
+
+def test_render_static_sections_joined(sp):
+    """测试场景：静态段按 order 排序后拼接成字符串"""
+    sp.register_section("coder", make_section("tool:bash", 100, "bash 指导"))
+    sp.register_section("coder", make_section("persona", 0, "你是一个编码助手"))
+    assembly = sp.assemble("coder")
+    text = SystemPrompt.render(assembly)
+    assert "你是一个个人助手" in text   # identity(-100)
+    assert "你是一个编码助手" in text   # persona(0)
+    assert "bash 指导" in text         # tool:bash(100)
+    assert text.index("你是一个个人助手") < text.index("你是一个编码助手") < text.index("bash 指导")
+
+
+def test_render_callable_section_with_params(sp):
+    """测试场景：text 为可调用对象时，按段名从 params 取参数注入"""
+    sp.register_section(
+        "coder",
+        make_section("deployment", 0, lambda *, cwd: f"工作目录: {cwd}"),
+    )
+    assembly = sp.assemble("coder")
+    text = SystemPrompt.render(assembly, params={"deployment": {"cwd": "/home/u"}})
+    assert "工作目录: /home/u" in text
+
+
+def test_render_callable_without_params_skipped(caplog):
+    """测试场景：text 为可调用对象但无注入参数时，跳过该段并告警，不抛错"""
+    sp = SystemPrompt()
+    sp.register_section("coder", make_section("deployment", 0, lambda *, cwd: cwd))
+    assembly = sp.assemble("coder")
+    with caplog.at_level(logging.WARNING):
+        text = SystemPrompt.render(assembly, params={})
+    assert "工作目录" not in text
+    assert any("deployment" in r.message for r in caplog.records)
+
+
+def test_render_static_with_params_renders_text(sp):
+    """测试场景：静态段的 text 不做参数注入，即使 params 里带同名键也正常输出"""
+    sp.register_section("coder", make_section("identity", -100, "固定文本"))
+    assembly = sp.assemble("coder")
+    text = SystemPrompt.render(assembly, params={"identity": {"cwd": "/x"}})
+    assert "固定文本" in text
