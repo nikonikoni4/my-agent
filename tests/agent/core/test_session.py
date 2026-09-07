@@ -20,12 +20,6 @@ from myagent.agent.core.session.types import (
 # 测试固件
 # ---------------------------------------------------------------------------
 
-@pytest.fixture(autouse=True)
-def _isolated_data_path(tmp_path, monkeypatch):
-    """把持久化路径指向临时目录，测试不污染真实 local_data_path。"""
-    monkeypatch.setattr("myagent.agent.core.session.session.local_data_path", tmp_path)
-
-
 @pytest.fixture
 def event_service():
     """每个测试独立的空事件服务，Session 构造必需。"""

@@ -8,7 +8,6 @@ from myagent.infra.events.service import EventService
 from myagent.infra.events.eventspec import SESSION_EVENT,SessionEventPayload
 from myagent.agent.core.session.surface import SurfaceManager
 from myagent.agent.core.session.persistence import SessionPresist
-from myagent.config.system_config import local_data_path
 import copy
 class Session:
     """
@@ -40,14 +39,16 @@ class Session:
         "compaction/start", "compaction/summary", "compaction/end",
     })
 
-    def __init__(self,event_service :EventService,meta_data :SessionMetaData,record_list:list[SessionRecordData] | None =None ,name : str | None = None  ):
+    def __init__(self,event_service :EventService,meta_data :SessionMetaData,record_list:list[SessionRecordData] | None =None ,presistence : SessionPresist | None = None  ):
 
 
         self.meta_data = meta_data
         self.record_list : list[SessionRecordData] = record_list if record_list else []
         self._event_service = event_service
         self.surface_manager = SurfaceManager(record_list)
-        self.presistence = SessionPresist(event_service,local_data_path / f"session/{meta_data.session_id}.jsonl", meta_data )
+        # 持久化组件由 SessionStore 组装注入：Session 只负责 append 触发 session/event，
+        # SessionPresist 订阅该事件后异步落盘
+        self.presistence = presistence
         # 恢复坐标：轮间压缩的记录 turn 为 None，向前找最近一条带 turn 的记录
         self.turn = 0
         for record in reversed(self.record_list):

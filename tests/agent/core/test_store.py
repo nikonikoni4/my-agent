@@ -1,17 +1,23 @@
-"""store.load 加载恢复测试。
+"""store 加载恢复测试。
 
 往返链路：SessionPresist 落盘（首次写入自动补 meta 行 + chunk 固件归并 + 一条
-user/message），再用 load 还原并逐项断言。meta 行由 presist 的 meta_data 参数提供。
+user/message），再用 store.load 还原为 Session 并逐项断言。meta 行由 presist
+的 meta_data 参数提供。store.load/create 内部构造 SessionPresist（依赖运行中
+事件循环），测试体为 async。
 """
 import datetime
 
+import pytest
+
 from conftest import make_chunk_record_list
-from myagent.agent.core.session.store import load
+from myagent.infra.events.service import EventService
+from myagent.agent.core.session.store import SessionStore
 from myagent.agent.core.session.persistence import SessionPresist
 from myagent.agent.core.session.types import (
     SessionRecordData, UserMessageData, AssistantChunkData, SessionMetaData,
 )
 from myagent.agent.core.provider import Message
+from myagent.utils.helper import project_path_to_session_folder
 
 
 def make_presist(path, meta) -> SessionPresist:
@@ -24,16 +30,18 @@ def make_presist(path, meta) -> SessionPresist:
     return comp
 
 
-def test_load_文件不存在返回None(tmp_path, monkeypatch):
-    monkeypatch.setattr("myagent.agent.core.session.store.local_data_path", tmp_path)
-    assert load("no-such-id") is None
+def test_load_文件不存在返回None(tmp_path):
+    store = SessionStore(tmp_path / "session", EventService())
+    assert store.load("no-such-id", tmp_path / "proj") is None
 
 
-def test_load_往返_解包chunk_还原嵌套消息(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_load_往返_解包chunk_还原嵌套消息(tmp_path):
     session_dir = tmp_path / "session"
     session_dir.mkdir()
-    monkeypatch.setattr("myagent.agent.core.session.store.local_data_path", tmp_path)
-    path = session_dir / "s1.jsonl"
+    project_path = tmp_path / "proj"
+    path = project_path_to_session_folder(project_path, session_dir) / "s1.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
 
     meta = SessionMetaData(cwd="", session_id="s1", name="s1")
     comp = make_presist(path, meta)
@@ -44,9 +52,14 @@ def test_load_往返_解包chunk_还原嵌套消息(tmp_path, monkeypatch):
     comp._buffer.extend([*make_chunk_record_list(), user_rec])
     comp.presist()
 
-    result = load("s1")
-    assert result is not None
-    meta_restored, records = result
+    session = SessionStore(session_dir, EventService()).load("s1", project_path)
+    assert session is not None
+    meta_restored = session.meta_data
+    records = session.record_list
+    # 组装断言：load 直接返回可用 Session，持久化组件随装配注入
+    assert session._event_service is not None
+    assert session.presistence is not None
+    assert session.presistence.file_path == path
 
     # meta 行由 presist 首次写入自动补写，load 还原字段一致
     assert meta_restored.session_id == "s1"
@@ -91,3 +104,21 @@ def test_load_往返_解包chunk_还原嵌套消息(tmp_path, monkeypatch):
     for i, r in enumerate(chunk_records):
         assert r.timestamp == datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc) + datetime.timedelta(milliseconds=i + 1)
         assert r.uuid == f"u{i + 1}"
+
+
+@pytest.mark.asyncio
+async def test_create_返回空会话并绑定持久化(tmp_path):
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    project_path = tmp_path / "proj"
+    store = SessionStore(session_dir, EventService())
+
+    session = store.create("新会话", project_path)
+
+    assert session.record_list == []
+    assert session.meta_data.name == "新会话"
+    assert session.meta_data.cwd == str(project_path)
+    assert session.presistence is not None
+    # 文件路径在项目编码子文件夹下，meta 行随首批记录才写入，此时文件尚不存在
+    assert session.presistence.file_path == project_path_to_session_folder(project_path, session_dir) / f"{session.meta_data.session_id}.jsonl"
+    assert not session.presistence.file_path.exists()
