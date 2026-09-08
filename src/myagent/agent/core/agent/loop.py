@@ -1,0 +1,155 @@
+from typing import Literal
+import uuid
+from myagent.agent import execption
+from myagent.agent.core.agent.types import AgentConfig, StepOut
+from myagent.agent.core.session import session
+from myagent.agent.core.systemprompt import AssemblyPrompt, SystemPrompt
+from myagent.infra.events import EventService
+from myagent.agent.core.tool import ToolRegister
+from myagent.agent.core.provider import LLMProvider,ChatParams, LLMResponse,Message, StreamChunk, ToolCallRequest,Usage
+from myagent.agent.core.session.types import (
+    AssistantChunkData, SessionMetaData,ToolCallChunksData,AssistantMessageData, StepEndData,CompactionStartData,
+    SessionRecordData,ReasoningChunksData,ToolCallData,ToolResultData,TurnEndData,CompactionSummaryData,
+    TurnStartData,StepStartData,UserMessageData,ContentChunksData,RequestHeaderData,CompactionEndData
+)
+from myagent.agent.core.session.session import Session
+
+import asyncio 
+import logging
+
+from myagent.infra.events.eventspec import REQUEST_ERROR
+from myagent.infra.events.payload import RequestErrorPayLoad
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+LLM_CALL_TIMEOUT = 120 # 单位秒
+TOOL_CALL_TIMEOUT = 60 # 单位秒
+MAX_RETRY_COUNT= 5 # 次
+class ReActAgentLoop:
+    def __init__(self,event_service:EventService,session :Session,tool_register:ToolRegister,system_prompt : SystemPrompt,agent_config :AgentConfig,llm_client:LLMProvider,name :str | None = None):     
+        """        
+        Args:
+            event_service: 事件服务，用于在循环关键节点发布事件（埋点尚未接入）。
+            session: 本循环绑定的会话，所有消息读写都落在它上面。
+            tool_register: 工具注册表，提供工具 schema 与执行。
+            llm_client: LLM 调用实现（LLMProvider 接口）。
+        """
+        self.name =name  if name else str(uuid.uuid4())[:8] # 若没有名称/id , 
+        self._event_service = event_service
+        self.tool_register = tool_register
+        self.system_prompt = system_prompt
+        self._llm_client = llm_client
+        self.agent_config = agent_config
+        self.inbox = {"next_turn":[],"next_step":[]} # next_turn 的消息要等待agentturn完成之后才会调用，而next_step会在下一个step马上打断并调用
+        self._session = session
+        self._task = None
+        self.state :Literal["idle","running","maintenance"] = "idle"# maintenance 暂时没用
+        self._LLM_CALL_TIMEOUT = LLM_CALL_TIMEOUT
+
+    async def send(self,user_prompt : str | list):
+        """
+        将消息发送进inbox
+        """
+        if isinstance(user_prompt,str):
+            content = [{"type":"text","text":user_prompt}]
+        # 整合可能会动态变化的系统提示词(为了缓存命中而不放在开头)
+        # 这里暂时不拼接
+        await self.turn(Message("user",content))
+
+    def followup(self):
+        pass
+
+
+    def persist_session_now(self):
+        try:
+            self._session.presistence.presist()
+        except OSError as e:
+            # 所有专门错误处理，类型等暂时先跳过
+            pass 
+
+    async def turn(self,user_message):
+        try:
+            self._session.append("turn/start",TurnStartData())
+            await self.step(user_message)
+        finally:
+            self._session.append("turn/end",TurnEndData("success"))  # 暂时这么写
+    def _request_header(self):
+        # 组装systemprompt
+        assembly_prompt : AssemblyPrompt = self.system_prompt.assemble(self.name)
+        system_prompt = self.system_prompt.render(assembly_prompt,self.agent_config.prompt_render_parame)
+        current = RequestHeaderData(
+            reason="initial",
+            model_name=self._llm_client.model,
+            system_prompt=system_prompt,
+            tools=self.tool_register.to_schemas(),
+            params=self._llm_client.params,
+        )
+        # 与最近一条 request/header 比较（reason 不参与比较，它是写入时才决定的结果）
+        last = self._session.latest_request_header()
+        if last is None:
+            # 本会话从未写入过配置快照
+            self._session.append("request/header", current)
+        elif (last.model_name, last.system_prompt, last.tools, last.params) != (current.model_name, current.system_prompt, current.tools, current.params):
+            current.reason = "change"
+            self._session.append("request/header", current)
+        # 除 reason 外完全一致：不写入，request/header 仅首次和配置变更时记录
+
+    async def step(self,user_message):
+        step_error = None
+        while True: # 为了重试而添加的Ture，try写在内部判断究竟是什么错误来决定是否重试
+            try:
+                self._session.append("step/start",StepStartData())
+                self._request_header()
+                if user_message:
+                    self._session.append("user/message",UserMessageData(user_message),surface_op="append")
+                    user_message = None # 用户消息只写首个step，后续step（工具循环）不再重复写
+                # 在模型请求前强制保存session
+                self.persist_session_now()
+                response = await asyncio.wait_for(self._ask_model(),self._LLM_CALL_TIMEOUT)
+
+                # 工具调用循环前强制保存session
+                self.persist_session_now()
+                if response.tool_call_requests:
+                    async with asyncio.TaskGroup() as tg:
+                        tasks = []
+                        for tool_call in response.tool_call_requests:
+                            tasks.append(tg.create_task(self.tool_register.execute(tool_call.name,**tool_call.arguments)))
+                            self._session.append("tool/call",ToolCallData(tool_name=tool_call.name,call_id = tool_call.id ,arguments=tool_call.arguments))
+                    for index,task in enumerate(tasks):
+                        tool_call = response.tool_call_requests[index]
+                        too_result =  task.result()
+                        self._session.append("tool/result",ToolResultData(call_id=tool_call.id,tool_name=tool_call.name,message=Message(role="tool",content=too_result,tool_call_id=tool_call.id)),surface_op="append",source_event_seqs=[])
+                else:
+                    break # 模型不再请求工具，本轮结束（ReAct 终止条件）
+                
+            except TimeoutError: # python 3.11+ 用TimeoutError， < 3.11用asyncio.TimeoutError
+                step_error = TimeoutError # 这里暂时先就这样简单的写，后续才丰富step_error的内容
+                    
+            except asyncio.CancelledError:
+                # 取消中断比较特殊，单独处理，不走request/error
+                pass 
+
+            finally:
+                # if step_error :
+                #     request_error_result = self._event_service.trigger(REQUEST_ERROR,RequestErrorPayLoad(error_type=step_error))
+                # 先不管错误处理，等先跑通了一遍流程之后再逐个错误处理进行安排，假设当前不会出错
+                self._session.append("step/end",StepEndData())
+
+
+
+
+                 
+    
+    async def _ask_model(self)->LLMResponse:
+        async for item in self._llm_client.stream_chat(self._session.derive_messages(),self.tool_register.to_schemas()):
+            if isinstance(item, LLMResponse):
+                response = item
+                self._session.append("assistant/message",AssistantMessageData(Message(
+                    role = "assistant",
+                    content = response.content,
+                    tool_calls=response.tool_call_requests,
+                    reasoning_content=response.reasoning_content,
+                ),usage=response.usage),surface_op="append",source_event_seqs=[])
+            else:
+                self._session.append("assistant/chunk",AssistantChunkData(item))
+
+        return response

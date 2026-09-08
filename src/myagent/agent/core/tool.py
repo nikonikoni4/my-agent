@@ -261,8 +261,9 @@ class ToolRegister:
         try:
             return await self._tools[tool_name].execute(**kwargs)
         except Exception as e:
+            # 暂时的写法，这里工具调用错误还需要分类进行
             logger.error(f"{tool_name}工具调用错误，参数:{kwargs}")
-            raise ToolExecuteError(f"{tool_name}工具调用错误，参数:{kwargs}") from e
+            return f"{tool_name}工具调用错误，参数:{kwargs}"
 
     def to_schemas(self)->list[dict]:
         """编译所有已注册工具的 schema。

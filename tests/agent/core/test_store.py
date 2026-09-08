@@ -103,7 +103,8 @@ async def test_load_往返_解包chunk_还原嵌套消息(tmp_path):
     # timestamp 按 组首 + dt 累积重建：固件相邻间隔 1ms，逐条恢复后应与原始一致
     for i, r in enumerate(chunk_records):
         assert r.timestamp == datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc) + datetime.timedelta(milliseconds=i + 1)
-        assert r.uuid == f"u{i + 1}"
+        # 片段 uuid 不落盘（身份按 seq 位置还原，参照 DeepSeek-Harness），恢复时重新生成
+        assert r.uuid
 
 
 @pytest.mark.asyncio

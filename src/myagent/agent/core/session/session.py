@@ -2,7 +2,7 @@ from myagent.agent.core.provider import Message
 from myagent.agent.core.session.types import (
     SessionMetaData,SessionData,AssistantChunkData,AssistantMessageData, StepEndData,CompactionStartData,
     SessionRecordData,ToolCallData,ToolResultData,TurnEndData,CompactionSummaryData,
-    TurnStartData,StepStartData,UserMessageData,RequestHeaderData,CompactionEndData
+    TurnStartData,StepStartData,UserMessageData,RequestHeaderData,CompactionEndData,LLMRetryData
 )
 from myagent.infra.events.service import EventService
 from myagent.infra.events.eventspec import SESSION_EVENT,SessionEventPayload
@@ -31,6 +31,7 @@ class Session:
         "compaction/start": CompactionStartData,
         "compaction/summary": CompactionSummaryData,
         "compaction/end": CompactionEndData,
+        "llm/retry" : LLMRetryData
     }
 
     # 信封上 step 记为 None 的事件：不属于任何 step（轮边界事件与压缩事务）
@@ -56,7 +57,7 @@ class Session:
                 self.turn = record.turn
                 break
         self.step = 0
-    
+        
     @property
     def record_list_seq(self):
         return len(self.record_list)
@@ -73,6 +74,28 @@ class Session:
                 messages.append(self.record_list[seq - 1].data.message)
         return messages
     
+    def latest_request_header(self) -> RequestHeaderData | None:
+        """返回最近一条 request/header 的配置快照（含 model_name/system_prompt/tools/params）。
+
+        从后往前找最近一条 request/header 记录的 data；本会话从未写入过（新会话首轮）时返回 None。
+        """
+        for record in reversed(self.record_list):
+            if record.type == "request/header":
+                return record.data
+        return None
+
+    def llm_retry_count(self, turn: int) -> int:
+        """统计指定 turn 内 type 为 llm/retry 的记录条数。
+
+        该 turn 不存在或没有重试记录时返回 0；llm/retry 属于 step 内事件，
+        信封上带 turn 定位，直接按 turn 过滤即可。
+        """
+        return sum(
+            1
+            for record in self.record_list
+            if record.turn == turn and record.type == "llm/retry"
+        )
+
     def _build_record(self,data:SessionData,event_type,surface_op = None,source_event_seqs:list |None=None)->SessionRecordData:
         if event_type == "turn/start":
             self.turn += 1

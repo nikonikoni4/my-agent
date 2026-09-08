@@ -17,7 +17,7 @@ import asyncio
 import logging
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
-class Loop:
+class AgentLoop:
     """单个会话的对话循环：调用 LLM → 记录回复 → 执行工具，直到模型不再请求工具。
 
     一个实例在构造时绑定一个 session，只服务该会话的生命周期；
@@ -49,15 +49,13 @@ class Loop:
         if self._task:
             self._task.cancel()
 
-    async def followup(self,message:Message)->LLMResponse:
+    async def followup(self,system_prompt:str,message:Message)->LLMResponse:
         """向会话追加用户消息并启动一轮对话循环，等待其完成。
 
         Args:
             message: 用户输入的消息。
-
-        
         """
-        self._task = asyncio.create_task(self._run_loop(message))
+        self._task = asyncio.create_task(self._run_loop(system_prompt,message))
         return await self._task
 
 
@@ -69,7 +67,7 @@ class Loop:
             logger.error(f"{loc} persist_now 出错{e}")
              
 
-    async def _run_loop(self,message:Message)->LLMResponse|None:
+    async def _run_loop(self,system_prompt:str,message:Message)->LLMResponse|None:
         """对话循环主体：调 LLM → 记录 assistant 回复 → 执行工具并记录结果 → 循环。
 
         Args:
@@ -77,8 +75,6 @@ class Loop:
 
         event:
             llm_call -> stream chunk (<loop_llm_call_chunk>) -> <after_loop_llm_call> -> tool_use -> <after_tool_use>
-
-
             
         """
 
@@ -88,7 +84,7 @@ class Loop:
             self._session.append("turn/start",TurnStartData())
             self._session.append("step/start",StepStartData())
             # TODO 暂时设置为initial 后续应该考虑resume change等
-            self._session.append("request/header",RequestHeaderData(reason='initial',model_name=self._llm_client.model,system_prompt='',tools=self._tool_register.to_schemas(),params=self._llm_client.params))
+            self._session.append("request/header",RequestHeaderData(reason='initial',model_name=self._llm_client.model,system_prompt=system_prompt,tools=self._tool_register.to_schemas(),params=self._llm_client.params))
             self._session.append("user/message",UserMessageData(message),surface_op="append")
             while True:
                 
@@ -103,7 +99,7 @@ class Loop:
                             content = response.content,
                             tool_calls=response.tool_call_requests,
                             reasoning_content=response.reasoning_content,
-                        ),usage=response.usage),surface_op="append")
+                        ),usage=response.usage),surface_op="append",source_event_seqs=[])
                     else:
                         chunks.append(item)
                         self._session.append("assistant/chunk",AssistantChunkData(item))
@@ -112,12 +108,11 @@ class Loop:
                         id = tool_call.id
                         name = tool_call.name
                         arguments = tool_call.arguments
-
                         self._session.append("tool/call",ToolCallData(tool_name=name,call_id = id ,arguments=arguments))
                         self.persist_now("tool/call")
                         # TODO 工具出错相关处理
                         result = await self._tool_register.execute(name,**arguments if arguments else None )
-                        self._session.append("tool/result",ToolResultData(call_id=id,tool_name=name,message=Message(role="tool",content=result,tool_call_id=id)),surface_op="append")
+                        self._session.append("tool/result",ToolResultData(call_id=id,tool_name=name,message=Message(role="tool",content=result,tool_call_id=id)),surface_op="append",source_event_seqs=[])
                     self._session.append("step/end",StepEndData())
                     self.persist_now("step/end")
                     self._session.append("step/start",StepStartData())

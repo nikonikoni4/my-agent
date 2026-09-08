@@ -1,13 +1,14 @@
 import pytest
 
 from myagent.infra.events.service import EventService
-from myagent.agent.core.provider import Message, Usage
+from myagent.agent.core.provider import ChatParams, Message, Usage
 from myagent.agent.core.session.session import Session
 from myagent.agent.core.session.types import (
     SessionMetaData,
     SessionRecordData,
     UserMessageData,
     AssistantMessageData,
+    RequestHeaderData,
     TurnStartData,
     StepStartData,
     TurnEndData,
@@ -331,6 +332,141 @@ class TestDeriveMessages:
         add("u2", "a2")
         messages = session.derive_messages()
         assert [m.content for m in messages] == ["u2", "a2"]
+
+
+class TestLatestRequestHeader:
+    """测试 latest_request_header：读取最近一条 request/header 配置快照。"""
+
+    @staticmethod
+    def _header(reason, model_name, system_prompt="sp", tools=None, params=None):
+        return RequestHeaderData(
+            reason=reason,
+            model_name=model_name,
+            system_prompt=system_prompt,
+            tools=tools if tools is not None else [],
+            params=params,
+        )
+
+    @pytest.mark.asyncio
+    async def test_empty_session_returns_none(self, make_session):
+        """测试场景：新会话从未写入 request/header，返回 None"""
+        session = make_session()
+        assert session.latest_request_header() is None
+
+    @pytest.mark.asyncio
+    async def test_returns_header_data_with_all_fields(self, make_session):
+        """测试场景：写入一条后返回其 data，reason/model_name/system_prompt/tools/params 原样可读"""
+        session = make_session()
+        session.append("request/header",
+                       self._header("initial", "m-1", system_prompt="sp-1",
+                                    tools=[{"name": "get_weather"}],
+                                    params=ChatParams(temperature=0.7, max_tokens=1024)),
+                       None, None)
+        header = session.latest_request_header()
+        assert isinstance(header, RequestHeaderData)
+        assert header.reason == "initial"
+        assert header.model_name == "m-1"
+        assert header.system_prompt == "sp-1"
+        assert header.tools == [{"name": "get_weather"}]
+        assert header.params == ChatParams(temperature=0.7, max_tokens=1024)
+
+    @pytest.mark.asyncio
+    async def test_returns_latest_when_multiple(self, make_session):
+        """测试场景：写入 initial 后又写入 change，返回最近一条（从后往前找）"""
+        session = make_session()
+        session.append("request/header", self._header("initial", "m-1"), None, None)
+        session.append("request/header", self._header("change", "m-2", system_prompt="sp-2"),
+                       None, None)
+        header = session.latest_request_header()
+        assert header.reason == "change"
+        assert header.model_name == "m-2"
+        assert header.system_prompt == "sp-2"
+
+    @pytest.mark.asyncio
+    async def test_skips_interleaved_other_records(self, make_session):
+        """测试场景：快照后继续追加其他类型记录，查询跳过它们仍返回原快照"""
+        session = make_session()
+        session.append("request/header", self._header("initial", "m-1"), None, None)
+        session.append("user/message",
+                       UserMessageData(message=Message(role="user", content="hi")),
+                       "append", None)
+        session.append("assistant/message",
+                       AssistantMessageData(message=Message(role="assistant", content="ok")),
+                       "append", None)
+        assert session.latest_request_header().model_name == "m-1"
+
+    @pytest.mark.asyncio
+    async def test_loaded_history_returns_last(self, make_session):
+        """测试场景：从落盘历史恢复（record_list 直接构造）后返回最后一条快照"""
+        records = [
+            SessionRecordData(type="request/header", seq=1, turn=1, step=0,
+                              data=self._header("initial", "m-1")),
+            SessionRecordData(type="request/header", seq=2, turn=2, step=0,
+                              data=self._header("change", "m-2")),
+        ]
+        session = make_session(records)
+        assert session.latest_request_header().reason == "change"
+        assert session.latest_request_header().model_name == "m-2"
+
+
+class TestLlmRetryCount:
+    """测试 llm_retry_count：按 turn 统计 llm/retry 记录条数。
+
+    llm/retry 事件类型尚未在 RECORD_DATA_TYPES 注册（append 会拒绝写入），
+    测试用手工构造的信封记录验证查询逻辑本身；等类型注册后可改走 append。
+    """
+
+    @staticmethod
+    def _retry_record(seq: int, turn: int | None, step: int = 1) -> SessionRecordData:
+        # data 用 StepStartData 占位：查询只看信封上的 type/turn，不看 data 内容
+        return SessionRecordData(type="llm/retry", seq=seq, turn=turn, step=step,
+                                 data=StepStartData())
+
+    @pytest.mark.asyncio
+    async def test_empty_session_returns_zero(self, make_session):
+        """测试场景：空会话任何 turn 的重试计数都是 0"""
+        session = make_session()
+        assert session.llm_retry_count(1) == 0
+
+    @pytest.mark.asyncio
+    async def test_counts_only_requested_turn(self, make_session):
+        """测试场景：turn 1 有 2 条、turn 2 有 1 条，各查各的，互不串数"""
+        records = [
+            self._retry_record(1, turn=1),
+            self._retry_record(2, turn=1),
+            self._retry_record(3, turn=2),
+        ]
+        session = make_session(records)
+        assert session.llm_retry_count(1) == 2
+        assert session.llm_retry_count(2) == 1
+
+    @pytest.mark.asyncio
+    async def test_missing_turn_returns_zero(self, make_session):
+        """测试场景：查询不存在的 turn 返回 0（该轮没有记录或轮号没用过）"""
+        records = [self._retry_record(1, turn=1)]
+        session = make_session(records)
+        assert session.llm_retry_count(5) == 0
+
+    @pytest.mark.asyncio
+    async def test_ignores_other_types_in_same_turn(self, make_session):
+        """测试场景：同 turn 内的其他类型记录不计入，只数 type 为 llm/retry 的"""
+        records = [
+            SessionRecordData(type="turn/start", seq=1, turn=1, step=None,
+                              data=TurnStartData()),
+            SessionRecordData(type="step/start", seq=2, turn=1, step=1,
+                              data=StepStartData()),
+            self._retry_record(3, turn=1),
+        ]
+        session = make_session(records)
+        assert session.llm_retry_count(1) == 1
+
+    @pytest.mark.asyncio
+    async def test_ignores_turn_none_records(self, make_session):
+        """测试场景：信封 turn=None 的 llm/retry（轮间压缩位置）不归属任何轮"""
+        records = [self._retry_record(1, turn=None, step=None)]
+        session = make_session(records)
+        assert session.llm_retry_count(0) == 0
+        assert session.llm_retry_count(1) == 0
 
 
 class TestCompactNotImplemented:

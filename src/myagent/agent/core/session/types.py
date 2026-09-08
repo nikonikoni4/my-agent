@@ -135,12 +135,12 @@ class ToolResultData(SessionData):
 @dataclass
 class StepEndData(SessionData):
     """step/end：一个步骤结束。"""
-
+    
 
 @dataclass
 class TurnEndData(SessionData):
     """turn/end：一轮结束。"""
-    reason: Literal["success", "interrupted"]
+    reason: Literal["success", "interrupted","error"]
 
 
 @dataclass
@@ -204,16 +204,18 @@ class SessionMetaData:
         }
 @dataclass
 class SessionRecordData:
+    # 字段顺序即 jsonl 落盘键序：定位字段（turn/step/surface_op/source_event_seqs）
+    # 排在 data 前面，人工查看 session 文件时先读定位信息再看载荷
     type : str # event的类型
     seq : int # session jsonl的顺序，从非metadata的数据开始
-    data : SessionData # RECORD_DATA_TYPES 中的类型实例，落盘时由持久化组件经 to_record_dict 转为 dict
     turn : int | None = None # 定位：事件发生在第几轮；0 表示第一条 turn/start 之前，轮间压缩为 None
     step : int | None = None # 定位：事件发生在本轮第几步；0 表示本轮第一个 step/start 之前，不属于任何 step 的事件为 None
-    uuid : str = field(default_factory=lambda : str(uuid.uuid4()))
-    timestamp : datetime.datetime = field(default_factory=lambda: datetime.datetime.now(datetime.timezone.utc))
     surface_op : str | dict = None
+    data : SessionData = field(kw_only=True) # RECORD_DATA_TYPES 中的类型实例，落盘时由持久化组件经 to_record_dict 转为 dict
     source_event_seqs : list | None =None # 当surface_op 是{op : replace ,start,end}时必须要
-
+    timestamp : datetime.datetime = field(default_factory=lambda: datetime.datetime.now(datetime.timezone.utc))
+    uuid : str = field(default_factory=lambda : str(uuid.uuid4()))
+    
     def to_record_dict(self)->dict:
         """"""
         d = asdict(self)
@@ -222,13 +224,20 @@ class SessionRecordData:
 
 @dataclass
 class TextChunkData:
+    """text-chunk 打包存储行的 data。
+
+    片段身份是位置性的（参照 DeepSeek-Harness 的 chunk-rows）：第 k 个成员的
+    seq = 信封 seq（组首）按 source_event_seqs 逐位还原，不存每片段 uuid。
+    """
     type : Literal["content","reasoning","tool-call"]
     first_seq : int
     index : int 
-    uuid : list[str] 
-    dt : list[int] 
     id : str | None 
     name : str | None
     args : list[str] | None
     texts : list[str] | None
+    dt : list[int]
     
+class LLMRetryData:
+    retry_count : int # 第n次重试
+    reason : str # 重试原因

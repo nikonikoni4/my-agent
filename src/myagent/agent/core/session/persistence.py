@@ -6,6 +6,7 @@ import logging
 from pathlib import Path
 
 from myagent.infra.events import EventService
+from myagent.infra.events.eventspec import SessionEventPayload
 from myagent.agent.core.session.types import SessionRecordData,TextChunkData,AssistantChunkData,SessionMetaData
 
 logger = logging.getLogger(__name__)
@@ -16,13 +17,15 @@ class SessionPresist:
     session的持久化组件，他订阅sesson/event （session.appen）事件进行持久化,不负责加载逻辑
     重要：
     1. 以接口的形式进行持久化，后续如果更换成数据库，jsonl等不同的保存类型，核心代码不必。 -- 暂不实现，先只写file
-    2. event事件进入后不马上写入，而是等待200ms | 3条数据以上才一起写入
+    2. event事件进入后不马上写入，而是等待2秒
     3. 写入以批为单位保证不出现半批数据：先序列化整批，再记录文件原大小写入，
        失败时截断回原大小；当场截断失败则记下目标大小，下次写入前先补截断，
        补截断没完成之前绝不写入新数据
     """
     def __init__(self, event_service: EventService, file_path: Path, meta_data: SessionMetaData):
         self.file_path = file_path
+        # 会话目录可能从未创建（新项目/新环境首次落盘），不建目录直接 append 会 FileNotFoundError
+        self.file_path.parent.mkdir(parents=True, exist_ok=True)
         self.meta_data = meta_data
         event_service.on("session/event", self.cache_data)
         self._buffer :list[SessionRecordData] = []
@@ -36,9 +39,13 @@ class SessionPresist:
         if not task.cancelled() and task.exception() is not None:
             logger.error("session 持久化循环意外终止", exc_info=task.exception())
 
-    def cache_data(self, record: SessionRecordData):
-        """session/event触发，写入缓存"""
-        self._buffer.append(record)
+    def cache_data(self, payload: SessionEventPayload):
+        """session/event触发，写入缓存。
+
+        事件携带的是 SessionEventPayload（内含记录的深拷贝），buffer 存的必须是
+        SessionRecordData 本体，否则 presist 时访问 record.type 会直接报错。
+        """
+        self._buffer.append(payload.session_record)
 
     def _conserve_chunk_type(self):
         """将assistant/chunk 类型 的recorddata -> text-chunk 进行合并"""
@@ -75,13 +82,14 @@ class SessionPresist:
                 source_event_seqs=[assistant_records[0].seq],
                 data = TextChunkData(
                     type = assistant_data.type,
-                    uuid = [assistant_records[0].uuid],
                     dt = [0],
                     first_seq=assistant_records[0].seq,
-                    index = assistant_data.index if assistant_data.index else None,
+                    # index=0 是合法槽位号，falsy 判断会把它写成 None，导致后续同槽片段无法归组
+                    index = assistant_data.index if assistant_data.index or assistant_data.index == 0 else None,
                     id=assistant_data.id if assistant_data.id else None,
                     name = assistant_data.name if assistant_data.name else None,
-                    args=[assistant_data.args] if assistant_data.args else None,
+                    # args 必须与 uuid/dt/source_event_seqs 等长对齐：首片只带 id/name 无参数时记 None 占位
+                    args=[assistant_data.args] if assistant_data.type == "tool-call" else None,
                     texts=[assistant_data.texts] if assistant_data.texts else None
                 )
             )
@@ -93,12 +101,17 @@ class SessionPresist:
             data :AssistantChunkData = record.data
             if data.type == text_chunk_records[-1].data.type and data.index == text_chunk_records[-1].data.index:
                 # 追加
-                text_chunk_records[-1].data.uuid.append(record.uuid)
                 text_chunk_records[-1].data.dt.append((record.timestamp - last_record.timestamp).total_seconds() * 1000)
                 text_chunk_records[-1].source_event_seqs.append(record.seq)
                 if data.type == "tool-call":
+                    # 组首片段可能只带 id/name（args 为 None），追加前先把列表建出来；
+                    # None 也要占位追加，保持 args 与 uuid/dt/source_event_seqs 等长对齐
+                    if text_chunk_records[-1].data.args is None:
+                        text_chunk_records[-1].data.args = []
                     text_chunk_records[-1].data.args.append(record.data.args)
                 else:
+                    if text_chunk_records[-1].data.texts is None:
+                        text_chunk_records[-1].data.texts = []
                     text_chunk_records[-1].data.texts.append(record.data.texts)
             else:
                 # 重新新建一条
@@ -111,13 +124,12 @@ class SessionPresist:
                         source_event_seqs=[record.seq],
                         data = TextChunkData(
                             type = record.data.type,
-                            uuid = [record.uuid],
                             dt = [0],
                             first_seq=record.seq,
                             index = record.data.index if record.data.index or record.data.index == 0 else None,
                             id=record.data.id if record.data.id else None,
                             name=record.data.name if record.data.name else None,
-                            args=[record.data.args] if record.data.args else None,
+                            args=[record.data.args] if record.data.type == "tool-call" else None,
                             texts=[record.data.texts] if record.data.texts else None
                         )
                     )
@@ -201,7 +213,7 @@ class SessionPresist:
 
     async def loop(self):
         while True:
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(2)
             try:
                 self.presist()
             except OSError as e:

@@ -78,3 +78,7 @@ class TurnEndPayload(Payload):
 class SessionEventPayload[T](Payload):
     "session/event"
     session_record : T 
+
+@dataclass
+class RequestErrorPayLoad[T](Payload):
+    error_type : T # 暂定

@@ -65,7 +65,7 @@ class SessionStore:
         """按 session_id + project_path 加载会话，直接返回可用的 Session。
 
         文件内容还原为 meta 与记录列表后组装 Session（含持久化组件），
-        恢复结果与写入前的内存形态一致，可直接传入 Loop 开启对话。
+        恢复结果与写入前的内存形态一致，可直接传入 AgentLoop 开启对话。
 
         Args:
             session_id: 会话 id，定位 {project_path 编码后的项目文件夹}/{session_id}.jsonl。
@@ -125,7 +125,9 @@ class SessionStore:
     @staticmethod
     def _restore_message(d: dict) -> Message:
         """把落盘的 message dict 还原为 Message，tool_calls 同步还原"""
-        tool_calls = [ToolCallRequest(**tc) for tc in (d.get("tool_calls") or [])]
+        # None 与 [] 要区分还原：or [] 会把 None 抹成空列表，导致与内存态不一致
+        raw_tool_calls = d.get("tool_calls")
+        tool_calls = None if raw_tool_calls is None else [ToolCallRequest(**tc) for tc in raw_tool_calls]
         return Message(
             role=d["role"],
             content=d["content"],
@@ -166,6 +168,8 @@ class SessionStore:
         seq 逐位取自 source_event_seqs（权威清单，首条与打包行信封 seq 相同）；
         timestamp 用组首时间 + dt 累积重建；tool-call 片段的 id/name 只还原到
         组内首条，其余片段为 None，与打包时的携带规则一致。
+        片段 uuid 不落盘（身份按 seq 位置还原，参照 DeepSeek-Harness），
+        恢复时由 default_factory 重新生成。
         """
         d = record["data"]
         seqs = record.get("source_event_seqs")
@@ -195,10 +199,12 @@ class SessionStore:
                 seq=seq,
                 turn=turn,
                 step=step,
-                uuid=d["uuid"][i],
+                # uuid 不落盘，恢复时重新生成
                 timestamp=cur,
                 surface_op=None,
                 source_event_seqs=None,
                 data=AssistantChunkData(chunk),
             ))
         return chunks
+
+    

@@ -372,8 +372,8 @@ def test_loop_OSError不死循环_等1秒重试一次_继续下一轮(monkeypatc
 
     n = asyncio.run(main())
     assert n == 4
-    # 节奏：轮间 0.2 → 失败 → 重试前等 1 → 重试失败 → 下一轮 0.2 → …
-    assert sleeps[:4] == [0.2, 1, 0.2, 1]
+    # 节奏：轮间 2 → 失败 → 重试前等 1 → 重试失败 → 下一轮 2 → …
+    assert sleeps[:4] == [2, 1, 2, 1]
 
 
 # ---------------------------------------------------------------------------
@@ -433,11 +433,9 @@ def test_merge_assistant_chunk(tmp_path):
     assert merged[3].data.args == ["{}"]
     assert merged[4].data.texts == ["思考", "中"]
 
-    # source_event_seqs 与 uuid 按组归并，保持出现顺序
+    # source_event_seqs 按组归并，保持出现顺序；片段 uuid 不落盘（身份按 seq 位置还原）
     assert [r.source_event_seqs for r in merged] == [[1, 2, 3], [4, 5], [6], [7], [8, 9]]
-    assert merged[0].data.uuid == ["u1", "u2", "u3"]
-    assert merged[1].data.uuid == ["u4", "u5"]
-    assert merged[4].data.uuid == ["u8", "u9"]
+    assert all(not hasattr(r.data, "uuid") for r in merged)
     # first_seq 与信封 seq 一致，dt 首片为 0
     assert all(r.data.first_seq == r.seq for r in merged)
     assert all(r.data.dt[0] == 0 for r in merged)
