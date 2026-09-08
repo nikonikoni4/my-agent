@@ -27,7 +27,7 @@ class SessionPresist:
         # 会话目录可能从未创建（新项目/新环境首次落盘），不建目录直接 append 会 FileNotFoundError
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
         self.meta_data = meta_data
-        event_service.on("session/event", self.cache_data)
+        event_service.register("session/event", self.cache_data)
         self._buffer :list[SessionRecordData] = []
         # 上次写入失败后文件应回滚到的字节数；None 表示没有待补的回滚
         self._pending_truncate: int | None = None
