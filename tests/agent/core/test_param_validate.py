@@ -322,3 +322,97 @@ class TestValidateParam:
         schema = {"properties": {"flag": {"type": "boolean"}}}
         result = register._validate_param(schema, {"flag": "0"})
         assert result == {"flag": False}
+
+
+# ---------------------------------------------------------------------------
+# 数值开区间 / 倍数 / 数组唯一性
+# ---------------------------------------------------------------------------
+
+class TestExclusiveRangeChecking:
+    @pytest.mark.parametrize("value", [0.5, 9, 5.5])
+    def test_exclusive_minimum_exclusive_maximum_pass(self, register, value):
+        """同时满足 0 < value < 10 通过"""
+        assert register._validate_param_value(
+            {"type": "number", "exclusiveMinimum": 0, "exclusiveMaximum": 10},
+            value) == value
+
+    def test_equal_to_exclusive_minimum_raises(self, register):
+        """value == exclusiveMinimum 时排除（严格大于）"""
+        with pytest.raises(ToolValidateParameterError, match="exclusiveMinimum"):
+            register._validate_param_value(
+                {"type": "number", "exclusiveMinimum": 0}, 0)
+
+    def test_below_exclusive_minimum_raises(self, register):
+        with pytest.raises(ToolValidateParameterError, match="exclusiveMinimum"):
+            register._validate_param_value(
+                {"type": "number", "exclusiveMinimum": 0}, -1)
+
+    def test_equal_to_exclusive_maximum_raises(self, register):
+        """value == exclusiveMaximum 时排除（严格小于）"""
+        with pytest.raises(ToolValidateParameterError, match="exclusiveMaximum"):
+            register._validate_param_value(
+                {"type": "number", "exclusiveMaximum": 10}, 10)
+
+    def test_above_exclusive_maximum_raises(self, register):
+        with pytest.raises(ToolValidateParameterError, match="exclusiveMaximum"):
+            register._validate_param_value(
+                {"type": "number", "exclusiveMaximum": 10}, 10.5)
+
+    def test_boundary_checks_after_normalization(self, register):
+        """开区间校验作用于归一化之后的值"""
+        assert register._validate_param_value(
+            {"type": "integer", "exclusiveMinimum": 0}, "1") == 1
+        with pytest.raises(ToolValidateParameterError):
+            register._validate_param_value(
+                {"type": "integer", "exclusiveMinimum": 0}, "0")
+
+    def test_no_exclusive_skips(self, register):
+        assert register._validate_param_value({"type": "number"}, 0) == 0
+
+
+class TestMultipleOfChecking:
+    @pytest.mark.parametrize("schema,value", [
+        ({"type": "integer", "multipleOf": 5}, 15),
+        ({"type": "integer", "multipleOf": 5}, 10),
+        ({"type": "number", "multipleOf": 0.1}, 0.3),
+    ])
+    def test_is_multiple_pass(self, register, schema, value):
+        assert register._validate_param_value(schema, value) == value
+
+    def test_not_multiple_raises(self, register):
+        with pytest.raises(ToolValidateParameterError, match="整数倍"):
+            register._validate_param_value({"type": "integer", "multipleOf": 5}, 12)
+
+    def test_number_fraction_multiple_raises(self, register):
+        with pytest.raises(ToolValidateParameterError, match="整数倍"):
+            register._validate_param_value({"type": "number", "multipleOf": 0.1}, 0.25)
+
+    def test_multiple_checked_after_normalization(self, register):
+        assert register._validate_param_value(
+            {"type": "integer", "multipleOf": 3}, "9") == 9
+        with pytest.raises(ToolValidateParameterError):
+            register._validate_param_value(
+                {"type": "integer", "multipleOf": 3}, "10")
+
+    def test_no_multiple_of_skips(self, register):
+        assert register._validate_param_value({"type": "integer"}, 7) == 7
+
+
+class TestUniqueItemsChecking:
+    def test_unique_items_pass(self, register):
+        assert register._validate_param_value(
+            {"type": "array", "uniqueItems": True}, [1, 2, 3]) == [1, 2, 3]
+
+    def test_duplicate_items_raises(self, register):
+        with pytest.raises(ToolValidateParameterError, match="重复元素"):
+            register._validate_param_value(
+                {"type": "array", "uniqueItems": True}, [1, 2, 2])
+
+    def test_unique_items_false_allows_duplicates(self, register):
+        """uniqueItems 显式为 false 时允许重复"""
+        assert register._validate_param_value(
+            {"type": "array", "uniqueItems": False}, [1, 2, 2]) == [1, 2, 2]
+
+    def test_no_unique_items_skips(self, register):
+        assert register._validate_param_value(
+            {"type": "array"}, ["a", "a"]) == ["a", "a"]

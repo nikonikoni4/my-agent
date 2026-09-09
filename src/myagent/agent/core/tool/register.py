@@ -41,8 +41,8 @@ class ToolRegister:
             integer : "42"              -> 42
             number  : "3.14"/"42"       -> float
         值校验：依据 schema 中的 enum / minLength / maxLength / minItems /
-        maxItems / minimum / maximum / exclusiveMinimum / exclusiveMaximum 等
-        关键字校验，未设置对应关键字即无该限制。
+        maxItems / minimum / maximum / exclusiveMinimum / exclusiveMaximum /
+        multipleOf / uniqueItems 等关键字校验，未设置对应关键字即无该限制。
 
         Args:
             schema_value: 单个参数的 schema（即 properties 里该字段的 dict）。
@@ -87,10 +87,24 @@ class ToolRegister:
         if schema_type in ("integer", "number") and isinstance(normalized, (int, float)) and not isinstance(normalized, bool):
             minimum = schema_value.get("minimum")
             maximum = schema_value.get("maximum")
+            exclusive_minimum = schema_value.get("exclusiveMinimum")
+            exclusive_maximum = schema_value.get("exclusiveMaximum")
+            multiple_of = schema_value.get("multipleOf")
+            # 闭区间：大于等于 / 小于等于
             if minimum is not None and normalized < minimum:
                 raise ToolValidateParameterError(f"数值 {normalized} 小于 minimum={minimum}")
             if maximum is not None and normalized > maximum:
                 raise ToolValidateParameterError(f"数值 {normalized} 大于 maximum={maximum}")
+            # 开区间：严格大于 / 严格小于
+            if exclusive_minimum is not None and normalized <= exclusive_minimum:
+                raise ToolValidateParameterError(f"数值 {normalized} 未 > exclusiveMinimum={exclusive_minimum}")
+            if exclusive_maximum is not None and normalized >= exclusive_maximum:
+                raise ToolValidateParameterError(f"数值 {normalized} 未 < exclusiveMaximum={exclusive_maximum}")
+            # 倍数：必须是 multipleOf 的整数倍（浮点误差用余数容差规避）
+            if multiple_of is not None:
+                quotient = normalized / multiple_of
+                if abs(round(quotient) - quotient) > 1e-9:
+                    raise ToolValidateParameterError(f"数值 {normalized} 不是 {multiple_of} 的整数倍")
 
         if schema_type == "array" and isinstance(normalized, list):
             min_items = schema_value.get("minItems")
@@ -99,6 +113,9 @@ class ToolRegister:
                 raise ToolValidateParameterError(f"数组长度 {len(normalized)} 小于 minItems={min_items}")
             if max_items is not None and len(normalized) > max_items:
                 raise ToolValidateParameterError(f"数组长度 {len(normalized)} 大于 maxItems={max_items}")
+            # 唯一性：要求元素互不相同
+            if schema_value.get("uniqueItems") is True and len(set(normalized)) != len(normalized):
+                raise ToolValidateParameterError(f"数组 {normalized} 存在重复元素，uniqueItems 要求互不相同")
 
         return normalized
 
