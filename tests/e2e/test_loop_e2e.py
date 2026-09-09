@@ -29,7 +29,8 @@ from myagent.agent.core.provider import ChatParams
 from myagent.agent.core.session.store import SessionStore
 from myagent.agent.core.systemprompt.systemprompt import SystemPrompt
 from myagent.agent.core.systemprompt.types import PrompSection
-from myagent.agent.core.tool import Tool, ToolRegister
+from myagent.agent.core.tool.register import ToolRegister
+from myagent.agent.core.tool.tool import Tool
 from myagent.agent.llm.openai_provider import OpenAIProvider
 from myagent.infra.events.service import EventService
 from myagent.utils.helper import project_path_to_session_folder

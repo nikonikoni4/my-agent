@@ -1,116 +1,10 @@
-from abc import ABC,abstractmethod
-import json
+from copy import deepcopy
 from typing import Any
 from myagent.agent.execption import ToolValueError,ToolExecuteError,ToolValidateParameterError
-import logging 
+from .tool import Tool
+import logging
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
-class Tool(ABC):
-    """工具抽象基类。
-
-    子类实现 name / description / parameters / execute 四个成员，
-    即可被 ToolRegister 注册，并通过 to_schema() 编译为 OpenAI 工具 schema。
-    """
-
-    def __init__(self):
-        pass
-
-    @property
-    @abstractmethod
-    def name(self)->str:
-        """
-        工具名称
-        """
-        pass
-    @property
-    @abstractmethod
-    def description(self)->str:
-        """
-        工具描述
-        """
-        pass
-    @property
-    @abstractmethod
-    def parameters(self)-> dict[str, Any]:
-        """
-        返回工具参数的 JSON Schema（首层固定为 object）。格式约定与示例：
-            "type" : "object" , <- 第一层嵌套固定是object
-            "properties" : {
-                "<parameter_name>" : {
-                    "type" : string / number / integer / boolean / array / object
-                    "description": "...",     ← 可有，给模型的说明
-                    "items": {...},           ← type 是 array 时才有
-                    "enum": ["a", "b"],       ← type 是 string/integer 时可选，限定取值
-                
-                # example1: 单个string/integer等参数
-                "parameter_name" : { 
-                    "type" : "string",
-                    "description" : "...",
-                    "enum" : ["a","b"],
-                }
-                # example2:多个参数
-                "parameter_name" :  {
-                    "type": "object",
-                    "description" : "...",
-                    "properties" : {
-                    }
-                }
-
-                example3: 输入字符串数组等
-                "parameter_name" : {
-                    "type" : "array",
-                    "description" : "...",
-                    "items" : {
-                        "type": "string"
-                    }
-                }
-
-                example4: 无参数工具
-                <parameters整个直接用空object，properties和required为空>
-                {
-                    "type" : "object",
-                    "properties" : {},
-                    "required" : []
-                }
-            }
-            "required":[...]
-        }
-        """
-        pass
-
-    @abstractmethod
-    async def execute(self,)->str:
-        """执行工具的具体逻辑。
-
-        Args:
-            **kwargs: 模型 arguments 经 json.loads 后的键值对，
-                键与 parameters schema 中 properties 声明对应。
-
-        Returns:
-            执行结果字符串，会作为 tool 消息的 content 回传给模型。
-        """
-        pass
-
-    def validate(self):
-        """参数校验"""
-        pass
-
-    def to_schema(self)->dict[str,Any]:
-        """编译为 OpenAI tools 顶层的单个 function schema。
-
-        Returns:
-            形如 {"type": "function", "function": {name, description, parameters}} 的 dict。
-        """
-        return {
-            "type" : "function",
-            "function":{
-                "name" : self.name,
-                "description":self.description,
-                "parameters":self.parameters
-            }
-        }
-
-
 
 class ToolRegister:
     """工具注册表：管理工具的注册、注销、查询与执行。"""
@@ -118,7 +12,7 @@ class ToolRegister:
     def __init__(self, ):
         """初始化一个空的工具注册表。"""
         self._tools :dict[str,Tool]= {}
-    
+
     def _validate_required_parameters(self, parameter_schemas: dict, parameters: dict):
         """校验模型传入的参数是否覆盖 schema 中声明的必填字段。
 
@@ -137,29 +31,109 @@ class ToolRegister:
         for required in required_parameters:
             if required not in parameters:
                 raise ToolValidateParameterError(f"缺少必要参数{required}")
-    def _validate_type(self, parameter_schemas: dict, parameters: dict)->dict:
-        """校验模型传入参数的类型是否与 schema 声明一致。
+
+    def _validate_param_value(self, schema_value: dict, parameter_value: Any) -> Any:
+        """对单个参数做类型归一化与值校验，返回处理后的新值（不修改入参）。
+
+        类型归一化：模型可能以字符串形式传入非字符串参数，这里按 schema 声明的
+        type 尽力转回对应类型（string / array / object 不做转换）：
+            boolean : "true"/"True"/"1" -> True，其他字符串 -> False
+            integer : "42"              -> 42
+            number  : "3.14"/"42"       -> float
+        值校验：依据 schema 中的 enum / minLength / maxLength / minItems /
+        maxItems / minimum / maximum / exclusiveMinimum / exclusiveMaximum 等
+        关键字校验，未设置对应关键字即无该限制。
+
+        Args:
+            schema_value: 单个参数的 schema（即 properties 里该字段的 dict）。
+            parameter_value: 模型实际传入该参数的原始值。
+
+        Returns:
+            归一化并校验通过后的新值。
+
+        Raises:
+            ToolValidateParameterError: 值违反 enum / 数值范围 / 长度等约束时抛出。
+        """
+        if not isinstance(schema_value, dict):
+            return parameter_value
+
+        schema_type = schema_value.get("type", "")
+        normalized = parameter_value
+
+        # ---- 类型归一化 ----
+        if schema_type == "boolean":
+            if isinstance(parameter_value, str):
+                normalized = parameter_value in {"true", "True", "1"}
+        elif schema_type == "integer":
+            if isinstance(parameter_value, str):
+                normalized = int(parameter_value)  # 非数字字符串会抛 ValueError
+        elif schema_type == "number":
+            if isinstance(parameter_value, str):
+                normalized = float(parameter_value)  # 非数字字符串会抛 ValueError
+
+        # ---- 值校验 ----
+        enum = schema_value.get("enum")
+        if enum is not None and normalized not in enum:
+            raise ToolValidateParameterError(f"参数取值 {normalized!r} 不在枚举 {enum} 内")
+
+        if schema_type == "string" and isinstance(normalized, str):
+            min_len = schema_value.get("minLength")
+            max_len = schema_value.get("maxLength")
+            if min_len is not None and len(normalized) < min_len:
+                raise ToolValidateParameterError(f"字符串长度 {len(normalized)} 小于 minLength={min_len}")
+            if max_len is not None and len(normalized) > max_len:
+                raise ToolValidateParameterError(f"字符串长度 {len(normalized)} 大于 maxLength={max_len}")
+
+        if schema_type in ("integer", "number") and isinstance(normalized, (int, float)) and not isinstance(normalized, bool):
+            minimum = schema_value.get("minimum")
+            maximum = schema_value.get("maximum")
+            if minimum is not None and normalized < minimum:
+                raise ToolValidateParameterError(f"数值 {normalized} 小于 minimum={minimum}")
+            if maximum is not None and normalized > maximum:
+                raise ToolValidateParameterError(f"数值 {normalized} 大于 maximum={maximum}")
+
+        if schema_type == "array" and isinstance(normalized, list):
+            min_items = schema_value.get("minItems")
+            max_items = schema_value.get("maxItems")
+            if min_items is not None and len(normalized) < min_items:
+                raise ToolValidateParameterError(f"数组长度 {len(normalized)} 小于 minItems={min_items}")
+            if max_items is not None and len(normalized) > max_items:
+                raise ToolValidateParameterError(f"数组长度 {len(normalized)} 大于 maxItems={max_items}")
+
+        return normalized
+
+
+    def _validate_param(self, parameter_schemas: dict, parameters: dict)->dict:
+        """校验并归一化模型传入的整组参数。
+
+        逐个参数交给 _validate_param_value 处理（含类型归一化与值校验），
+        返回归一化后的新 dict（深拷贝，不改动入参）；未知参数直接抛错。
 
         Args:
             parameter_schemas: 工具的参数 schema（即 Tool.parameters 返回的 dict）。
             parameters: 模型实际传入的参数键值对。
 
-        Raises:
-            ToolValidateParameterError: 参数的实际类型与 schema 声明的 type 不符时抛出。
-        """
-        parameter_schemas:dict = parameter_schemas.get("properties",None)
-        if not parameter_schemas:
-            # 无参数，不需要验证
-            return
+        Returns:
+            归一化后的参数 dict。
 
-        for parameter_name,parameter_value in parameters.items():
-            schema_value = parameter_schemas.get(parameter_name,None)
-            if schema_value: # string / number / integer / boolean / array / object
-                if schema_value == "boolean" :
-                    # if isinstance(parameter_value,str)
-                    pass 
-            else:
-                raise ToolValidateParameterError(f"tool_call输入未知参数{parameter_name}")
+        Raises:
+            ToolValidateParameterError: 参数名不在 schema.properties 中声明时抛出。
+        """
+        properties = parameter_schemas.get("properties", None)
+        if not properties:
+            # 无参数，不需要验证
+            return parameters
+        try :
+            vp :dict=deepcopy(parameters) # 归一化后的参数
+            for parameter_name,parameter_value in parameters.items():
+                schema_value:dict = properties.get(parameter_name,None)
+                if not schema_value:
+                    raise ToolValidateParameterError(f"tool_call输入未知参数{parameter_name}")
+                vp[parameter_name] = self._validate_param_value(schema_value, parameter_value)
+        except (ValueError, TypeError) as e:
+            raise ToolValidateParameterError(f"验证参数{parameter_name}时发生错误，真实值为{parameter_value!r}") from e
+        return vp
+
     def validate(self, parameter_schemas: dict, parameters: dict):
         """参数校验的统一入口，组合各项校验步骤。
 
@@ -260,6 +234,9 @@ class ToolRegister:
 
         try:
             return await self._tools[tool_name].execute(**kwargs)
+        except ToolValidateParameterError as e:
+            logger.error(f"{tool_name}工具调用错误，参数:{kwargs},错误信息：{e}")
+            return f"{tool_name}工具调用错误，参数:{kwargs},错误信息：{e}"
         except Exception as e:
             # 暂时的写法，这里工具调用错误还需要分类进行
             logger.error(f"{tool_name}工具调用错误，参数:{kwargs}")

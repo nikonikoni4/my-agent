@@ -290,7 +290,7 @@ if __name__ == "__main__":
     import asyncio
     import os
     from dotenv import load_dotenv
-    from myagent.agent.core.tool import Tool
+    from myagent.agent.core.tool.tool import Tool
     from typing import Any
     class WeatherTool(Tool):
         def __init__(self):

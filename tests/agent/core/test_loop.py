@@ -11,7 +11,7 @@
 
 import pytest
 
-from myagent.agent.core.loop import AgentLoop
+from myagent.agent.core.deprecated_loop import AgentLoop
 from myagent.agent.core.provider import (
     LLMProvider,
     LLMResponse,
@@ -22,7 +22,8 @@ from myagent.agent.core.provider import (
 )
 from myagent.agent.core.session.session import Session
 from myagent.agent.core.session.types import SessionMetaData
-from myagent.agent.core.tool import Tool, ToolRegister
+from myagent.agent.core.tool.tool import Tool
+from myagent.agent.core.tool.register import ToolRegister
 from myagent.infra.events.service import EventService
 
 SYSTEM_PROMPT = "你是测试助手，回答要简短"

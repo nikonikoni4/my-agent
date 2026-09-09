@@ -4,7 +4,7 @@ from typing import Literal
 from myagent.agent.core.provider import ChatParams
 from myagent.agent.core.session.session import Session
 from myagent.agent.core.systemprompt import SystemPrompt
-from myagent.agent.core.tool import ToolRegister
+from myagent.agent.core.tool.register import ToolRegister
 from myagent.infra.events.service import EventService
 
 

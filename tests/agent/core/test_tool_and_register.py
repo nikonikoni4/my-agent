@@ -1,7 +1,7 @@
 from typing import Any
 
 from myagent.agent.core import Tool
-from myagent.agent.core.tool import ToolRegister
+from myagent.agent.core.tool.register import ToolRegister
 from myagent.agent.execption import ToolValueError
 import pytest
 

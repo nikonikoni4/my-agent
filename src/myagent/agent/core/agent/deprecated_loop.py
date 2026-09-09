@@ -3,7 +3,7 @@ from attr import dataclass
 from myagent.agent import execption
 from myagent.agent.core.session import session
 from myagent.infra.events import EventService
-from myagent.agent.core.tool import ToolRegister
+from myagent.agent.core.tool.register import ToolRegister
 from myagent.agent.core.provider import LLMProvider,ChatParams, LLMResponse,Message, StreamChunk, ToolCallRequest,Usage
 from myagent.agent.core.session.types import (
     AssistantChunkData, SessionMetaData,ToolCallChunksData,AssistantMessageData, StepEndData,CompactionStartData,
