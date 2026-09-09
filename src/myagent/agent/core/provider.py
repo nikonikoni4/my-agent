@@ -8,7 +8,7 @@ import json
 from dataclasses import dataclass,field
 from typing import Any
 import datetime
-from myagent.agent.execption import LLMToolCallTruncatedError
+from myagent.agent.execption import LLMToolCallTruncatedError, LLMToolCallParseError
 @dataclass
 class ToolCallRequest:
     id : str
@@ -197,11 +197,25 @@ class LLMProvider(ABC):
             return
         tool_call_list = []
         for tool_call in response_message.tool_calls :
+            raw_arguments = tool_call.function.arguments or "{}"
+            try:
+                arguments = json.loads(raw_arguments)
+            except json.JSONDecodeError as e:
+                raise LLMToolCallParseError(
+                    f"工具调用({tool_call.function.name}) 参数 JSON 解析失败：{e.msg}（位置 {e.pos}）",
+                    code="LLM_TOOL_CALL_PARSE",
+                    details={
+                        "tool_call_id": tool_call.id,
+                        "tool_name": tool_call.function.name,
+                        "raw_arguments": raw_arguments,
+                    },
+                    cause=e,
+                ) from e
             tool_call_list.append(
                 ToolCallRequest(
                     id = tool_call.id,
                     name = tool_call.function.name,
-                    arguments=json.loads(tool_call.function.arguments)
+                    arguments=arguments
                 )
             )
         return tool_call_list

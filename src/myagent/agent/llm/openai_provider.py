@@ -17,6 +17,7 @@ from myagent.agent.execption import (
     LLMQuotaError,
     LLMConnectionError,
     LLMContextExceededError,
+    LLMToolCallParseError,
 )
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -245,14 +246,29 @@ class OpenAIProvider(LLMProvider):
 
             tool_call_requests = None
             if finish_reason == "tool_calls" and tool_calls_acc:
-                tool_call_requests = [
-                    ToolCallRequest(
-                        id=acc["id"],
-                        name=acc["name"],
-                        arguments=json.loads(acc["arguments"] or "{}"),
+                tool_call_requests = []
+                for _, acc in sorted(tool_calls_acc.items()):
+                    raw_arguments = acc["arguments"] or "{}"
+                    try:
+                        arguments = json.loads(raw_arguments)
+                    except json.JSONDecodeError as e:
+                        raise LLMToolCallParseError(
+                            f"工具调用({acc['name']}) 参数 JSON 解析失败：{e.msg}（位置 {e.pos}）",
+                            code="LLM_TOOL_CALL_PARSE",
+                            details={
+                                "tool_call_id": acc["id"],
+                                "tool_name": acc.get("name"),
+                                "raw_arguments": raw_arguments,
+                            },
+                            cause=e,
+                        ) from e
+                    tool_call_requests.append(
+                        ToolCallRequest(
+                            id=acc["id"],
+                            name=acc["name"],
+                            arguments=arguments,
+                        )
                     )
-                    for _, acc in sorted(tool_calls_acc.items())
-                ]
             elif finish_reason == "length" and tool_calls_acc:
                 # max_tokens 截断：截断流里攒出的参数可能不完整，交给检查函数判定
                 tool_call_requests = self.check_truncated_tool_calls(
