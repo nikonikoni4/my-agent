@@ -1,17 +1,22 @@
 from copy import deepcopy
-from typing import Any
-from myagent.agent.execption import ToolValueError,ToolExecuteError,ToolValidateParameterError
-from .tool import Tool
+from dataclasses import dataclass
+from typing import Any, Literal
+from myagent.agent.execption import ToolValueError,ToolExecuteError,ToolValidateParameterError,ToolConsecutiveFailureError
+from .tool import Tool, ToolResult
 import logging
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 class ToolRegister:
-    """工具注册表：管理工具的注册、注销、查询与执行。"""
+    """工具注册表：管理工具的注册、注销、查询、执行与熔断。"""
 
     def __init__(self, ):
         """初始化一个空的工具注册表。"""
         self._tools :dict[str,Tool]= {}
+        # 熔断状态：工具名 -> 本 turn 内当前连续失败次数
+        self._consecutive_failures :dict[str,int]= {}
+        # 本 turn 内已熔断的工具名；turn/end 事件清空，下一 turn 恢复可用
+        self._tripped :set[str]= set()
 
     def _validate_required_parameters(self, parameter_schemas: dict, parameters: dict):
         """校验模型传入的参数是否覆盖 schema 中声明的必填字段。
@@ -151,7 +156,7 @@ class ToolRegister:
             raise ToolValidateParameterError(f"验证参数{parameter_name}时发生错误，真实值为{parameter_value!r}") from e
         return vp
 
-    def validate(self, parameter_schemas: dict, parameters: dict):
+    def _validate(self, parameter_schemas: dict, parameters: dict)->dict:
         """参数校验的统一入口，组合各项校验步骤。
 
         Args:
@@ -163,11 +168,7 @@ class ToolRegister:
         """
         # 验证required 参数是否都包含
         self._validate_required_parameters(parameter_schemas,parameters)
-        # 验证参数类型是否正确
-        # pass 暂时先不做
-        # 验证参数范围是否在默认范围内
-        # pass 这一个暂时不做
-        pass
+        return self._validate_param(parameter_schemas,parameters)
 
     def register(self, tools: Tool | list[Tool]):
         """注册一个或多个工具。
@@ -229,43 +230,99 @@ class ToolRegister:
         """
         return list(self._tools.keys())
 
-    async def execute(self, tool_name, **kwargs) -> str:
-        """按名称执行工具。
+    async def execute(self, tool_name, **kwargs) -> ToolResult:
+        """按名称执行工具（含熔断拦截与失败计数）。
 
         Args:
             tool_name: 工具名，即注册时 Tool.name 的值。
             **kwargs: 传给工具 execute 的参数（模型 arguments 解析后的键值对）。
 
         Returns:
-            工具的执行结果。工具不存在时不抛异常，返回带 status/message/hint
-            的错误 JSON 字符串，供模型自行纠正。
+            工具执行结果。工具不存在、参数校验失败、执行抛异常时返回
+            is_error=True 的 ToolResult（错误文本 + hint），供模型自纠。
 
         Raises:
-            ToolExecuteError: 工具执行过程中抛出任意异常时，记录日志后包装抛出。
+            ToolConsecutiveFailureError: 工具触发熔断且配置了 raise_on_break
+                （人在回路入口），上抛由 loop 接住中断本 turn。
         """
         if tool_name not in self._tools:
             logger.warning(f"{tool_name}工具不存在/未注册")
-            return f"status : error \n message : {tool_name}工具不存在 \n hint : 可用工具 {','.join(self.tool_list())} "
-        # 工具参数校验
-        # pass
+            return ToolResult.error(f"status : error \n message : {tool_name}工具不存在 \n hint : 可用工具 {','.join(self.tool_list())} ")
+        tool = self._tools[tool_name]
 
+        # 熔断拦截：仅 execute_intercept 模式在入口驳回。schema_hide 模式由
+        # to_schemas 过滤，模型依据对话历史硬调已熔断工具时仍会执行到这里
+        # （缺口记录在 架构设计/工具调用.md 已知限制 4）
+        if tool.breaker_mode == "execute_intercept" and tool_name in self._tripped:
+            return ToolResult.error(
+                f"工具{tool_name}已因连续失败{self._consecutive_failures.get(tool_name, 0)}次被熔断，"
+                f"本轮内不可再调用，请改用其他工具完成任务，或告知用户当前工具不可用"
+            )
+
+        # 工具参数校验 + 执行
         try:
-            return await self._tools[tool_name].execute(**kwargs)
+            kwargs = self._validate(tool.parameters,kwargs)
+            raw = await tool.execute(**kwargs)
+            # 子类返回 str 视为成功；返回 ToolResult 按其 is_error 判定
+            result = raw if isinstance(raw, ToolResult) else ToolResult(content=str(raw))
         except ToolValidateParameterError as e:
             logger.error(f"{tool_name}工具调用错误，参数:{kwargs},错误信息：{e}")
-            return f"{tool_name}工具调用错误，参数:{kwargs},错误信息：{e}"
+            result = ToolResult.error(f"{tool_name}工具调用错误，参数:{kwargs},错误信息：{e}, hint : 请分析上述调用错误信息,重新调用")
         except Exception as e:
             # 暂时的写法，这里工具调用错误还需要分类进行
             logger.error(f"{tool_name}工具调用错误，参数:{kwargs}")
-            return f"{tool_name}工具调用错误，参数:{kwargs}"
+            result = ToolResult.error(f"{tool_name}工具调用错误，参数:{kwargs}")
+
+        # 熔断计数：异常路径与 is_error 结果都算一次失败，成功清零
+        if result.is_error:
+            self._on_failure(tool, result)
+        else:
+            self._consecutive_failures[tool_name] = 0
+        return result
+
+    def _on_failure(self, tool: Tool, result: ToolResult) -> None:
+        """记录一次失败并处理熔断触发（计数达到阈值时抛错或附 hint）。"""
+        if tool.max_consecutive_failures is None:
+            return  # 未配置熔断，由 agent 的 step_limit 兜底
+        count = self._consecutive_failures.get(tool.name, 0) + 1
+        self._consecutive_failures[tool.name] = count
+        if count < tool.max_consecutive_failures:
+            return
+        self._tripped.add(tool.name)
+        if tool.raise_on_break:
+            # 抛错上抛，由 loop 识别后记入 step_error 并触发 request/error；
+            # 人在回路的控制由 request/error 的 waterfall 订阅方给出，后续接入
+            raise ToolConsecutiveFailureError(
+                f"工具{tool.name}连续失败{count}次触发熔断，该工具配置熔断即抛错，中断当前行为"
+            )
+        # 功能降级：触发熔断的当次结果附 hint。schema_hide 模式下模型下次
+        # 看不到该工具的 schema，这条 hint 是它获知熔断、换路的唯一渠道
+        result.content = (
+            f"{result.content}\n hint : 工具{tool.name}连续失败{count}次已熔断，本轮内不可再用，"
+            f"请改用其他工具完成任务，或告知用户当前工具不可用、无法完成任务"
+        )
+
+    def reset_breaker(self, payload=None) -> None:
+        """清空熔断状态（连续失败计数与已熔断集合），下一 turn 工具恢复可用。
+
+        作为 turn/end 事件回调由 loop 接线订阅；也可直接调用。
+        """
+        self._consecutive_failures.clear()
+        self._tripped.clear()
 
     def to_schemas(self)->list[dict]:
-        """编译所有已注册工具的 schema。
+        """编译所有已注册工具的 schema（含熔断过滤）。
+
+        schema_hide 模式的已熔断工具不出现在结果里，模型下次请求起不再
+        看到该工具（注意：schema 变化会使本次请求的缓存命中失效）。
 
         Returns:
-            每个已注册工具 to_schema() 结果组成的列表，注册表为空时返回空列表。
+            每个未熔断（或非 schema_hide 模式）工具 to_schema() 结果组成的
+            列表，注册表为空时返回空列表。
         """
         schemas = []
         for tool in self._tools.values():
+            if tool.breaker_mode == "schema_hide" and tool.name in self._tripped:
+                continue
             schemas.append(tool.to_schema())
         return schemas

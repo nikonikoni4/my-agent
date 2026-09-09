@@ -1,5 +1,25 @@
 from abc import ABC,abstractmethod
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Literal
+
+MIN_CONSECUTIVE_FAILURES = 5  # 熔断阈值下限：防止配置过小让工具被轻易熔断
+
+
+@dataclass
+class ToolResult:
+    """工具执行结果。
+
+    content 是回传给模型的文本；is_error 标记本次执行是否失败，
+    ToolRegister 依据它做熔断计数（失败累加、成功清零）。
+    """
+
+    content: str
+    is_error: bool = False
+
+    @classmethod
+    def error(cls, content: str) -> "ToolResult":
+        """构造失败结果（is_error=True）。"""
+        return cls(content=content, is_error=True)
 
 class Tool(ABC):
     """工具抽象基类。
@@ -8,8 +28,33 @@ class Tool(ABC):
     即可被 ToolRegister 注册，并通过 to_schema() 编译为 OpenAI 工具 schema。
     """
 
-    def __init__(self):
-        pass
+    def __init__(
+        self,
+        max_consecutive_failures: int | None = None,
+        breaker_mode: Literal["schema_hide", "execute_intercept"] = "schema_hide",
+        raise_on_break: bool = False,
+    ):
+        """熔断配置（语义见 架构设计/工具调用.md）。
+
+        Args:
+            max_consecutive_failures: 熔断阈值，本 turn 内连续失败达到该次数即
+                熔断。None 表示不熔断，由 agent 的 step_limit 兜底防死循环；
+                设置时必须 >= MIN_CONSECUTIVE_FAILURES（下限 5）。
+            breaker_mode: 熔断方式，二选一。schema_hide：下次请求起从 tools
+                schema 中移除（默认，最稳，代价是缓存命中失效）；execute_intercept：
+                schema 保留，execute 入口驳回调用。
+            raise_on_break: 熔断时是否抛 ToolConsecutiveFailureError（人在回路
+                入口，由 loop 接住并中断本 turn）；False 时功能降级，触发熔断的
+                当次结果附 hint，agent 继续运行。
+        """
+        if max_consecutive_failures is not None and max_consecutive_failures < MIN_CONSECUTIVE_FAILURES:
+            raise ValueError(
+                f"max_consecutive_failures={max_consecutive_failures} 低于下限 "
+                f"{MIN_CONSECUTIVE_FAILURES}；不熔断请传 None（由 agent 的 step_limit 兜底）"
+            )
+        self.max_consecutive_failures = max_consecutive_failures
+        self.breaker_mode = breaker_mode
+        self.raise_on_break = raise_on_break
 
     @property
     @abstractmethod
@@ -137,7 +182,7 @@ class Tool(ABC):
         pass
 
     @abstractmethod
-    async def execute(self,)->str:
+    async def execute(self,)->ToolResult | str:
         """执行工具的具体逻辑。
 
         Args:
@@ -145,7 +190,8 @@ class Tool(ABC):
                 键与 parameters schema 中 properties 声明对应。
 
         Returns:
-            执行结果字符串，会作为 tool 消息的 content 回传给模型。
+            返回 str 视为成功（由 register 包装为 ToolResult(content=...)）；
+            要标记失败时返回 ToolResult.error(...)，register 会据此做熔断计数。
         """
         pass
 

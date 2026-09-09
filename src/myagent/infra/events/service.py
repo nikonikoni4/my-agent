@@ -124,9 +124,13 @@ class EventService:
         self._hooks[event_name] = alive
     def trigger(self,event_spec:EventSpec,payload):
         """
-        使用spec进行触发事件
+        使用spec进行触发事件。
+
+        waterfall 语义时返回洋葱链最外层回调的返回值（作为控制信号传回
+        调用方，如错误处理订阅方决定"继续/终止/人工确认"）；emit 语义
+        无返回值（None）。
         """
         if event_spec.semantics == "emit":
             self.emit(event_spec.name,payload)
         elif event_spec.semantics == "waterfall":
-            self.waterfall(event_spec.name,payload)
+            return self.waterfall(event_spec.name,payload)

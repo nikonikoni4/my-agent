@@ -11,7 +11,7 @@
 
 import pytest
 
-from myagent.agent.core.deprecated_loop import AgentLoop
+from myagent.agent.core.agent.deprecated_loop import AgentLoop
 from myagent.agent.core.provider import (
     LLMProvider,
     LLMResponse,

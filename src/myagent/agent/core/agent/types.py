@@ -10,10 +10,7 @@ from myagent.infra.events.service import EventService
 
 @dataclass
 class AgentConfig:
-    parames : ChatParams
-    model : str
-    prompt_render_parame : dict
-    provider : str  = "custom" # openai格式，目前只支持这个，后续更多服务商修改这个类型并扩展
+    step_limit : int 
 @dataclass
 class AgentContext:
     event_service : EventService

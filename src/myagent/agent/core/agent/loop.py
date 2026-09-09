@@ -6,6 +6,7 @@ from myagent.agent.core.session import session
 from myagent.agent.core.systemprompt import AssemblyPrompt, SystemPrompt
 from myagent.infra.events import EventService
 from myagent.agent.core.tool.register import ToolRegister
+from myagent.agent.execption import ToolConsecutiveFailureError
 from myagent.agent.core.provider import LLMProvider,ChatParams, LLMResponse,Message, StreamChunk, ToolCallRequest,Usage
 from myagent.agent.core.session.types import (
     AssistantChunkData, SessionMetaData,ToolCallChunksData,AssistantMessageData, StepEndData,CompactionStartData,
@@ -33,7 +34,16 @@ LLM_CALL_TIMEOUT = 120 # 单位秒
 TOOL_CALL_TIMEOUT = 60 # 单位秒
 MAX_RETRY_COUNT= 5 # 次
 class ReActAgentLoop:
-    def __init__(self,event_service:EventService,session :Session,tool_register:ToolRegister,system_prompt : SystemPrompt,agent_config :AgentConfig,llm_client:LLMProvider,name :str | None = None):     
+    def __init__(
+        self,
+        event_service:EventService,
+        session :Session,
+        tool_register:ToolRegister,
+        system_prompt : SystemPrompt,
+        agent_config :AgentConfig,
+        llm_client:LLMProvider,
+        name :str | None = None,
+        prompt_render_parame :dict |None = None):     
         """        
         Args:
             event_service: 事件服务，用于在循环关键节点发布事件（埋点尚未接入）。
@@ -47,11 +57,15 @@ class ReActAgentLoop:
         self.system_prompt = system_prompt
         self._llm_client = llm_client
         self.agent_config = agent_config
+        self.prompt_render_parame = prompt_render_parame
         self.inbox = {"next_turn":[],"next_step":[]} # next_turn 的消息要等待agentturn完成之后才会调用，而next_step会在下一个step马上打断并调用
         self._session = session
         self._task = None
         self.state :Literal["idle","running","maintenance"] = "idle"# maintenance 暂时没用
         self._LLM_CALL_TIMEOUT = LLM_CALL_TIMEOUT
+        # 工具熔断状态随 turn 结束清空：接线在此（loop 同时持有 event_service
+        # 与 tool_register），清空逻辑在 ToolRegister.reset_breaker
+        self._event_service.register(TURN_END.name, self.tool_register.reset_breaker)
 
     async def send(self,user_prompt : str | list):
         """
@@ -85,7 +99,7 @@ class ReActAgentLoop:
     def _request_header(self):
         # 组装systemprompt
         assembly_prompt : AssemblyPrompt = self.system_prompt.assemble(self.name)
-        system_prompt = self.system_prompt.render(assembly_prompt,self.agent_config.prompt_render_parame)
+        system_prompt = self.system_prompt.render(assembly_prompt,self.prompt_render_parame)
         current = RequestHeaderData(
             reason="initial",
             model_name=self._llm_client.model,
@@ -107,7 +121,15 @@ class ReActAgentLoop:
 
     async def step(self,user_message):
         step_error = None
+        step_count = 0
         while True: # 为了重试而添加的Ture，try写在内部判断究竟是什么错误来决定是否重试
+            # 步数兜底：达到上限仍未收敛（熔断管不到的场景，如模型轮换调用多个
+            # 工具、每个都不达熔断阈值），强制终止，防止 while True 死循环
+            if step_count >= self.agent_config.step_limit:
+                step_error = RuntimeError(f"达到最大步数{self.agent_config.step_limit}，强制终止本turn")
+                self._event_service.trigger(REQUEST_ERROR,RequestErrorPayLoad(error_type=step_error))
+                break
+            step_count += 1
             try:
                 self._session.append("step/start",StepStartData())
                 self._event_service.trigger(STEP_START,StepStartPayload())
@@ -131,22 +153,39 @@ class ReActAgentLoop:
                             self._event_service.trigger(TOOL_CALL,ToolCallPayload())
                     for index,task in enumerate(tasks):
                         tool_call = response.tool_call_requests[index]
-                        too_result =  task.result()
-                        self._session.append("tool/result",ToolResultData(call_id=tool_call.id,tool_name=tool_call.name,message=Message(role="tool",content=too_result,tool_call_id=tool_call.id)),surface_op="append",source_event_seqs=[])
+                        tool_result =  task.result()
+                        self._session.append("tool/result",ToolResultData(call_id=tool_call.id,tool_name=tool_call.name,message=Message(role="tool",content=tool_result.content,tool_call_id=tool_call.id,),is_error=tool_result.is_error),surface_op="append",source_event_seqs=[])
                         self._event_service.trigger(TOOL_RESULT,ToolResultPayload())
                 else:
                     break # 模型不再请求工具，本轮结束（ReAct 终止条件）
                 
             except TimeoutError: # python 3.11+ 用TimeoutError， < 3.11用asyncio.TimeoutError
                 step_error = TimeoutError # 这里暂时先就这样简单的写，后续才丰富step_error的内容
-                    
+
             except asyncio.CancelledError:
                 # 取消中断比较特殊，单独处理，不走request/error
-                pass 
+                pass
+
+            except ExceptionGroup as eg:
+                # TaskGroup 把子任务（工具执行）异常包成 ExceptionGroup 上抛。
+                # register.execute 已兜掉普通工具异常，这里只识别熔断抛错
+                # （raise_on_break）：记入 step_error 即可。注意 except 不会中断
+                # while（捕获后控制流回到循环顶部，同 TimeoutError 的重试路径），
+                # 是否终止由 REQUEST_ERROR 的 waterfall（IOC）控制信号决定，
+                # 信号细节当前未定；无订阅方时循环继续，由 step_limit 兜底
+                matched, rest = eg.split(ToolConsecutiveFailureError)
+                if matched is None:
+                    raise  # 非熔断错误不属于本处理范围，原样上抛
+                if rest is not None:
+                    logger.warning(f"熔断处理时忽略同批其他异常: {rest!r}")
+                step_error = matched.exceptions[0]
 
             finally:
                 if step_error :
+                    # request/error 是 waterfall 语义事件：控制反转挂点，后续
+                    # 订阅方（如人在回路处理）经返回值给出控制信号，当前无订阅方
                     request_error_result = self._event_service.trigger(REQUEST_ERROR,RequestErrorPayLoad(error_type=step_error))
+                    step_error = None  # 一次错误只触发一次 request/error，避免错误后的重试轮次里重复触发
                 # 先不管错误处理，等先跑通了一遍流程之后再逐个错误处理进行安排，假设当前不会出错
                 self._session.append("step/end",StepEndData())
                 self._event_service.trigger(STEP_END,StepEndPayload())

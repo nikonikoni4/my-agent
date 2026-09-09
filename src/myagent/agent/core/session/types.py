@@ -130,7 +130,7 @@ class ToolResultData(SessionData):
     tool_name: str
     message: Message  # role="tool"、tool_call_id=call_id 的结果消息
     duration_ms: int | None = None
-
+    is_error : bool = False 
 
 @dataclass
 class StepEndData(SessionData):

@@ -112,7 +112,7 @@ class AgentLoop:
                         self.persist_now("tool/call")
                         # TODO 工具出错相关处理
                         result = await self._tool_register.execute(name,**arguments if arguments else None )
-                        self._session.append("tool/result",ToolResultData(call_id=id,tool_name=name,message=Message(role="tool",content=result,tool_call_id=id)),surface_op="append",source_event_seqs=[])
+                        self._session.append("tool/result",ToolResultData(call_id=id,tool_name=name,message=Message(role="tool",content=result.content,tool_call_id=id),is_error=result.is_error),surface_op="append",source_event_seqs=[])
                     self._session.append("step/end",StepEndData())
                     self.persist_now("step/end")
                     self._session.append("step/start",StepStartData())

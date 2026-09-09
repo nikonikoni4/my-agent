@@ -2,7 +2,8 @@ from typing import Any
 
 from myagent.agent.core import Tool
 from myagent.agent.core.tool.register import ToolRegister
-from myagent.agent.execption import ToolValueError
+from myagent.agent.core.tool.tool import ToolResult
+from myagent.agent.execption import ToolValueError, ToolConsecutiveFailureError
 import pytest
 
 class WeatherTool(Tool):
@@ -29,7 +30,7 @@ class WeatherTool(Tool):
             }
         }
 
-    def execute(self, **kwargs) -> str:
+    async def execute(self, **kwargs) -> str:
         date = kwargs.get("date", None)
         return f"{date}的天气是晴天"
 
@@ -171,3 +172,156 @@ def test_to_schemas(register: ToolRegister):
     for schema in schemas:
         name = schema["function"]["name"]
         assert schema == expected[name], f"工具 {name} 的 schema 与 to_schema() 不一致"
+
+
+# ---------------------------------------------------------------------------
+# 熔断（连续失败计数 / 触发 / 拦截 / 清零，规格见 架构设计/工具调用.md）
+# ---------------------------------------------------------------------------
+
+
+class FlakyTool(Tool):
+    """失败可控的工具：fail=True 时 execute 抛异常，否则成功。"""
+
+    def __init__(self, **breaker_kwargs):
+        super().__init__(**breaker_kwargs)
+        self.fail = True
+        self.calls = 0
+
+    @property
+    def name(self) -> str:
+        return "flaky"
+
+    @property
+    def description(self) -> str:
+        return "测试熔断的可控失败工具"
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {"type": "object", "properties": {}, "required": []}
+
+    async def execute(self, **kwargs):
+        self.calls += 1
+        if self.fail:
+            raise RuntimeError(f"第{self.calls}次失败")
+        return ToolResult(content="成功")
+
+
+def test_熔断阈值下限校验():
+    """max_consecutive_failures：None 表示不熔断（step_limit 兜底）；设置时必须 >= 5"""
+    FlakyTool()  # None，合法
+    FlakyTool(max_consecutive_failures=5)  # 恰为下限，合法
+    with pytest.raises(ValueError):
+        FlakyTool(max_consecutive_failures=4)
+
+
+@pytest.mark.asyncio
+async def test_未配置熔断_失败不计数不熔断(register: ToolRegister):
+    """max_consecutive_failures=None：连续失败既不计数也不熔断"""
+    tool = FlakyTool()
+    register.register(tool)
+    for _ in range(8):
+        result = await register.execute("flaky")
+        assert result.is_error is True
+    # 未熔断：schema 保留；不计数：失败表为空
+    assert register.to_schemas() == [tool.to_schema()]
+    assert register._consecutive_failures == {}
+
+
+@pytest.mark.asyncio
+async def test_连续失败达阈值_熔断且当次结果附hint(register: ToolRegister):
+    """schema_hide（默认）：第 5 次失败触发熔断，当次结果附 hint，之后 schema 过滤"""
+    tool = FlakyTool(max_consecutive_failures=5)
+    register.register(tool)
+
+    # 前 4 次：普通错误结果，无熔断字样
+    for _ in range(4):
+        result = await register.execute("flaky")
+        assert result.is_error is True
+        assert "已熔断" not in result.content
+
+    # 第 5 次：触发熔断，当次结果附 hint
+    result = await register.execute("flaky")
+    assert result.is_error is True
+    assert "已熔断" in result.content
+    assert "请改用其他工具" in result.content
+
+    # schema_hide：熔断后从 schema 消失
+    assert register.to_schemas() == []
+
+
+@pytest.mark.asyncio
+async def test_成功一次清零连续计数(register: ToolRegister):
+    """失败->失败->成功：计数清零，需重新连续失败满阈值才熔断"""
+    tool = FlakyTool(max_consecutive_failures=5)
+    register.register(tool)
+
+    await register.execute("flaky")  # 失败 1
+    await register.execute("flaky")  # 失败 2
+    tool.fail = False
+    await register.execute("flaky")  # 成功，清零
+    tool.fail = True
+    for _ in range(4):
+        await register.execute("flaky")  # 重新连续失败 4 次
+    assert register.to_schemas() == [tool.to_schema()], "4 < 5，不应熔断"
+
+    await register.execute("flaky")  # 重新连续第 5 次失败
+    assert register.to_schemas() == [], "连续第 5 次失败应熔断"
+
+
+@pytest.mark.asyncio
+async def test_turn_end清空熔断_下一turn恢复可用(register: ToolRegister):
+    """reset_breaker（turn/end 回调）：清空计数与熔断表，工具恢复"""
+    tool = FlakyTool(max_consecutive_failures=5)
+    register.register(tool)
+    for _ in range(5):
+        await register.execute("flaky")
+    assert register.to_schemas() == []
+
+    register.reset_breaker()
+
+    assert register.to_schemas() == [tool.to_schema()]
+    assert register._tripped == set()
+
+
+@pytest.mark.asyncio
+async def test_熔断即抛错_raise_on_break(register: ToolRegister):
+    """raise_on_break=True：触发熔断当次抛 ToolConsecutiveFailureError（人在回路入口）"""
+    tool = FlakyTool(max_consecutive_failures=5, raise_on_break=True)
+    register.register(tool)
+
+    for _ in range(4):
+        await register.execute("flaky")  # 未达阈值，正常返回错误结果
+
+    with pytest.raises(ToolConsecutiveFailureError):
+        await register.execute("flaky")  # 第 5 次触发熔断并抛错
+    assert register._tripped == {"flaky"}
+
+
+@pytest.mark.asyncio
+async def test_execute_intercept模式_熔断后入口驳回(register: ToolRegister):
+    """execute_intercept：熔断后 schema 保留，入口驳回且不再执行工具本体"""
+    tool = FlakyTool(max_consecutive_failures=5, breaker_mode="execute_intercept")
+    register.register(tool)
+
+    for _ in range(5):
+        await register.execute("flaky")
+
+    # schema 不被过滤（与 schema_hide 的区别）
+    assert register.to_schemas() == [tool.to_schema()]
+
+    # 熔断后调用：入口驳回，返回错误结果，工具本体不执行
+    calls_before = tool.calls
+    result = await register.execute("flaky")
+    assert result.is_error is True
+    assert "已因连续失败" in result.content
+    assert tool.calls == calls_before
+
+
+@pytest.mark.asyncio
+async def test_execute返回str包装为成功ToolResult(register: ToolRegister):
+    """子类 execute 返回 str：register 包装为 is_error=False 的 ToolResult"""
+    register.register(WeatherTool())
+    result = await register.execute("get_weather", date="2026-09-02")
+    assert isinstance(result, ToolResult)
+    assert result.is_error is False
+    assert result.content == "2026-09-02的天气是晴天"

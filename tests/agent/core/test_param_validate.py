@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 
 from myagent.agent.core.tool.register import ToolRegister
+from myagent.agent.core.tool.tool import Tool, ToolResult
 from myagent.agent.execption import ToolValidateParameterError
 
 
@@ -416,3 +417,115 @@ class TestUniqueItemsChecking:
     def test_no_unique_items_skips(self, register):
         assert register._validate_param_value(
             {"type": "array"}, ["a", "a"]) == ["a", "a"]
+
+
+# ---------------------------------------------------------------------------
+# execute 全链路：校验在工具执行前生效
+# ---------------------------------------------------------------------------
+
+import json
+
+from myagent.agent.core.tool.tool import Tool
+
+
+class FullTypeTool(Tool):
+    """覆盖 string / integer / number / boolean / array 五种参数类型的工具。
+
+    execute 把收到的 kwargs 原样转 JSON 返回，便于断言归一化后的真实类型。
+    """
+
+    @property
+    def name(self) -> str:
+        return "full_type_tool"
+
+    @property
+    def description(self) -> str:
+        return "覆盖全部参数类型的测试工具"
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "required": ["mode", "count"],
+            "properties": {
+                "mode": {"type": "string", "enum": ["fast", "slow"]},
+                "count": {"type": "integer", "minimum": 1, "maximum": 10},
+                "ratio": {"type": "number"},
+                "verbose": {"type": "boolean"},
+                "tags": {"type": "array", "uniqueItems": True},
+            },
+        }
+
+    async def execute(self, **kwargs) -> str:
+        return json.dumps(kwargs, ensure_ascii=False)
+
+
+def make_full_type_register(tool=None) -> ToolRegister:
+    register = ToolRegister()
+    register.register(tool or FullTypeTool())
+    return register
+
+
+class TestExecuteWithValidation:
+    @pytest.mark.asyncio
+    async def test_valid_params_executes_normally(self):
+        """全部参数合法且归一化后，正常执行工具"""
+        register = make_full_type_register()
+        raw = {"mode": "fast", "count": "3", "ratio": "2.5",
+               "verbose": "true", "tags": ["a", "b"]}
+        result = await register.execute("full_type_tool", **raw)
+        assert result.is_error is False
+        data = json.loads(result.content)
+        # 类型已归一化：字符串转回对应基础类型
+        assert data["count"] == 3 and isinstance(data["count"], int)
+        assert data["ratio"] == 2.5 and isinstance(data["ratio"], float)
+        assert data["verbose"] is True
+        assert data["tags"] == ["a", "b"]
+
+    @pytest.mark.asyncio
+    async def test_invalid_enum_returns_error_not_raise(self):
+        """enum 违约：execute 返回错误 ToolResult 而非抛异常"""
+        register = make_full_type_register()
+        result = await register.execute(
+            "full_type_tool", mode="turbo", count=1)
+        assert isinstance(result, ToolResult)
+        assert result.is_error is True
+        assert "错误" in result.content or "不在枚举" in result.content
+
+    @pytest.mark.asyncio
+    async def test_missing_required_returns_error(self):
+        """缺少必填参数：返回错误 ToolResult"""
+        register = make_full_type_register()
+        result = await register.execute("full_type_tool", mode="fast")
+        assert isinstance(result, ToolResult)
+        assert result.is_error is True
+        assert "缺少必要参数" in result.content
+
+    @pytest.mark.asyncio
+    async def test_range_violation_returns_error(self):
+        """数值超出范围：返回错误 ToolResult"""
+        register = make_full_type_register()
+        result = await register.execute("full_type_tool", mode="fast", count=99)
+        assert isinstance(result, ToolResult)
+        assert result.is_error is True
+        assert "大于 maximum" in result.content or "错误" in result.content
+
+    @pytest.mark.asyncio
+    async def test_unknown_parameter_returns_error(self):
+        """传入未声明参数：返回错误 ToolResult"""
+        register = make_full_type_register()
+        result = await register.execute(
+            "full_type_tool", mode="fast", count=1, mystery=123)
+        assert isinstance(result, ToolResult)
+        assert result.is_error is True
+        assert "未知参数" in result.content
+
+    @pytest.mark.asyncio
+    async def test_nonexistent_tool_returns_error_hint(self):
+        """调用未注册工具：返回带可用工具提示的错误 ToolResult"""
+        register = make_full_type_register()
+        result = await register.execute("no_such_tool", a=1)
+        assert isinstance(result, ToolResult)
+        assert result.is_error is True
+        assert "工具不存在" in result.content
+        assert "full_type_tool" in result.content  # hint 中列出可用工具

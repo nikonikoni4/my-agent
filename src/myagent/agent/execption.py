@@ -25,6 +25,15 @@ class ToolValidateParameterError(MyAgentError):
     典型场景：缺少 required 中声明的字段、参数类型与 schema 声明不符。
     """
 
+class ToolConsecutiveFailureError(MyAgentError):
+    """单个工具连续失败达到熔断阈值，且该工具配置了熔断即抛错（人在回路入口）。
+
+    由 ToolRegister.execute 在触发熔断时抛出；经 step 内 TaskGroup 以
+    ExceptionGroup 形式上抛，由 loop 接住：记录 request/error 后终止本
+    turn（中断当前行为）。与"功能降级"（返回带 hint 的错误结果、agent
+    继续运行）相对，本类型表示该工具已不可用、需要外部介入。
+    """
+
 class LLMCallError(MyAgentError):
     """LLM 调用失败（来源分类树的基类）。
 
