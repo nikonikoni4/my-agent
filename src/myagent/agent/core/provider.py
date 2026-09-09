@@ -8,6 +8,7 @@ import json
 from dataclasses import dataclass,field
 from typing import Any
 import datetime
+from myagent.agent.execption import LLMToolCallTruncatedError
 @dataclass
 class ToolCallRequest:
     id : str
@@ -204,3 +205,50 @@ class LLMProvider(ABC):
                 )
             )
         return tool_call_list
+
+    def check_truncated_tool_calls(self, finish_reason: str | None, raw_tool_calls: list[dict] | None) -> list[ToolCallRequest] | None:
+        """max_tokens 截断（finish_reason == 'length'）时的工具调用完整性检查。
+
+        截断响应可能携带未生成完的工具调用：id/name 完整，但 arguments 的
+        JSON 字符串在中途被切断。逐个尝试 json.loads：
+        - 全部可解析：返回 ToolCallRequest 列表，交由上层继续处理
+        - 任一不可解析：抛 LLMToolCallTruncatedError，由 agent loop 决定恢复策略
+
+        Args:
+            finish_reason: 本次响应的结束原因，非 'length' 时不做检查
+            raw_tool_calls: 响应携带的原始工具调用，每项形如
+                {"id": str, "name": str, "arguments": str}，
+                arguments 为未解析的 JSON 字符串
+
+        Returns:
+            finish_reason 非 'length'、或无工具调用时返回 None；
+            否则返回解析成功的 ToolCallRequest 列表。
+
+        Raises:
+            LLMToolCallTruncatedError: 存在参数 JSON 不完整（被截断）的工具调用时抛出，
+                details["truncated_tool_calls"] 携带全部原始工具调用信息。
+        """
+        if finish_reason != "length" or not raw_tool_calls:
+            return None
+        requests: list[ToolCallRequest] = []
+        broken: list[str] = []
+        for tc in raw_tool_calls:
+            try:
+                arguments = json.loads(tc.get("arguments") or "{}")
+            except json.JSONDecodeError as e:
+                broken.append(
+                    f"id={tc.get('id')!r} name={tc.get('name')!r} "
+                    f"截断于第 {e.pos} 字符（{e.msg}）"
+                )
+                continue
+            requests.append(
+                ToolCallRequest(id=tc.get("id", ""), name=tc.get("name", ""), arguments=arguments)
+            )
+        if broken:
+            raise LLMToolCallTruncatedError(
+                f"输出达到 max_tokens 被截断，{len(broken)}/{len(raw_tool_calls)} 个工具调用参数不完整，"
+                f"无法解析：{'；'.join(broken)}",
+                code="LLM_TOOL_CALL_TRUNCATED",
+                details={"truncated_tool_calls": raw_tool_calls},
+            )
+        return requests

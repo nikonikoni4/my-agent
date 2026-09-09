@@ -1,13 +1,14 @@
 ---
-version: 1.1
+version: 1.2
 created_at: 2026-09-03
-updated_at: 2026-09-07
-last_updated: 新增会话文件夹命名与读取分类 ADR
+updated_at: 2026-09-09
+last_updated: 新增 LLM 错误处理分类策略 ADR
 abstract: agent 项目架构决策索引。
 ---
 
 | 日期 | 决策标题 | 状态 | 项目名 | 详情 |
 |------|---------|------|--------|------|
+| 2026-09-09 | LLM 错误处理分类策略（内部翻译 + 单点捕获 + 按来源分类树 + 独立策略注册表） | decided | agent | [详情](.\2026-09-09-LLM错误处理分类策略.md) |
 | 2026-09-07 | 会话文件夹命名与读取分类（有损名 + uuid 后缀 + 扫描 meta） | decided | agent | [详情](.\2026-09-07-会话文件夹命名与读取分类.md) |
 | 2026-09-04 | Session 持久化写入两级回滚（with 非原子前提下的整批原子性） | decided | agent | [详情](.\2026-09-04-session持久化写入两级回滚.md) |
 | 2026-09-03 | Session 承担过程日志职责（从仅存 Message 到过程日志） | decided | agent | [详情](.\2026-09-03-session承担过程日志职责.md) |

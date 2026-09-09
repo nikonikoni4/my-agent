@@ -7,10 +7,91 @@ from openai import AsyncOpenAI
 import openai
 import json
 from myagent.agent.core.provider import ChatParams, LLMProvider, LLMResponse, Message, StreamChunk, ToolCallRequest, Usage
-from myagent.agent.execption import LLMCallError
-import logging 
+
+import logging
+from myagent.agent.execption import (
+    LLMCallError,
+    LLMAuthError,
+    LLMModelError,
+    LLMRateLimitError,
+    LLMQuotaError,
+    LLMConnectionError,
+    LLMContextExceededError,
+)
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+
+def _retry_after(e) -> float | None:
+    """从响应头提取服务端建议的重试等待秒数，拿不到返回 None。"""
+    headers = getattr(e, "headers", None) or {}
+    value = headers.get("retry-after") or headers.get("Retry-After")
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _classify_openai_error(e: openai.APIError) -> LLMCallError:
+    """把 openai SDK 异常翻译成 execption.py 分类树中的具体子类。
+
+    分类依据 = 状态码 + 响应体 error.code/error.type/error.message 三者联合，
+    因为 429/403 在不同供应商下语义可能不同（限流 vs 欠费），不能只看 HTTP 码。
+    details 里透传原始信号，供上层归因与策略注册表判定重试。
+    """
+    status = getattr(e, "status_code", None)
+    body = getattr(e, "body", None)
+    # 兼容两种响应体：openai 标准 {"error": {...}} 与方舟扁平 {"code":...,"message":...}
+    err = {}
+    if isinstance(body, dict):
+        err = body.get("error", body)
+        if not isinstance(err, dict):
+            err = body
+    err_code = err.get("code") or err.get("type")
+    err_msg = err.get("message") or str(e)
+    text = f"{err_code or ''} {str(err_msg or '')}"
+
+    # 连接层（无 HTTP 状态码）：断网/超时/瞬时不可达
+    if isinstance(e, openai.APIConnectionError) or isinstance(e, openai.APITimeoutError):
+        cls = LLMConnectionError
+    # 配额/余额：各方欠费表现不一致，靠 code+message 关键词兜底（优先于 403/429 判断）
+    elif any(k in text for k in ("quota", "insufficient", "balance", "欠费", "余额")):
+        cls = LLMQuotaError
+    # 上下文超长：400 context_length_exceeded
+    elif status == 400 or any(k in text for k in ("context_length", "too long")):
+        cls = LLMContextExceededError
+    # 认证 401 / 权限 403
+    elif status == 401 or isinstance(e, openai.AuthenticationError):
+        cls = LLMAuthError
+    elif status == 403 or isinstance(e, openai.PermissionDeniedError):
+        cls = LLMAuthError
+    # 模型/接入点不存在 404
+    elif status == 404 or isinstance(e, openai.NotFoundError):
+        cls = LLMModelError
+    # 限流 429（且已被 quota 分支过滤过，走到这说明是纯限流）
+    elif status == 429 or isinstance(e, openai.RateLimitError):
+        cls = LLMRateLimitError
+    # 服务端繁忙/过载：视作瞬时错误统一延迟重试
+    elif status and status >= 500:
+        cls = LLMRateLimitError
+    # 其余 4xx（HTTP 状态码缓存异常如 400 通用错误）走基类兜底
+    else:
+        cls = LLMCallError
+
+    return cls(
+        f"LLM 调用错误：{err_msg}",
+        details={
+            "http_status": status,
+            "sdk_type": type(e).__name__,
+            "error_code": err_code,
+            "retry_after": _retry_after(e),
+        },
+        cause=e,
+    )
+
+
 class OpenAIProvider(LLMProvider):
     """基于 openai SDK 的实现，model 和 base_url 由调用方指定"""
 
@@ -62,10 +143,20 @@ class OpenAIProvider(LLMProvider):
                 )
 
             # 工具调用解析
-            tool_call_requests=self.parse_tool_call(choice.message) if choice.finish_reason=='tool_calls' else None
+            if choice.finish_reason == 'tool_calls':
+                tool_call_requests = self.parse_tool_call(choice.message)
+            elif choice.finish_reason == 'length':
+                # max_tokens 截断：截断响应可能夹带参数不完整的工具调用，交给检查函数判定
+                raw_calls = [
+                    {"id": tc.id, "name": tc.function.name, "arguments": tc.function.arguments or ""}
+                    for tc in (choice.message.tool_calls or [])
+                ]
+                tool_call_requests = self.check_truncated_tool_calls(choice.finish_reason, raw_calls)
+            else:
+                tool_call_requests = None
         except openai.APIError as e :
             logger.debug(f"llm call 错误 {e}")
-            raise LLMCallError(f"llm call 错误：{e}") from e
+            raise _classify_openai_error(e) from e
 
         print(completion)
         return LLMResponse(
@@ -162,9 +253,14 @@ class OpenAIProvider(LLMProvider):
                     )
                     for _, acc in sorted(tool_calls_acc.items())
                 ]
+            elif finish_reason == "length" and tool_calls_acc:
+                # max_tokens 截断：截断流里攒出的参数可能不完整，交给检查函数判定
+                tool_call_requests = self.check_truncated_tool_calls(
+                    finish_reason, [acc for _, acc in sorted(tool_calls_acc.items())]
+                )
         except openai.APIError as e:
             logger.debug(f"llm stream 错误 {e}")
-            raise LLMCallError(f"llm stream 错误：{e}") from e
+            raise _classify_openai_error(e) from e
 
         yield LLMResponse(
             content="".join(content_parts) or None,

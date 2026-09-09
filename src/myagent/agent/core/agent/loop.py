@@ -17,8 +17,16 @@ from myagent.agent.core.session.session import Session
 import asyncio 
 import logging
 
-from myagent.infra.events.eventspec import REQUEST_ERROR
-from myagent.infra.events.payload import RequestErrorPayLoad
+from myagent.infra.events.eventspec import (
+    TURN_START, STEP_START, REQUEST_HEADER, USER_MESSAGE,
+    ASSISTANT_CHUNK, ASSISTANT_MESSAGE, TOOL_CALL, TOOL_RESULT,
+    STEP_END, TURN_END, REQUEST_ERROR,
+)
+from myagent.infra.events.payload import (
+    TurnStartPayload, StepStartPayload, RequestHeaderPayload, UserMessagePayload,
+    AssistantChunkPayload, AssistantMessagePayload, ToolCallPayload, ToolResultPayload,
+    StepEndPayload, TurnEndPayload, RequestErrorPayLoad,
+)
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 LLM_CALL_TIMEOUT = 120 # 单位秒
@@ -69,9 +77,11 @@ class ReActAgentLoop:
     async def turn(self,user_message):
         try:
             self._session.append("turn/start",TurnStartData())
+            self._event_service.trigger(TURN_START,TurnStartPayload())
             await self.step(user_message)
         finally:
             self._session.append("turn/end",TurnEndData("success"))  # 暂时这么写
+            self._event_service.trigger(TURN_END,TurnEndPayload())
     def _request_header(self):
         # 组装systemprompt
         assembly_prompt : AssemblyPrompt = self.system_prompt.assemble(self.name)
@@ -88,9 +98,11 @@ class ReActAgentLoop:
         if last is None:
             # 本会话从未写入过配置快照
             self._session.append("request/header", current)
+            self._event_service.trigger(REQUEST_HEADER,RequestHeaderPayload())
         elif (last.model_name, last.system_prompt, last.tools, last.params) != (current.model_name, current.system_prompt, current.tools, current.params):
             current.reason = "change"
             self._session.append("request/header", current)
+            self._event_service.trigger(REQUEST_HEADER,RequestHeaderPayload())
         # 除 reason 外完全一致：不写入，request/header 仅首次和配置变更时记录
 
     async def step(self,user_message):
@@ -98,9 +110,11 @@ class ReActAgentLoop:
         while True: # 为了重试而添加的Ture，try写在内部判断究竟是什么错误来决定是否重试
             try:
                 self._session.append("step/start",StepStartData())
+                self._event_service.trigger(STEP_START,StepStartPayload())
                 self._request_header()
                 if user_message:
                     self._session.append("user/message",UserMessageData(user_message),surface_op="append")
+                    self._event_service.trigger(USER_MESSAGE,UserMessagePayload())
                     user_message = None # 用户消息只写首个step，后续step（工具循环）不再重复写
                 # 在模型请求前强制保存session
                 self.persist_session_now()
@@ -114,10 +128,12 @@ class ReActAgentLoop:
                         for tool_call in response.tool_call_requests:
                             tasks.append(tg.create_task(self.tool_register.execute(tool_call.name,**tool_call.arguments)))
                             self._session.append("tool/call",ToolCallData(tool_name=tool_call.name,call_id = tool_call.id ,arguments=tool_call.arguments))
+                            self._event_service.trigger(TOOL_CALL,ToolCallPayload())
                     for index,task in enumerate(tasks):
                         tool_call = response.tool_call_requests[index]
                         too_result =  task.result()
                         self._session.append("tool/result",ToolResultData(call_id=tool_call.id,tool_name=tool_call.name,message=Message(role="tool",content=too_result,tool_call_id=tool_call.id)),surface_op="append",source_event_seqs=[])
+                        self._event_service.trigger(TOOL_RESULT,ToolResultPayload())
                 else:
                     break # 模型不再请求工具，本轮结束（ReAct 终止条件）
                 
@@ -129,10 +145,11 @@ class ReActAgentLoop:
                 pass 
 
             finally:
-                # if step_error :
-                #     request_error_result = self._event_service.trigger(REQUEST_ERROR,RequestErrorPayLoad(error_type=step_error))
+                if step_error :
+                    request_error_result = self._event_service.trigger(REQUEST_ERROR,RequestErrorPayLoad(error_type=step_error))
                 # 先不管错误处理，等先跑通了一遍流程之后再逐个错误处理进行安排，假设当前不会出错
                 self._session.append("step/end",StepEndData())
+                self._event_service.trigger(STEP_END,StepEndPayload())
 
 
 
@@ -149,7 +166,9 @@ class ReActAgentLoop:
                     tool_calls=response.tool_call_requests,
                     reasoning_content=response.reasoning_content,
                 ),usage=response.usage),surface_op="append",source_event_seqs=[])
+                self._event_service.trigger(ASSISTANT_MESSAGE,AssistantMessagePayload())
             else:
                 self._session.append("assistant/chunk",AssistantChunkData(item))
+                self._event_service.trigger(ASSISTANT_CHUNK,AssistantChunkPayload())
 
         return response

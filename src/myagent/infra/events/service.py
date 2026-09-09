@@ -68,8 +68,8 @@ class EventService:
             
         """
         if event_name not in self._hooks:
-            logger.warning(f"{event_name} 未注册")
-            return 
+            logger.debug(f"{event_name} 未注册")
+            return
         self._clear_dead_callback(event_name)
         for entry, _name in list(self._hooks[event_name]): # 浅拷贝，防callback在迭代中注册/注销打乱迭代
             callback = entry()  # 解引用：取回callback；None 表示订阅者已被回收
@@ -91,8 +91,8 @@ class EventService:
         
         """
         if event_name not in self._hooks:
-            logger.warning(f"{event_name} 未注册")
-            return 
+            logger.debug(f"{event_name} 未注册")
+            return
         self._clear_dead_callback(event_name)
         try:
             # 解引用弱引用并过滤失效项（保持原先浅拷贝语义）
