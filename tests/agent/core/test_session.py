@@ -132,7 +132,7 @@ class TestSessionInit:
         records = [
             SessionRecordData(type="turn/start", seq=1, turn=1, step=None, data=TurnStartData()),
             SessionRecordData(type="turn/end", seq=2, turn=1, step=None,
-                              data=TurnEndData(reason="success")),
+                              data=TurnEndData(reason_type="success", reason_text="")),
             SessionRecordData(type="compaction/end", seq=3, turn=None, step=None,
                               data=CompactionEndData(compaction_id="c-1")),
         ]
@@ -236,7 +236,7 @@ class TestTurnStepTracking:
                        AssistantMessageData(message=Message(role="assistant", content="ok")),
                        "append", None)
         session.append("step/start", StepStartData(), None, None)
-        session.append("turn/end", TurnEndData(reason="success"), None, None)
+        session.append("turn/end", TurnEndData(reason_type="success", reason_text=""), None, None)
 
         got = [(r.type, r.turn, r.step) for r in session.record_list]
         assert got == [

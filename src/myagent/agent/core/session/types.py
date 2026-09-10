@@ -139,12 +139,14 @@ class ToolResultData(SessionData):
 @dataclass
 class StepEndData(SessionData):
     """step/end：一个步骤结束。"""
-    
+    reason_type: Literal["success", "interrupted","error"]
+    reason_text : str 
 
 @dataclass
 class TurnEndData(SessionData):
     """turn/end：一轮结束。"""
-    reason: Literal["success", "interrupted","error"]
+    reason_type: Literal["success", "interrupted","error"]
+    reason_text : str 
 
 
 @dataclass
@@ -243,6 +245,8 @@ class TextChunkData:
     finish_reason : list[str] | None  # finish 行的结束原因逐片对齐；非 finish 行为 None
     dt : list[int]
     
-class LLMRetryData:
+@dataclass
+class LLMRetryData(SessionData):
+    """llm/retry：一次重试决策记录（第几次重试、因何决策）。"""
     retry_count : int # 第n次重试
-    reason : str # 重试原因
+    reason : str # 重试原因（触发重试的决策，如 backoff_retry）

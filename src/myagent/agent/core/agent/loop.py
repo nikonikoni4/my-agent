@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from typing import Literal
 import uuid
 from myagent.agent import execption
@@ -11,7 +12,8 @@ from myagent.agent.core.provider import LLMProvider,ChatParams, LLMResponse,Mess
 from myagent.agent.core.session.types import (
     AssistantChunkData, SessionMetaData,ToolCallChunksData,AssistantMessageData, StepEndData,CompactionStartData,
     SessionRecordData,ReasoningChunksData,ToolCallData,ToolResultData,TurnEndData,CompactionSummaryData,
-    TurnStartData,StepStartData,UserMessageData,ContentChunksData,RequestHeaderData,CompactionEndData
+    TurnStartData,StepStartData,UserMessageData,ContentChunksData,RequestHeaderData,CompactionEndData,
+    LLMRetryData
 )
 from myagent.agent.core.session.session import Session
 
@@ -32,7 +34,18 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 LLM_CALL_TIMEOUT = 120 # 单位秒
 TOOL_CALL_TIMEOUT = 60 # 单位秒
-MAX_RETRY_COUNT= 5 # 次
+
+@dataclass(frozen=True)
+class RetryPolicy:
+    """一档重试的退避参数：第 n 次重试等待 min(base_delay * multiplier^(n-1), cap) 秒。
+
+    参数值由策略注册表（LLMRerty）以 dict 形式给出，loop 在此承接为本结构再计算
+    退避。暂放 loop，策略扩展后（如新增抖动、按环境差异化）再定该结构的归属。
+    """
+    base_delay: float = 0.0  # 基准值：第 1 次重试的等待秒数
+    multiplier: float = 1.0  # 乘数：每次重试等待时长相对上一次的放大倍数
+    cap: float = float("inf")  # 上限：等待时长封顶值（秒），默认不封顶
+
 class ReActAgentLoop:
     def __init__(
         self,
@@ -89,12 +102,16 @@ class ReActAgentLoop:
             pass 
 
     async def turn(self,user_message):
+        # 默认成功：step 抛出未归一化的异常时仍按成功收口（异常继续上抛）
+        result = StepOut(reason_type="success",reason_text="")
         try:
             self._session.append("turn/start",TurnStartData())
             self._event_service.trigger(TURN_START,TurnStartPayload())
-            await self.step(user_message)
+            result = await self.step(user_message)
         finally:
-            self._session.append("turn/end",TurnEndData("success"))  # 暂时这么写
+            # 一轮的结果由 step 汇总：出现过未恢复的 error 则为 error 并带上错误
+            # 信息；用户取消则为 interrupted
+            self._session.append("turn/end",TurnEndData(reason_type=result.reason_type,reason_text=result.reason_text))
             self._event_service.trigger(TURN_END,TurnEndPayload())
     def _request_header(self):
         # 组装systemprompt
@@ -119,15 +136,21 @@ class ReActAgentLoop:
             self._event_service.trigger(REQUEST_HEADER,RequestHeaderPayload())
         # 除 reason 外完全一致：不写入，request/header 仅首次和配置变更时记录
 
-    async def step(self,user_message):
+    async def step(self,user_message) -> StepOut:
         step_error = None
         step_count = 0
-        while True: # 为了重试而添加的Ture，try写在内部判断究竟是什么错误来决定是否重试
+        # step 的汇总结果（turn 据此写 turn/end）：任一轮以 error 结束即为 error；
+        # 中间轮次的重试不算——重试后仍继续，最终成功则整轮为 success
+        result = StepOut(reason_type="success",reason_text="")
+        while True: # 为了重试而添加的循环，try写在内部判断究竟是什么错误来决定是否重试
+            # 本轮（一条 step/end 记录）的结束原因，默认正常结束
+            round_reason_type, round_reason_text = "success", ""
             # 步数兜底：达到上限仍未收敛（熔断管不到的场景，如模型轮换调用多个
             # 工具、每个都不达熔断阈值），强制终止，防止 while True 死循环
             if step_count >= self.agent_config.step_limit:
-                step_error = RuntimeError(f"达到最大步数{self.agent_config.step_limit}，强制终止本turn")
-                self._event_service.trigger(REQUEST_ERROR,RequestErrorPayLoad(error_type=step_error))
+                limit_error = RuntimeError(f"达到最大步数{self.agent_config.step_limit}，强制终止本turn")
+                self._event_service.trigger(REQUEST_ERROR,RequestErrorPayLoad(error_type=limit_error))
+                result = StepOut(reason_type="error",reason_text=str(limit_error))
                 break
             step_count += 1
             try:
@@ -167,8 +190,11 @@ class ReActAgentLoop:
                 step_error = e # 这里暂时先就这样简单的写，后续才丰富step_error的内容
 
             except asyncio.CancelledError:
-                # 取消中断比较特殊，单独处理，不走request/error
-                pass
+                # 取消中断比较特殊，单独处理，不走request/error（不是 LLM 调用错误）：
+                # 本 step 记为 interrupted 后结束，终态由 turn 汇总写入 turn/end
+                round_reason_type, round_reason_text = "interrupted","用户手动取消"
+                result = StepOut(reason_type="interrupted",reason_text="用户手动取消")
+                break
 
             except ExceptionGroup as eg:
                 # TaskGroup 把子任务（工具执行）异常包成 ExceptionGroup 上抛。
@@ -189,20 +215,18 @@ class ReActAgentLoop:
                 step_error = e 
             finally:
                 if step_error :
-                    # request/error 是 waterfall 语义事件：控制反转挂点，后续
-                    # 订阅方（如人在回路处理）经返回值给出控制信号，当前无订阅方
-                    request_error_result = self._event_service.trigger(REQUEST_ERROR,RequestErrorPayLoad(error_type=step_error))
-                    # waterfall 无订阅方/订阅方未返回决策时 trigger 返回 None，
-                    # 视为"无人认领"走 LLmError（设计语义），而不是 AttributeError
-                    decision = (request_error_result or {}).get("decision",None)
-                    if decision:
-                        logger.info(f"llm请求错误决策：{decision}；错误{step_error}")
-                    else:
-                        raise LLmError(f"错误无人认领") from step_error
-                    step_error = None  # 一次错误只触发一次 request/error，避免错误后的重试轮次里重复触发
-                # 先不管错误处理，等先跑通了一遍流程之后再逐个错误处理进行安排，假设当前不会出错
-                self._session.append("step/end",StepEndData())
+                    exhausted_reason = await self._handle_step_error(step_error)
+                    # 重试耗尽：本轮记为 error 并结束整个 step 循环。不在 finally 内
+                    # break（会抑制在途异常），只置 result，由循环末尾统一退出
+                    if exhausted_reason is not None:
+                        round_reason_type, round_reason_text = "error", exhausted_reason
+                        result = StepOut(reason_type="error",reason_text=exhausted_reason)
+                    step_error = None  # 一次错误只触发一次 request/error，避免后续轮次重复处理
+                self._session.append("step/end",StepEndData(reason_type=round_reason_type,reason_text=round_reason_text))
                 self._event_service.trigger(STEP_END,StepEndPayload())
+            if result.reason_type == "error":
+                break  # 终态错误（重试耗尽等）：结束本 step
+        return result
 
 
 
@@ -251,3 +275,56 @@ class ReActAgentLoop:
             raise
  
         return response
+
+    async def _handle_step_error(self,error)->str | None:
+        """处理一次 step 错误，返回终止原因文本（None 表示不终止、进入下一轮）。
+
+        触发 request/error（waterfall 语义的控制反转挂点）拿订阅方决策：
+        - 无决策：视为无人认领，抛 LLmError（设计语义）
+        - retry / backoff_retry：记 llm/retry 后按策略退避等待，进入下一轮重试；
+          次数达到 max_retry_count 时不再重试，返回终止原因文本（形如
+          "10/10 达到最大重试错误：429 限流..."，保留最后一次原始错误信息，
+          供 step 记为 error、界面直接展示）
+        - 其余（如 dont_retry）：不等待，维持既有控制流（由 step_limit 兜底）
+        """
+        request_error_result = self._event_service.trigger(REQUEST_ERROR,RequestErrorPayLoad(error_type=error))
+        # waterfall 无订阅方/订阅方未返回决策时 trigger 返回 None，
+        # 视为"无人认领"走 LLmError（设计语义），而不是 AttributeError
+        decision = (request_error_result or {}).get("decision",None)
+        if decision is None:
+            raise LLmError(f"错误无人认领") from error
+        logger.info(f"llm请求错误决策：{decision}；错误{error}")
+        if decision not in ("retry","backoff_retry"):
+            return None
+        # 第 n 次重试：n = 本 turn 已记录的重试次数 + 1
+        attempt = self._session.llm_retry_count(self._session.turn) + 1
+        max_retry_count = self.agent_config.max_retry_count
+        if attempt > max_retry_count:
+            logger.warning(f"重试次数已达上限 {max_retry_count}，结束本 step：{error}")
+            return f"{max_retry_count}/{max_retry_count} 达到最大重试错误：{error}"
+        # 先落 llm/retry 记录再等待：该记录是"决定重试"的事实，也是下轮 attempt 计数来源
+        self._session.append("llm/retry",LLMRetryData(retry_count=attempt,reason=decision))
+        policy = RetryPolicy(**(request_error_result.get("policy") or {}))
+        await self.retry_delay(error,policy,attempt)
+        return None
+
+    async def retry_delay(self,error,policy:RetryPolicy,attempt:int)->float:
+        """计算并等待第 attempt 次重试的退避时长，返回实际等待秒数。
+
+        delay = min(base_delay * multiplier^(attempt-1), cap)；错误携带服务端
+        Retry-After 建议时取其与本地退避的较大值（服务端更清楚何时可用，本地
+        退避作为下限）。等待用 asyncio.sleep，不阻塞事件循环。
+
+        args:
+            error: 本次错误，用于取 details["retry_after"]；非领域异常（如
+                TimeoutError）没有 details，取不到建议值，仅用本地退避
+            policy: 策略注册表给出的该档退避参数
+            attempt: 第几次重试，从 1 开始
+        """
+        delay = min(policy.base_delay * policy.multiplier ** (attempt - 1),policy.cap)
+        retry_after = (getattr(error,"details",None) or {}).get("retry_after")
+        if isinstance(retry_after,(int,float)):
+            delay = max(delay,retry_after)
+        if delay > 0:
+            await asyncio.sleep(delay)
+        return delay

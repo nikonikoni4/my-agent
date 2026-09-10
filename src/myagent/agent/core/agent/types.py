@@ -11,6 +11,8 @@ from myagent.infra.events.service import EventService
 @dataclass
 class AgentConfig:
     step_limit : int 
+    max_retry_count : int
+
 @dataclass
 class AgentContext:
     event_service : EventService
@@ -20,7 +22,6 @@ class AgentContext:
 
 @dataclass
 class StepOut:
-    continue_ : bool
     reason_type : Literal["success","interrupted","error"]
     reason_text : str  
 
