@@ -210,18 +210,44 @@ class ReActAgentLoop:
                  
     
     async def _ask_model(self)->LLMResponse:
-        async for item in self._llm_client.stream_chat(self._session.derive_messages(),self.tool_register.to_schemas()):
-            if isinstance(item, LLMResponse):
-                response = item
-                self._session.append("assistant/message",AssistantMessageData(Message(
-                    role = "assistant",
-                    content = response.content,
-                    tool_calls=response.tool_call_requests,
-                    reasoning_content=response.reasoning_content,
-                ),usage=response.usage),surface_op="append",source_event_seqs=[])
-                self._event_service.trigger(ASSISTANT_MESSAGE,AssistantMessagePayload())
-            else:
-                self._session.append("assistant/chunk",AssistantChunkData(item))
-                self._event_service.trigger(ASSISTANT_CHUNK,AssistantChunkPayload())
+        """
+        请求模型，并触发assistant/message 和 assistant/chunk事件
+        return : 
+            LLMResponse
+        raise:
+            LLMCallError
 
+        在内部捕获LLMCallError，补齐由于llmcallerror导致的session缺少：
+        补齐策略：
+        1. 所有的error的已经输出的chunk不回滚，保留。原则是：已经落盘的内容不会在被修改，append-only
+        2. 若缺少finish chunk则补齐finish chunk，finish_reason = error
+        3. 原有的json解析和max_token错误已经移动到工具调用部分处理，见docs\adr\2026-09-10-工具调用解析与截断处置移入工具层.md
+        4. 不补齐assistant/message
+        """
+        finish_emitted = False
+        try:
+            async for item in self._llm_client.stream_chat(self._session.derive_messages(),self.tool_register.to_schemas()):
+                if isinstance(item, LLMResponse):
+                    response = item
+                    self._session.append("assistant/message",AssistantMessageData(Message(
+                        role = "assistant",
+                        content = response.content,
+                        tool_calls=response.tool_call_requests,
+                        reasoning_content=response.reasoning_content,
+                    ),usage=response.usage),surface_op="append",source_event_seqs=[])
+                    self._event_service.trigger(ASSISTANT_MESSAGE,AssistantMessagePayload())
+                else:
+                    if item.finish_reason is not None:
+                        finish_emitted = True
+                    self._session.append("assistant/chunk",AssistantChunkData(item))
+                    self._event_service.trigger(ASSISTANT_CHUNK,AssistantChunkPayload())
+        except LLMCallError:
+            # 调用失败：已产出的 chunk 一律保留（append-only）。正常结束时 provider
+            # 已产出 finish 块，这里只为缺失的情况补一个 error 结束原因，使日志上
+            # "正常结束"与"调用失败"可判别；不可回滚、不补 assistant/message
+            if not finish_emitted:
+                self._session.append("assistant/chunk",AssistantChunkData(StreamChunk(finish_reason="error")))
+                self._event_service.trigger(ASSISTANT_CHUNK,AssistantChunkPayload())
+            raise
+ 
         return response

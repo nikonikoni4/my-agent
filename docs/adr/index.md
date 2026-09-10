@@ -1,13 +1,14 @@
 ---
-version: 1.3
+version: 1.4
 created_at: 2026-09-03
 updated_at: 2026-09-10
-last_updated: 新增工具调用解析与截断处置移入工具层 ADR；截断与 JSON 解析错误分类 ADR 标记 superseded
+last_updated: 新增 LLM 调用失败时的 session 补齐策略 ADR
 abstract: agent 项目架构决策索引。
 ---
 
 | 日期 | 决策标题 | 状态 | 项目名 | 详情 |
 |------|---------|------|--------|------|
+| 2026-09-10 | LLM 调用失败时的 session 补齐策略（保留已产出 chunk + 补 error finish 块 + 不补 assistant/message） | decided | agent | [详情](.\2026-09-10-LLM调用失败时的session补齐策略.md) |
 | 2026-09-10 | 工具调用解析与截断处置移入工具层（RawToolCall 原样契约 + 工具层信任边界回喂 + finish 链路承载截断强调） | decided | agent | [详情](.\2026-09-10-工具调用解析与截断处置移入工具层.md) |
 | 2026-09-09 | 工具调用截断与 JSON 解析错误分类（平铺并列、突出 Max Token 截断的三类成因） | superseded | agent | [详情](.\2026-09-09-工具调用截断与JSON解析错误分类.md) |
 | 2026-09-09 | LLM 错误处理分类策略（内部翻译 + 单点捕获 + 按来源分类树 + 独立策略注册表） | decided | agent | [详情](.\2026-09-09-LLM错误处理分类策略.md) |
