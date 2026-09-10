@@ -6,7 +6,7 @@
 from openai import AsyncOpenAI
 import openai
 import json
-from myagent.agent.core.provider import ChatParams, LLMProvider, LLMResponse, Message, StreamChunk, ToolCallRequest, Usage
+from myagent.agent.core.provider import ChatParams, LLMProvider, LLMResponse, Message, StreamChunk, RawToolCall, Usage
 
 import logging
 from myagent.agent.execption import (
@@ -17,7 +17,6 @@ from myagent.agent.execption import (
     LLMQuotaError,
     LLMConnectionError,
     LLMContextExceededError,
-    LLMToolCallParseError,
 )
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -143,18 +142,11 @@ class OpenAIProvider(LLMProvider):
                     total_tokens=completion.usage.total_tokens,
                 )
 
-            # 工具调用解析
-            if choice.finish_reason == 'tool_calls':
-                tool_call_requests = self.parse_tool_call(choice.message)
-            elif choice.finish_reason == 'length':
-                # max_tokens 截断：截断响应可能夹带参数不完整的工具调用，交给检查函数判定
-                raw_calls = [
-                    {"id": tc.id, "name": tc.function.name, "arguments": tc.function.arguments or ""}
-                    for tc in (choice.message.tool_calls or [])
-                ]
-                tool_call_requests = self.check_truncated_tool_calls(choice.finish_reason, raw_calls)
-            else:
-                tool_call_requests = None
+            # 工具调用提取：arguments 保持 wire 原样 JSON 字符串，不在此解析
+            # （解析是工具层 ToolRegister 的信任边界，失败走带 hint 的工具结果
+            # 回喂模型自纠，不作为 LLM 调用错误）。finish_reason=length 时
+            # 提取出的调用带 truncated 标记，回喂话术由工具层依据标记选择
+            tool_call_requests = self.extract_tool_calls(choice.message, choice.finish_reason)
         except openai.APIError as e :
             logger.debug(f"llm call 错误 {e}")
             raise _classify_openai_error(e) from e
@@ -245,38 +237,28 @@ class OpenAIProvider(LLMProvider):
                     finish_reason = choice.finish_reason
 
             tool_call_requests = None
-            if finish_reason == "tool_calls" and tool_calls_acc:
-                tool_call_requests = []
-                for _, acc in sorted(tool_calls_acc.items()):
-                    raw_arguments = acc["arguments"] or "{}"
-                    try:
-                        arguments = json.loads(raw_arguments)
-                    except json.JSONDecodeError as e:
-                        raise LLMToolCallParseError(
-                            f"工具调用({acc['name']}) 参数 JSON 解析失败：{e.msg}（位置 {e.pos}）",
-                            code="LLM_TOOL_CALL_PARSE",
-                            details={
-                                "tool_call_id": acc["id"],
-                                "tool_name": acc.get("name"),
-                                "raw_arguments": raw_arguments,
-                            },
-                            cause=e,
-                        ) from e
-                    tool_call_requests.append(
-                        ToolCallRequest(
-                            id=acc["id"],
-                            name=acc["name"],
-                            arguments=arguments,
-                        )
+            if tool_calls_acc:
+                # arguments 保持流式拼接的原样字符串，不做 JSON 解析（解析是
+                # 工具层的信任边界）；finish_reason=length 时打 truncated 标记，
+                # 回喂话术（截断 vs 语法错误）由工具层依据标记选择
+                truncated = finish_reason == "length"
+                tool_call_requests = [
+                    RawToolCall(
+                        id=acc["id"],
+                        name=acc["name"],
+                        arguments=acc["arguments"] or "{}",
+                        truncated=truncated,
                     )
-            elif finish_reason == "length" and tool_calls_acc:
-                # max_tokens 截断：截断流里攒出的参数可能不完整，交给检查函数判定
-                tool_call_requests = self.check_truncated_tool_calls(
-                    finish_reason, [acc for _, acc in sorted(tool_calls_acc.items())]
-                )
+                    for _, acc in sorted(tool_calls_acc.items())
+                ]
         except openai.APIError as e:
             logger.debug(f"llm stream 错误 {e}")
             raise _classify_openai_error(e) from e
+
+        # 流正常结束才产出 finish 块：中途抛错时不会执行到这里，该块自然缺失，
+        # 以此与正常结束区分。（错误发生时如何补/不补该块，后续错误处理再做）
+        if finish_reason is not None:
+            yield StreamChunk(finish_reason=finish_reason)
 
         yield LLMResponse(
             content="".join(content_parts) or None,
@@ -328,7 +310,7 @@ if __name__ == "__main__":
     print(llm_response.reasoning_content)
     print(llm_response.content)
     print(llm_response.tool_call_requests)
-    print(WeatherTool().execute(**llm_response.tool_call_requests[0].arguments))
+    print(WeatherTool().execute(**json.loads(llm_response.tool_call_requests[0].arguments)))
 
     # 流式输出自测
     async def run_stream():

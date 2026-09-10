@@ -1,8 +1,11 @@
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Literal
+import json
+
+from myagent.agent.core.provider import RawToolCall
 from myagent.agent.execption import ToolValueError,ToolExecuteError,ToolValidateParameterError,ToolConsecutiveFailureError
-from .tool import Tool, ToolResult
+from .tool import Tool, ToolResult, ParsedToolCall
 import logging
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -230,21 +233,79 @@ class ToolRegister:
         """
         return list(self._tools.keys())
 
-    async def execute(self, tool_name, **kwargs) -> ToolResult:
-        """按名称执行工具（含熔断拦截与失败计数）。
+    def parse_call(self, call: RawToolCall) -> ParsedToolCall | ToolResult:
+        """把模型原始工具调用解析为可执行形态（工具层的信任边界入口）。
+
+        模型输出的 arguments JSON 字符串不可信，json.loads 在此完成：
+        - 解析成功且是 dict：返回 ParsedToolCall，交由 execute 继续校验执行
+        - 解析失败或不是 dict：返回带 hint 的错误 ToolResult（原文 + 错误
+          位置），回喂模型自纠；工具未执行
+
+        解析失败的话术依据 call.truncated 分流（见 ADR 截断三成因）：
+        截断（来自 finish_reason=length 的响应）建议精简参数/拆分调用，
+        普通语法错误建议对照错误位置修正。
 
         Args:
-            tool_name: 工具名，即注册时 Tool.name 的值。
-            **kwargs: 传给工具 execute 的参数（模型 arguments 解析后的键值对）。
+            call: 模型发起的原始工具调用
 
         Returns:
-            工具执行结果。工具不存在、参数校验失败、执行抛异常时返回
-            is_error=True 的 ToolResult（错误文本 + hint），供模型自纠。
+            ParsedToolCall（解析成功）或 ToolResult（is_error=True 且
+            is_parse_error=True，解析失败）
+        """
+        raw = call.arguments or "{}"
+        try:
+            arguments = json.loads(raw)
+        except json.JSONDecodeError as e:
+            if call.truncated:
+                hint = (
+                    "\n hint : 本次回复因达到 max_tokens 被截断，上述参数大概率"
+                    "是在生成中途被切断（不完整）；请精简参数内容后重新调用，"
+                    "必要时拆分为多次调用"
+                )
+            else:
+                hint = (
+                    "\n hint : 上述原文是你本次工具调用的 arguments，存在 JSON "
+                    "语法错误；请对照错误位置修正后重新调用该工具"
+                )
+            return ToolResult(
+                content=(
+                    f"status : error \n message : 工具调用({call.name})参数不是合法 JSON："
+                    f"{e.msg}（位置 {e.pos}）\n raw_arguments : {raw}" + hint
+                ),
+                is_error=True,
+                is_parse_error=True,
+            )
+        if not isinstance(arguments, dict):
+            return ToolResult(
+                content=(
+                    f"status : error \n message : 工具调用({call.name})参数解析结果不是"
+                    f"JSON 对象（得到 {type(arguments).__name__}）\n raw_arguments : {raw}"
+                    "\n hint : arguments 必须是 {...} 形式的 JSON 对象；请重新调用该工具"
+                ),
+                is_error=True,
+                is_parse_error=True,
+            )
+        return ParsedToolCall(call_id=call.id, tool_name=call.name, arguments=arguments)
+
+    async def execute(self, call: RawToolCall) -> ToolResult:
+        """执行一次模型发起的工具调用：解析参数 → 校验 → 执行。
+
+        Args:
+            call: 模型发起的原始工具调用，arguments 为 wire 上的 JSON 字符串
+
+        Returns:
+            工具执行结果。参数 JSON 解析失败、参数校验失败、执行抛异常时
+            返回 is_error=True 的 ToolResult（错误文本 + hint），供模型自纠；
+            工具不存在返回错误结果但无熔断对象、不计入计数。
 
         Raises:
             ToolConsecutiveFailureError: 工具触发熔断且配置了 raise_on_break
                 （人在回路入口），上抛由 loop 接住中断本 turn。
         """
+        # 信任边界：先解析模型给的原始 arguments（纯解析，无副作用）
+        parsed = self.parse_call(call)
+
+        tool_name = call.name
         if tool_name not in self._tools:
             logger.warning(f"{tool_name}工具不存在/未注册")
             return ToolResult.error(f"status : error \n message : {tool_name}工具不存在 \n hint : 可用工具 {','.join(self.tool_list())} ")
@@ -259,21 +320,27 @@ class ToolRegister:
                 f"本轮内不可再调用，请改用其他工具完成任务，或告知用户当前工具不可用"
             )
 
-        # 工具参数校验 + 执行
-        try:
-            kwargs = self._validate(tool.parameters,kwargs)
-            raw = await tool.execute(**kwargs)
-            # 子类返回 str 视为成功；返回 ToolResult 按其 is_error 判定
-            result = raw if isinstance(raw, ToolResult) else ToolResult(content=str(raw))
-        except ToolValidateParameterError as e:
-            logger.error(f"{tool_name}工具调用错误，参数:{kwargs},错误信息：{e}")
-            result = ToolResult.error(f"{tool_name}工具调用错误，参数:{kwargs},错误信息：{e}, hint : 请分析上述调用错误信息,重新调用")
-        except Exception as e:
-            # 暂时的写法，这里工具调用错误还需要分类进行
-            logger.error(f"{tool_name}工具调用错误，参数:{kwargs}")
-            result = ToolResult.error(f"{tool_name}工具调用错误，参数:{kwargs}")
+        # 解析失败：模型输出问题，但与执行失败同等计入熔断——熔断防的是
+        # "模型反复调用一个工具一直出错"，模型侧写坏参数与工具侧执行失败
+        # 都算，防止坏参数调用无限循环
+        if isinstance(parsed, ToolResult):
+            result = parsed
+        else:
+            # 工具参数校验 + 执行
+            try:
+                kwargs = self._validate(tool.parameters,parsed.arguments)
+                raw = await tool.execute(**kwargs)
+                # 子类返回 str 视为成功；返回 ToolResult 按其 is_error 判定
+                result = raw if isinstance(raw, ToolResult) else ToolResult(content=str(raw))
+            except ToolValidateParameterError as e:
+                logger.error(f"{tool_name}工具调用错误，参数:{parsed.arguments},错误信息：{e}")
+                result = ToolResult.error(f"{tool_name}工具调用错误，参数:{parsed.arguments},错误信息：{e}, hint : 请分析上述调用错误信息,重新调用")
+            except Exception as e:
+                # 暂时的写法，这里工具调用错误还需要分类进行
+                logger.error(f"{tool_name}工具调用错误，参数:{parsed.arguments}")
+                result = ToolResult.error(f"{tool_name}工具调用错误，参数:{parsed.arguments}")
 
-        # 熔断计数：异常路径与 is_error 结果都算一次失败，成功清零
+        # 熔断计数：解析/校验/执行的失败都算一次，成功清零
         if result.is_error:
             self._on_failure(tool, result)
         else:

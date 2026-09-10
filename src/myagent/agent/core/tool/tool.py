@@ -9,17 +9,36 @@ MIN_CONSECUTIVE_FAILURES = 5  # 熔断阈值下限：防止配置过小让工具
 class ToolResult:
     """工具执行结果。
 
-    content 是回传给模型的文本；is_error 标记本次执行是否失败，
-    ToolRegister 依据它做熔断计数（失败累加、成功清零）。
+    content 是回传给模型的文本（解析/校验/执行失败时含错误信息与 hint）；
+    is_error 标记本次执行是否失败，ToolRegister 依据它做熔断计数（失败累加、
+    成功清零）。is_parse_error 标记失败发生在"模型参数 JSON 解析"这一步
+    （工具未执行）：是模型输出问题而非工具问题，但与执行失败同等计入
+    熔断——熔断防的是"模型反复调用一个工具一直出错"，模型侧写坏参数
+    与工具侧执行失败都算。
     """
 
     content: str
     is_error: bool = False
+    is_parse_error: bool = False
 
     @classmethod
     def error(cls, content: str) -> "ToolResult":
         """构造失败结果（is_error=True）。"""
         return cls(content=content, is_error=True)
+
+
+@dataclass
+class ParsedToolCall:
+    """RawToolCall 解析后的可执行形态（工具层内部使用）。
+
+    arguments 已通过 json.loads 从 wire 字符串解析为 dict；解析失败的调用
+    不会产生本类型——由 ToolRegister 直接以带 hint 的错误 ToolResult
+    回喂模型自纠。
+    """
+
+    call_id: str
+    tool_name: str
+    arguments: dict[str, Any]
 
 class Tool(ABC):
     """工具抽象基类。

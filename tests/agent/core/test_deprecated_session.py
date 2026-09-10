@@ -3,7 +3,7 @@ import datetime
 import pytest
 from pathlib import Path
 
-from myagent.agent.core.provider import Message, ToolCallRequest
+from myagent.agent.core.provider import Message, RawToolCall
 from myagent.agent.core.session.deprecated_session import Session, SessionManager
 
 
@@ -115,7 +115,7 @@ def new_session():
             Message("assistant","助手"),
             Message("user","user"),
             Message("assistant","",tool_calls=[
-                ToolCallRequest("call_123","get_weather",'{"location": "shanghai"}')
+                RawToolCall("call_123","get_weather",'{"location": "shanghai"}')
             ]),
             Message("tool","测试结果",tool_call_id="call_123"),
             Message("assistant","输出结果")

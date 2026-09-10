@@ -95,30 +95,5 @@ class LLMContextExceededError(LLMCallError):
     处理方式由策略注册表决定。
     """
 
-class LLMToolCallParseError(LLMCallError):
-    """工具调用的 arguments 参数 JSON 解析失败（非截断）。
-
-    典型场景：模型输出的工具调用 arguments 是非法 JSON（单引号、括号不匹配、
-    多余逗号等导致 json.loads 抛 JSONDecodeError），并非 max_tokens 截断所致。
-
-    与 LLMToolCallTruncatedError 的区别：后者特指 finish_reason == 'length'
-    截断导致的参数 JSON 不完整；本类型覆盖其余一切解析失败。两者同源于
-    "模型工具调用内容不可信"，但重试/恢复策略可能不同，故平铺并列，
-    由 agent loop 或策略注册表分别处置。
-
-    由 LLMProvider.parse_tool_call 及流式 tool_calls 拼装处的 json.loads 捕获抛出。
-    details 携带 tool_call_id / tool_name / raw_arguments，供上层诊断或补救。
-    """
-
-class LLMToolCallTruncatedError(LLMCallError):
-    """输出达到 max_tokens 被截断，且截断响应中夹带了参数不完整的工具调用。
-
-    典型场景：finish_reason == 'length' 时响应携带 tool_calls，id/name 完整，
-    但 arguments 的 JSON 字符串在生成中途被切断，json.loads 失败
-    （实测错误形如 Unterminated string）。流式与非流式均可能出现。
-
-    由 LLMProvider.check_truncated_tool_calls 抛出，由 agent loop 决定恢复策略：
-    提高 max_tokens 重试 / 要求模型缩短写入内容 / 人在回路确认。
-    details["truncated_tool_calls"] 携带截断工具调用的原始信息
-    （id/name/未解析的 arguments 字符串），供上层诊断或补救。
-    """
+class LLmError(MyAgentError):
+    """request/error 事件无人认领的时候抛出错误"""

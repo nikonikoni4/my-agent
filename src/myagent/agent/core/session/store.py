@@ -25,7 +25,7 @@ from pathlib import Path
 from myagent.agent.core.session.session import Session
 from myagent.agent.core.session.persistence import SessionPresist
 from myagent.agent.core.session.types import SessionMetaData, SessionRecordData, AssistantChunkData
-from myagent.agent.core.provider import Message, ToolCallRequest, ChatParams, Usage, StreamChunk
+from myagent.agent.core.provider import Message, RawToolCall, ChatParams, Usage, StreamChunk
 from myagent.infra.events import EventService
 from myagent.utils.helper import project_path_to_session_folder
 
@@ -127,7 +127,16 @@ class SessionStore:
         """把落盘的 message dict 还原为 Message，tool_calls 同步还原"""
         # None 与 [] 要区分还原：or [] 会把 None 抹成空列表，导致与内存态不一致
         raw_tool_calls = d.get("tool_calls")
-        tool_calls = None if raw_tool_calls is None else [ToolCallRequest(**tc) for tc in raw_tool_calls]
+        tool_calls = None if raw_tool_calls is None else [
+            RawToolCall(
+                id=tc["id"],
+                name=tc["name"],
+                # 旧版落盘的 arguments 是已解析的 dict（现契约为 wire 原样字符串），
+                # 还原时序列化回字符串；新版直接透传
+                arguments=tc["arguments"] if isinstance(tc["arguments"], str) else json.dumps(tc["arguments"] or {}),
+            )
+            for tc in raw_tool_calls
+        ]
         return Message(
             role=d["role"],
             content=d["content"],
@@ -192,6 +201,8 @@ class SessionStore:
                 )
             elif d["type"] == "content":
                 chunk = StreamChunk(content=d["texts"][i])
+            elif d["type"] == "finish":
+                chunk = StreamChunk(finish_reason=d["finish_reason"][i])
             else:
                 chunk = StreamChunk(reasoning_content=d["texts"][i])
             chunks.append(SessionRecordData(

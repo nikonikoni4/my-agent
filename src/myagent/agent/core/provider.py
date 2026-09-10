@@ -4,16 +4,26 @@
 具体实现（如 OpenAI 兼容接口）由 llm/ 层提供，通过构造函数注入。
 """
 from abc import ABC, abstractmethod
-import json
 from dataclasses import dataclass,field
 from typing import Any
 import datetime
-from myagent.agent.execption import LLMToolCallTruncatedError, LLMToolCallParseError
+
 @dataclass
-class ToolCallRequest:
+class RawToolCall:
+    """模型发起的一次工具调用（原始形态，未经解析）。
+
+    arguments 保持 wire 上的 JSON 字符串原样。模型输出不可信，解析
+    （json.loads + dict 校验）统一由工具层 ToolRegister 承接（信任边界）：
+    解析失败以带 hint 的 ToolResult 回喂模型自纠，不作为 LLM 调用错误。
+
+    truncated 由 provider 依据响应 finish_reason == "length" 标记：该调用的
+    arguments 可能在生成中途被 max_tokens 切断。它是执行语境而非 wire 数据
+    （to_dict 不序列化它），供工具层选择回喂话术（截断 vs 语法错误）。
+    """
     id : str
-    name :str 
-    arguments : dict[str,Any] | None
+    name :str
+    arguments : str  # wire 原样 JSON 字符串；无参数时为 "{}"（空串按 "{}" 处理）
+    truncated : bool = False
 
     def to_dict(self)->dict:
         if not self.id or not self.name :
@@ -23,8 +33,9 @@ class ToolCallRequest:
             "type" :"function",
             "function":{
                 "name":self.name,
-                # 契约：wire 格式中 arguments 是 JSON 字符串；无参数时为空对象字符串 "{}"
-                "arguments" : json.dumps(self.arguments or {})
+                # 契约：wire 格式中 arguments 是 JSON 字符串；原样透传不重新序列化，
+                # 回发给供应商的就是模型当时写的文本
+                "arguments" : self.arguments or "{}"
             }
         }
 
@@ -39,7 +50,7 @@ class Message:
     """
     role: str
     content: str | list 
-    tool_calls : list[ToolCallRequest] | None = None
+    tool_calls : list[RawToolCall] | None = None
     tool_call_id : str |None = None 
     reasoning_content : str | None = None 
     def to_dict(self)->dict: # 需要把这个改为to_llm_call_dict
@@ -90,13 +101,14 @@ class LLMResponse:
     Attributes:
         content: 模型回复的文本内容
         reasoning_content : 推理过程
-        tool_call_requests: 模型发起的工具调用请求列表，无调用时为空列表
+        tool_call_requests: 模型发起的工具调用请求列表（原始形态，arguments
+            为 wire 上的 JSON 字符串，解析职责在工具层），无调用时为空列表
         finish_reason: 结束原因，如 stop（正常结束）、length（达到 max_tokens）
         usage: token 用量统计，供应商未返回时各字段为 0
     """
     content: str | None
     reasoning_content : str  | None = None
-    tool_call_requests : list[ToolCallRequest] = field(default_factory=list)
+    tool_call_requests : list[RawToolCall] = field(default_factory=list)
     finish_reason: str | None = None
     usage: Usage  = field(default_factory=Usage)
     interrupted : bool = False 
@@ -112,7 +124,11 @@ class StreamChunk:
         tool_id: 工具调用标识，仅每个调用的首个片段携带，后续片段为 None
         tool_name: 工具名，仅每个调用的首个片段携带，后续片段为 None
         tool_arguments_delta: 参数 JSON 的增量碎片。单个碎片不是合法 JSON，
-            只能在流结束后拼接再解析
+            只能在流结束后拼接，拼接结果作为 RawToolCall.arguments 原样
+            交给工具层解析
+        finish_reason: 结束原因（stop/length/tool_calls 等）。非 None 表示这是
+            流正常结束时产出的 finish 块；流中途出错则该块不会被产出，以此
+            区分正常结束与中断
     """
     content: str | None = None
     reasoning_content: str | None = None
@@ -120,6 +136,7 @@ class StreamChunk:
     tool_id: str | None = None
     tool_name: str | None = None
     tool_arguments_delta: str | None = None
+    finish_reason: str | None = None
         
 
 @dataclass
@@ -182,87 +199,33 @@ class LLMProvider(ABC):
             LLMResponse: 流结束时的最终完整结果，含工具调用、finish_reason、token 用量
         """
 
-    def parse_tool_call(self,response_message)->list[ToolCallRequest]:
-        """把 SDK 响应里的 tool_calls 解析为项目内的 ToolCallRequest 列表。
+    def extract_tool_calls(self,response_message,finish_reason : str | None = None)->list[RawToolCall] | None:
+        """把 SDK 响应里的 tool_calls 提取为 RawToolCall 列表（纯翻译，不做解析）。
+
+        arguments 保持模型输出的 JSON 字符串原样：是否合法 JSON、是否符合
+        schema 由工具层 ToolRegister 判定。finish_reason == "length" 时为提取
+        出的调用打 truncated 标记（arguments 可能中途被 max_tokens 切断），
+        回喂话术的选择由工具层依据该标记完成。
 
         Args:
             response_message: SDK 响应中的 choices[0].message 对象，
                 可为 None（部分供应商无工具调用时该位置为空）。
+            finish_reason: 本次响应的结束原因，"length" 表示输出被截断。
 
         Returns:
-            ToolCallRequest 列表，arguments 已从 JSON 字符串解析为 dict；
-            无工具调用时返回 None（输入为 None）或空列表。
+            RawToolCall 列表；无工具调用时返回 None（输入为 None）或空列表。
         """
         if not response_message:
-            return
-        tool_call_list = []
-        for tool_call in response_message.tool_calls :
-            raw_arguments = tool_call.function.arguments or "{}"
-            try:
-                arguments = json.loads(raw_arguments)
-            except json.JSONDecodeError as e:
-                raise LLMToolCallParseError(
-                    f"工具调用({tool_call.function.name}) 参数 JSON 解析失败：{e.msg}（位置 {e.pos}）",
-                    code="LLM_TOOL_CALL_PARSE",
-                    details={
-                        "tool_call_id": tool_call.id,
-                        "tool_name": tool_call.function.name,
-                        "raw_arguments": raw_arguments,
-                    },
-                    cause=e,
-                ) from e
-            tool_call_list.append(
-                ToolCallRequest(
-                    id = tool_call.id,
-                    name = tool_call.function.name,
-                    arguments=arguments
-                )
-            )
-        return tool_call_list
-
-    def check_truncated_tool_calls(self, finish_reason: str | None, raw_tool_calls: list[dict] | None) -> list[ToolCallRequest] | None:
-        """max_tokens 截断（finish_reason == 'length'）时的工具调用完整性检查。
-
-        截断响应可能携带未生成完的工具调用：id/name 完整，但 arguments 的
-        JSON 字符串在中途被切断。逐个尝试 json.loads：
-        - 全部可解析：返回 ToolCallRequest 列表，交由上层继续处理
-        - 任一不可解析：抛 LLMToolCallTruncatedError，由 agent loop 决定恢复策略
-
-        Args:
-            finish_reason: 本次响应的结束原因，非 'length' 时不做检查
-            raw_tool_calls: 响应携带的原始工具调用，每项形如
-                {"id": str, "name": str, "arguments": str}，
-                arguments 为未解析的 JSON 字符串
-
-        Returns:
-            finish_reason 非 'length'、或无工具调用时返回 None；
-            否则返回解析成功的 ToolCallRequest 列表。
-
-        Raises:
-            LLMToolCallTruncatedError: 存在参数 JSON 不完整（被截断）的工具调用时抛出，
-                details["truncated_tool_calls"] 携带全部原始工具调用信息。
-        """
-        if finish_reason != "length" or not raw_tool_calls:
             return None
-        requests: list[ToolCallRequest] = []
-        broken: list[str] = []
-        for tc in raw_tool_calls:
-            try:
-                arguments = json.loads(tc.get("arguments") or "{}")
-            except json.JSONDecodeError as e:
-                broken.append(
-                    f"id={tc.get('id')!r} name={tc.get('name')!r} "
-                    f"截断于第 {e.pos} 字符（{e.msg}）"
-                )
-                continue
-            requests.append(
-                ToolCallRequest(id=tc.get("id", ""), name=tc.get("name", ""), arguments=arguments)
+        calls = [
+            RawToolCall(
+                id=tool_call.id,
+                name=tool_call.function.name,
+                arguments=tool_call.function.arguments or "{}",
             )
-        if broken:
-            raise LLMToolCallTruncatedError(
-                f"输出达到 max_tokens 被截断，{len(broken)}/{len(raw_tool_calls)} 个工具调用参数不完整，"
-                f"无法解析：{'；'.join(broken)}",
-                code="LLM_TOOL_CALL_TRUNCATED",
-                details={"truncated_tool_calls": raw_tool_calls},
-            )
-        return requests
+            for tool_call in response_message.tool_calls
+        ]
+        if finish_reason == "length":
+            for call in calls:
+                call.truncated = True
+        return calls

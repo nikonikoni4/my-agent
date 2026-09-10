@@ -17,7 +17,7 @@ from myagent.agent.core.agent.loop import ReActAgentLoop
 from myagent.agent.core.provider import (
     LLMProvider,
     LLMResponse,
-    ToolCallRequest,
+    RawToolCall,
     Usage,
 )
 from myagent.agent.core.session.session import Session
@@ -97,7 +97,7 @@ def make_loop(tool: Tool, rounds: list[list], step_limit: int):
 
 def tool_round(call_id: str) -> list:
     return [LLMResponse(content=None, tool_call_requests=[
-        ToolCallRequest(id=call_id, name="flaky", arguments={})
+        RawToolCall(id=call_id, name="flaky", arguments="{}")
     ], usage=Usage())]
 
 
@@ -115,10 +115,12 @@ async def test_熔断抛错记入step_error_触发一次request_error后循环�
     loop, provider, _ = make_loop(tool, rounds, step_limit=20)
 
     errors = []
-    # REQUEST_ERROR 是 waterfall 语义事件，回调需接受 (payload, next) 两个参数；
+    # REQUEST_ERROR 是 waterfall 语义事件，回调需接受 (payload, next) 两个参数，
+    # 并按契约返回决策（loop 消费 {"decision": ...} 控制信号）；
     # 必须用具名局部函数注册（EventService 弱引用 lambda 会立即失效）
     def on_error(payload, nxt):
         errors.append(payload.error_type)
+        return {"decision": "dont_retry"}
     loop._event_service.register(REQUEST_ERROR.name, on_error)
 
     await loop.send("触发熔断")  # 不外抛，send 正常返回
@@ -140,6 +142,7 @@ async def test_步数兜底_未配置熔断时达到上限强制终止():
     errors = []
     def on_error(payload, nxt):
         errors.append(payload.error_type)
+        return {"decision": "dont_retry"}
     loop._event_service.register(REQUEST_ERROR.name, on_error)
 
     await loop.send("测试步数兜底")
@@ -169,3 +172,60 @@ async def test_熔断后schema过滤_turn结束自动恢复():
 
     # turn/end 事件已触发 reset_breaker（loop 构造时接线）：工具恢复可用
     assert register.to_schemas() == [tool.to_schema()]
+
+
+# ---------------------------------------------------------------------------
+# 参数 JSON 解析失败（信任边界在工具层）：解析错误回喂模型自纠
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_非法JSON参数_工具不执行_回喂解析错误与原文():
+    """模型输出的 arguments 是非法 JSON：ToolRegister 解析失败返回带 hint 的
+    错误结果（工具本体不执行、计入熔断计数），以 role=tool 消息回喂，模型下一轮自纠"""
+    tool = FlakyTool(max_consecutive_failures=5)
+    rounds = [
+        [LLMResponse(content=None, tool_call_requests=[
+            RawToolCall(id="call_bad", name="flaky", arguments='{"date": "2026-09-02"')
+        ], usage=Usage())],
+        text_round("参数写错了，我重新调用"),
+    ]
+    loop, provider, _ = make_loop(tool, rounds, step_limit=10)
+
+    await loop.send("测试非法 JSON")
+
+    assert tool.calls == 0, "解析失败不应执行工具本体"
+    # 熔断计数在 turn/end 的 reset_breaker 后已清空（不跨 turn），
+    # 计入与否由 register 单测（test_tool_and_register.py）覆盖
+    tool_results = [r for r in loop._session.record_list if r.type == "tool/result"]
+    assert len(tool_results) == 1
+    content = tool_results[0].data.message.content
+    assert "不是合法 JSON" in content
+    assert '{"date": "2026-09-02"' in content, "原文回显供模型定位错误"
+    assert "被截断" not in content, "finish_reason 非 length 不应带截断 hint"
+    assert provider.calls == 2, "回喂解析错误后模型下一轮收敛"
+
+
+@pytest.mark.asyncio
+async def test_截断的非法JSON_回喂结果带截断hint():
+    """finish_reason=length 的截断调用（provider 打 truncated 标记）：解析失败
+    的回喂话术走截断分支（精简参数/拆分调用），区别于普通语法错误"""
+    tool = FlakyTool()
+    rounds = [
+        [LLMResponse(content=None, finish_reason="length", tool_call_requests=[
+            # 模拟 provider 对 length 响应的提取结果：truncated=True
+            RawToolCall(id="call_trunc", name="flaky", arguments='{"date": "2026-09-2', truncated=True)
+        ], usage=Usage())],
+        text_round("输出被截断了，我精简参数重新调用"),
+    ]
+    loop, _, _ = make_loop(tool, rounds, step_limit=10)
+
+    await loop.send("测试截断")
+
+    assert tool.calls == 0, "解析失败不应执行工具本体"
+    tool_results = [r for r in loop._session.record_list if r.type == "tool/result"]
+    assert len(tool_results) == 1
+    content = tool_results[0].data.message.content
+    assert "不是合法 JSON" in content
+    assert "max_tokens" in content and "被截断" in content, "截断分支应给针对性 hint"
+    assert "语法错误" not in content, "截断分支不应再给语法错误话术"

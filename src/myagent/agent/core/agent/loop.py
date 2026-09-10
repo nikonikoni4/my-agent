@@ -6,8 +6,8 @@ from myagent.agent.core.session import session
 from myagent.agent.core.systemprompt import AssemblyPrompt, SystemPrompt
 from myagent.infra.events import EventService
 from myagent.agent.core.tool.register import ToolRegister
-from myagent.agent.execption import ToolConsecutiveFailureError
-from myagent.agent.core.provider import LLMProvider,ChatParams, LLMResponse,Message, StreamChunk, ToolCallRequest,Usage
+from myagent.agent.execption import LLMCallError, LLmError, ToolConsecutiveFailureError
+from myagent.agent.core.provider import LLMProvider,ChatParams, LLMResponse,Message, StreamChunk,Usage
 from myagent.agent.core.session.types import (
     AssistantChunkData, SessionMetaData,ToolCallChunksData,AssistantMessageData, StepEndData,CompactionStartData,
     SessionRecordData,ReasoningChunksData,ToolCallData,ToolResultData,TurnEndData,CompactionSummaryData,
@@ -148,19 +148,23 @@ class ReActAgentLoop:
                     async with asyncio.TaskGroup() as tg:
                         tasks = []
                         for tool_call in response.tool_call_requests:
-                            tasks.append(tg.create_task(self.tool_register.execute(tool_call.name,**tool_call.arguments)))
+                            # 传入原始调用（arguments 为 wire JSON 字符串），
+                            # 解析与校验都在 ToolRegister（信任边界）内完成
+                            tasks.append(tg.create_task(self.tool_register.execute(tool_call)))
                             self._session.append("tool/call",ToolCallData(tool_name=tool_call.name,call_id = tool_call.id ,arguments=tool_call.arguments))
                             self._event_service.trigger(TOOL_CALL,ToolCallPayload())
                     for index,task in enumerate(tasks):
                         tool_call = response.tool_call_requests[index]
                         tool_result =  task.result()
+                        # 回喂内容与截断/语法话术均由工具层产出（ToolResult.content），
+                        # loop 只负责把结果按 tool_call_id 配对写回
                         self._session.append("tool/result",ToolResultData(call_id=tool_call.id,tool_name=tool_call.name,message=Message(role="tool",content=tool_result.content,tool_call_id=tool_call.id,),is_error=tool_result.is_error),surface_op="append",source_event_seqs=[])
                         self._event_service.trigger(TOOL_RESULT,ToolResultPayload())
                 else:
                     break # 模型不再请求工具，本轮结束（ReAct 终止条件）
                 
-            except TimeoutError: # python 3.11+ 用TimeoutError， < 3.11用asyncio.TimeoutError
-                step_error = TimeoutError # 这里暂时先就这样简单的写，后续才丰富step_error的内容
+            except TimeoutError as e: # python 3.11+ 用TimeoutError， < 3.11用asyncio.TimeoutError
+                step_error = e # 这里暂时先就这样简单的写，后续才丰富step_error的内容
 
             except asyncio.CancelledError:
                 # 取消中断比较特殊，单独处理，不走request/error
@@ -173,6 +177,7 @@ class ReActAgentLoop:
                 # while（捕获后控制流回到循环顶部，同 TimeoutError 的重试路径），
                 # 是否终止由 REQUEST_ERROR 的 waterfall（IOC）控制信号决定，
                 # 信号细节当前未定；无订阅方时循环继续，由 step_limit 兜底
+                # 已知限制，这里只会获取第一个group的错误，后续的错误会静默失败
                 matched, rest = eg.split(ToolConsecutiveFailureError)
                 if matched is None:
                     raise  # 非熔断错误不属于本处理范围，原样上抛
@@ -180,11 +185,20 @@ class ReActAgentLoop:
                     logger.warning(f"熔断处理时忽略同批其他异常: {rest!r}")
                 step_error = matched.exceptions[0]
 
+            except LLMCallError as e:
+                step_error = e 
             finally:
                 if step_error :
                     # request/error 是 waterfall 语义事件：控制反转挂点，后续
                     # 订阅方（如人在回路处理）经返回值给出控制信号，当前无订阅方
                     request_error_result = self._event_service.trigger(REQUEST_ERROR,RequestErrorPayLoad(error_type=step_error))
+                    # waterfall 无订阅方/订阅方未返回决策时 trigger 返回 None，
+                    # 视为"无人认领"走 LLmError（设计语义），而不是 AttributeError
+                    decision = (request_error_result or {}).get("decision",None)
+                    if decision:
+                        logger.info(f"llm请求错误决策：{decision}；错误{step_error}")
+                    else:
+                        raise LLmError(f"错误无人认领") from step_error
                     step_error = None  # 一次错误只触发一次 request/error，避免错误后的重试轮次里重复触发
                 # 先不管错误处理，等先跑通了一遍流程之后再逐个错误处理进行安排，假设当前不会出错
                 self._session.append("step/end",StepEndData())

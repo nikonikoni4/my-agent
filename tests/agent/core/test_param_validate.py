@@ -1,20 +1,28 @@
 """工具调用参数校验的单元测试。
 
-覆盖 ToolRegister 三个校验环节：
-1. _validate_required_parameters —— 必填字段校验
-2. _validate_param_value     —— 单参数类型归一化 + 值校验
-3. _validate_param           —— 整组参数归一化
+覆盖 ToolRegister 校验环节：
+1. parse_call               —— arguments JSON 解析（信任边界，模型输出不可信）
+2. _validate_required_parameters —— 必填字段校验
+3. _validate_param_value     —— 单参数类型归一化 + 值校验
+4. _validate_param           —— 整组参数归一化
 
 聚焦"模型可能以字符串形式传入非字符串参数"的场景，覆盖每种类型的
 正常归一化、保持原样、以及各约束关键字命中/未命中的分支。
 """
+import json
 from typing import Any
 
 import pytest
 
+from myagent.agent.core.provider import RawToolCall
 from myagent.agent.core.tool.register import ToolRegister
 from myagent.agent.core.tool.tool import Tool, ToolResult
 from myagent.agent.execption import ToolValidateParameterError
+
+
+def call(name: str, arguments: str = "{}", call_id: str = "call_1") -> RawToolCall:
+    """构造一次模型原始工具调用（arguments 为 wire 上的 JSON 字符串）"""
+    return RawToolCall(id=call_id, name=name, arguments=arguments)
 
 
 @pytest.fixture
@@ -423,8 +431,6 @@ class TestUniqueItemsChecking:
 # execute 全链路：校验在工具执行前生效
 # ---------------------------------------------------------------------------
 
-import json
-
 from myagent.agent.core.tool.tool import Tool
 
 
@@ -473,7 +479,7 @@ class TestExecuteWithValidation:
         register = make_full_type_register()
         raw = {"mode": "fast", "count": "3", "ratio": "2.5",
                "verbose": "true", "tags": ["a", "b"]}
-        result = await register.execute("full_type_tool", **raw)
+        result = await register.execute(call("full_type_tool", json.dumps(raw)))
         assert result.is_error is False
         data = json.loads(result.content)
         # 类型已归一化：字符串转回对应基础类型
@@ -487,7 +493,7 @@ class TestExecuteWithValidation:
         """enum 违约：execute 返回错误 ToolResult 而非抛异常"""
         register = make_full_type_register()
         result = await register.execute(
-            "full_type_tool", mode="turbo", count=1)
+            call("full_type_tool", json.dumps({"mode": "turbo", "count": 1})))
         assert isinstance(result, ToolResult)
         assert result.is_error is True
         assert "错误" in result.content or "不在枚举" in result.content
@@ -496,7 +502,7 @@ class TestExecuteWithValidation:
     async def test_missing_required_returns_error(self):
         """缺少必填参数：返回错误 ToolResult"""
         register = make_full_type_register()
-        result = await register.execute("full_type_tool", mode="fast")
+        result = await register.execute(call("full_type_tool", json.dumps({"mode": "fast"})))
         assert isinstance(result, ToolResult)
         assert result.is_error is True
         assert "缺少必要参数" in result.content
@@ -505,7 +511,8 @@ class TestExecuteWithValidation:
     async def test_range_violation_returns_error(self):
         """数值超出范围：返回错误 ToolResult"""
         register = make_full_type_register()
-        result = await register.execute("full_type_tool", mode="fast", count=99)
+        result = await register.execute(
+            call("full_type_tool", json.dumps({"mode": "fast", "count": 99})))
         assert isinstance(result, ToolResult)
         assert result.is_error is True
         assert "大于 maximum" in result.content or "错误" in result.content
@@ -515,7 +522,7 @@ class TestExecuteWithValidation:
         """传入未声明参数：返回错误 ToolResult"""
         register = make_full_type_register()
         result = await register.execute(
-            "full_type_tool", mode="fast", count=1, mystery=123)
+            call("full_type_tool", json.dumps({"mode": "fast", "count": 1, "mystery": 123})))
         assert isinstance(result, ToolResult)
         assert result.is_error is True
         assert "未知参数" in result.content
@@ -524,7 +531,7 @@ class TestExecuteWithValidation:
     async def test_nonexistent_tool_returns_error_hint(self):
         """调用未注册工具：返回带可用工具提示的错误 ToolResult"""
         register = make_full_type_register()
-        result = await register.execute("no_such_tool", a=1)
+        result = await register.execute(call("no_such_tool", '{"a": 1}'))
         assert isinstance(result, ToolResult)
         assert result.is_error is True
         assert "工具不存在" in result.content

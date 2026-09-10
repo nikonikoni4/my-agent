@@ -81,14 +81,16 @@ class AssistantChunkData(SessionData):
 
     type 标注片段类型（对齐 harness 用 chunk 判别字段区分的方式），打包时据此分流到对应存储行。
     一次对应一个片段，字段按类型部分填充，其余为 None：
-    content/reasoning 片段只填 texts；tool-call 片段只填 index/id/name/args。
+    content/reasoning 片段只填 texts；tool-call 片段只填 index/id/name/args；
+    finish 片段只填 finish_reason（结束原因与文本增量语义不同，单独承载）。
     """
-    type: Literal["content", "reasoning", "tool-call"] | None = None  # 片段类型，打包时映射到 content-chunks / reasoning-chunks / tool-call-chunks
+    type: Literal["content", "reasoning", "tool-call", "finish"] | None = None  # 片段类型，打包时映射到 content-chunks / reasoning-chunks / tool-call-chunks / finish-chunks
     index: int | None = None  # 槽位号，并行调用时区分归属；非工具片段为 None
     id: str | None = None  # 调用标识，仅每个调用的首个片段携带，后续片段为 None
     name: str | None = None  # 工具名，携带规则同 id
     args: str | None = None  # 本片段的参数 JSON 碎片，单个碎片不是合法 JSON；非工具片段为 None
-    texts: str | None = None  # 本片段的文本增量；工具调用片段为 None
+    texts: str | None = None  # 本片段的文本增量；工具调用、finish 片段为 None
+    finish_reason: str | None = None  # 结束原因（stop/length/...），仅 finish 片段填充；其余片段为 None
 
     def __init__(self, chunk: StreamChunk):
         # provider 流每个片段只填一类字段（见 openai_provider.stream_chat），按字段推断类型
@@ -104,6 +106,9 @@ class AssistantChunkData(SessionData):
         elif chunk.reasoning_content is not None:
             self.type = "reasoning"
             self.texts = chunk.reasoning_content
+        elif chunk.finish_reason is not None:
+            self.type = "finish"
+            self.finish_reason = chunk.finish_reason
         else:
             self.type = None
 
@@ -114,13 +119,12 @@ class AssistantMessageData(SessionData):
     message: Message
     usage: Usage = field(default_factory=Usage)
 
-
 @dataclass
 class ToolCallData(SessionData):
     """tool/call：一次工具调用，执行时写入、先于 tool/result。"""
     call_id: str  # 与 tool/result 配对；并行调用同一工具时靠它区分
     tool_name: str
-    arguments: dict  # 已解析的参数
+    arguments: str  # wire 原样 JSON 字符串（忠实记录模型输出，未解析）
 
 
 @dataclass
@@ -229,13 +233,14 @@ class TextChunkData:
     片段身份是位置性的（参照 DeepSeek-Harness 的 chunk-rows）：第 k 个成员的
     seq = 信封 seq（组首）按 source_event_seqs 逐位还原，不存每片段 uuid。
     """
-    type : Literal["content","reasoning","tool-call"]
+    type : Literal["content","reasoning","tool-call","finish"]
     first_seq : int
     index : int 
     id : str | None 
     name : str | None
     args : list[str] | None
     texts : list[str] | None
+    finish_reason : list[str] | None  # finish 行的结束原因逐片对齐；非 finish 行为 None
     dt : list[int]
     
 class LLMRetryData:

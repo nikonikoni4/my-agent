@@ -1,23 +1,22 @@
-from myagent.agent.core.provider import Message,ToolCallRequest
-import json
+from myagent.agent.core.provider import Message,RawToolCall
 import pytest
 
 @pytest.fixture
 def correct_toolcallrequest():
-    return ToolCallRequest(
+    return RawToolCall(
         id = "123",
         name = "get_weather",
-        arguments=json.loads("{\"location\":\"Paris, France\"}"),
+        arguments='{"location": "Paris, France"}',
     )
 @pytest.fixture
 def wrong_toolcallrequest():
-    return ToolCallRequest(
+    return RawToolCall(
         id = None,
         name = "get_weather",
-        arguments=json.loads("{\"location\":\"Paris, France\"}"),
+        arguments='{"location": "Paris, France"}',
     )
 
-def test_tool_to_dict(correct_toolcallrequest:ToolCallRequest,wrong_toolcallrequest:ToolCallRequest):
+def test_tool_to_dict(correct_toolcallrequest:RawToolCall,wrong_toolcallrequest:RawToolCall):
     """
     测试场景：
     1. 测试正确的to_dict
@@ -49,7 +48,7 @@ def assistant_toolcall_message():
     return Message(
         role="assistant",
         content=None,
-        tool_calls=[ToolCallRequest(id="call_1", name="get_weather", arguments={"location": "Paris, France"})],
+        tool_calls=[RawToolCall(id="call_1", name="get_weather", arguments='{"location": "Paris, France"}')],
     )
 
 @pytest.fixture

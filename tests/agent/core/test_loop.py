@@ -17,7 +17,7 @@ from myagent.agent.core.provider import (
     LLMResponse,
     Message,
     StreamChunk,
-    ToolCallRequest,
+    RawToolCall,
     Usage,
 )
 from myagent.agent.core.session.session import Session
@@ -219,7 +219,7 @@ async def test_流式片段记录为assistant_chunk_且assistant_message声明�
 async def test_工具调用后进入下一步_直到模型不再请求工具():
     """测试场景：先发起工具调用并记录结果，再走一步得到最终回复"""
     session = make_session()
-    tool_call = ToolCallRequest(id="call_1", name="get_weather", arguments={"date": "2026-09-02"})
+    tool_call = RawToolCall(id="call_1", name="get_weather", arguments='{"date": "2026-09-02"}')
     rounds = [
         [LLMResponse(content=None, tool_call_requests=[tool_call], usage=usage())],
         [LLMResponse(content="2026-09-02的天气是晴天", usage=usage())],
@@ -251,9 +251,9 @@ async def test_工具调用后进入下一步_直到模型不再请求工具():
     assert tool_result.role == "tool"
     assert tool_result.tool_call_id == "call_1"
     assert tool_result.content == "2026-09-02的天气是晴天"
-    # 记录的 tool/call 携带模型给的参数
+    # 记录的 tool/call 携带模型给的参数（wire 原样 JSON 字符串，解析在工具层）
     tool_call_record = find_record(session, "tool/call")
     assert tool_call_record.data.tool_name == "get_weather"
-    assert tool_call_record.data.arguments == {"date": "2026-09-02"}
+    assert tool_call_record.data.arguments == '{"date": "2026-09-02"}'
     # 可见面 = user + 发起调用 + tool 结果 + 最终回复
     assert [m.role for m in session.derive_messages()] == ["user", "assistant", "tool", "assistant"]

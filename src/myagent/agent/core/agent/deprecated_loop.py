@@ -4,7 +4,7 @@ from myagent.agent import execption
 from myagent.agent.core.session import session
 from myagent.infra.events import EventService
 from myagent.agent.core.tool.register import ToolRegister
-from myagent.agent.core.provider import LLMProvider,ChatParams, LLMResponse,Message, StreamChunk, ToolCallRequest,Usage
+from myagent.agent.core.provider import LLMProvider,ChatParams, LLMResponse,Message, StreamChunk, RawToolCall,Usage
 from myagent.agent.core.session.types import (
     AssistantChunkData, SessionMetaData,ToolCallChunksData,AssistantMessageData, StepEndData,CompactionStartData,
     SessionRecordData,ReasoningChunksData,ToolCallData,ToolResultData,TurnEndData,CompactionSummaryData,
@@ -107,11 +107,11 @@ class AgentLoop:
                     for tool_call in response.tool_call_requests:
                         id = tool_call.id
                         name = tool_call.name
-                        arguments = tool_call.arguments
-                        self._session.append("tool/call",ToolCallData(tool_name=name,call_id = id ,arguments=arguments))
+                        # arguments 保持 wire 原样 JSON 字符串，解析在 ToolRegister 内
+                        self._session.append("tool/call",ToolCallData(tool_name=name,call_id = id ,arguments=tool_call.arguments))
                         self.persist_now("tool/call")
                         # TODO 工具出错相关处理
-                        result = await self._tool_register.execute(name,**arguments if arguments else None )
+                        result = await self._tool_register.execute(tool_call)
                         self._session.append("tool/result",ToolResultData(call_id=id,tool_name=name,message=Message(role="tool",content=result.content,tool_call_id=id),is_error=result.is_error),surface_op="append",source_event_seqs=[])
                     self._session.append("step/end",StepEndData())
                     self.persist_now("step/end")
@@ -126,7 +126,7 @@ class AgentLoop:
         except asyncio.TimeoutError:
             pass
             
-    def handle_cancel(session:Session , response:LLMResponse|None=None ,chunks:list[StreamChunk]|None=None ,tool_call_requests :list[ToolCallRequest]|None = None,):
+    def handle_cancel(session:Session , response:LLMResponse|None=None ,chunks:list[StreamChunk]|None=None ,tool_call_requests :list[RawToolCall]|None = None,):
         # 先判断中断之后进行到哪一步了
         pass 
         # if response is None and chunks is None:

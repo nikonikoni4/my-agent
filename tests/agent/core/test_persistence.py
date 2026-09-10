@@ -387,7 +387,7 @@ def test_保存时把assistant_chunk合并为text_chunk再落盘(tmp_path):
     """保存链路：presist 先把 buffer 里的 assistant/chunk 归并为 text-chunk，再整批写入。
 
     非 chunk 记录原样保留，文件中不再出现 assistant/chunk 行，合并结果与
-    test_merge_assistant_chunk 的期望分组一致（9 条 chunk → 5 条 text-chunk）。
+    test_merge_assistant_chunk 的期望分组一致（10 条 chunk → 6 条 text-chunk）。
     """
     path = tmp_path / "s.jsonl"
     comp = make_presist(path)
@@ -399,7 +399,7 @@ def test_保存时把assistant_chunk合并为text_chunk再落盘(tmp_path):
     lines = [json.loads(line) for line in payload_after_meta(path).splitlines()]
     types = [line["type"] for line in lines]
     assert "assistant/chunk" not in types
-    assert types.count("text-chunk") == 5
+    assert types.count("text-chunk") == 6
     assert types[0] == "test"  # 非 chunk 记录原样落盘
     assert comp._buffer == []
 
@@ -408,23 +408,23 @@ def test_merge_assistant_chunk(tmp_path):
     """_merge_chunks 把 assistant/chunk 按同类同槽位归并为 text-chunk。
 
     固件序列与期望分组见 make_chunk_record_list 的 docstring：
-    content×3 → tool-call(index=0)×2 → content×1 → tool-call(index=1)×1 → reasoning×2，
-    共合并为 5 条 text-chunk。
+    content×3 → tool-call(index=0)×2 → content×1 → tool-call(index=1)×1 → reasoning×2 → finish×1，
+    共合并为 6 条 text-chunk。
     """
     presist = make_presist(tmp_path / "unused.jsonl")
     merged = presist._merge_chunks(make_chunk_record_list())
 
-    assert len(merged) == 5
+    assert len(merged) == 6
     # 信封信息取组内首条：seq/timestamp 同理，这里只验 seq 代表分组边界
-    assert [r.seq for r in merged] == [1, 4, 6, 7, 8]
-    assert [r.data.type for r in merged] == ["content", "tool-call", "content", "tool-call", "reasoning"]
+    assert [r.seq for r in merged] == [1, 4, 6, 7, 8, 10]
+    assert [r.data.type for r in merged] == ["content", "tool-call", "content", "tool-call", "reasoning", "finish"]
     # index 是槽位号：index=0 是合法值，不得被清成 None
-    assert [r.data.index for r in merged] == [None, 0, None, 1, None]
+    assert [r.data.index for r in merged] == [None, 0, None, 1, None, None]
     # id/name 只在组内首条片段携带，合并后保留首条的值
-    assert [r.data.id for r in merged] == [None, "call_a", None, "call_b", None]
-    assert [r.data.name for r in merged] == [None, "get_weather", None, "get_time", None]
+    assert [r.data.id for r in merged] == [None, "call_a", None, "call_b", None, None]
+    assert [r.data.name for r in merged] == [None, "get_weather", None, "get_time", None, None]
 
-    # 碎片逐片保存：content/reasoning 进 texts，tool-call 进 args，两者互斥
+    # 碎片逐片保存：content/reasoning 进 texts，tool-call 进 args，finish 进 finish_reason，三者互斥
     assert merged[0].data.texts == ["你", "好", "！"]
     assert merged[0].data.args is None
     assert merged[1].data.args == ['{"date"', ': "2026-09-05"}']
@@ -432,9 +432,13 @@ def test_merge_assistant_chunk(tmp_path):
     assert merged[2].data.texts == ["晴天"]
     assert merged[3].data.args == ["{}"]
     assert merged[4].data.texts == ["思考", "中"]
+    # finish 结束原因走独立字段：与 texts/args 一样按片段对齐，且不占用 texts
+    assert merged[5].data.finish_reason == ["stop"]
+    assert merged[5].data.texts is None
+    assert all(r.data.finish_reason is None for r in merged[:5])
 
     # source_event_seqs 按组归并，保持出现顺序；片段 uuid 不落盘（身份按 seq 位置还原）
-    assert [r.source_event_seqs for r in merged] == [[1, 2, 3], [4, 5], [6], [7], [8, 9]]
+    assert [r.source_event_seqs for r in merged] == [[1, 2, 3], [4, 5], [6], [7], [8, 9], [10]]
     assert all(not hasattr(r.data, "uuid") for r in merged)
     # first_seq 与信封 seq 一致，dt 首片为 0
     assert all(r.data.first_seq == r.seq for r in merged)

@@ -90,7 +90,8 @@ class SessionPresist:
                     name = assistant_data.name if assistant_data.name else None,
                     # args 必须与 uuid/dt/source_event_seqs 等长对齐：首片只带 id/name 无参数时记 None 占位
                     args=[assistant_data.args] if assistant_data.type == "tool-call" else None,
-                    texts=[assistant_data.texts] if assistant_data.texts else None
+                    texts=[assistant_data.texts] if assistant_data.type in ("content", "reasoning") else None,
+                    finish_reason=[assistant_data.finish_reason] if assistant_data.type == "finish" else None
                 )
             )
         )
@@ -109,6 +110,8 @@ class SessionPresist:
                     if text_chunk_records[-1].data.args is None:
                         text_chunk_records[-1].data.args = []
                     text_chunk_records[-1].data.args.append(record.data.args)
+                elif data.type == "finish":
+                    text_chunk_records[-1].data.finish_reason.append(record.data.finish_reason)
                 else:
                     if text_chunk_records[-1].data.texts is None:
                         text_chunk_records[-1].data.texts = []
@@ -130,7 +133,8 @@ class SessionPresist:
                             id=record.data.id if record.data.id else None,
                             name=record.data.name if record.data.name else None,
                             args=[record.data.args] if record.data.type == "tool-call" else None,
-                            texts=[record.data.texts] if record.data.texts else None
+                            texts=[record.data.texts] if record.data.type in ("content", "reasoning") else None,
+                            finish_reason=[record.data.finish_reason] if record.data.type == "finish" else None
                         )
                     )
                 )

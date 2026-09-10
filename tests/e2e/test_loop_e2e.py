@@ -139,13 +139,12 @@ def build_agent(session_folder: Path, project_path: Path, session_name: str):
         chat_params=ChatParams(temperature=0.7),  # request/header 的 params 快照取自 provider
     )
     agent_config = AgentConfig(
-        parames=ChatParams(temperature=0.7),
-        model=MODEL,
-        prompt_render_parame={},
+        step_limit=20,  # 步数兜底（单轮 2 工具 + 汇总回复约 3 步）；采样参数由 provider 的 chat_params 提供
     )
     agent_loop = ReActAgentLoop(
         event_service, session, tool_register, system_prompt,
         agent_config, llm_client, name=AGENT_NAME,
+        prompt_render_parame={},  # 渲染参数是 loop 构造参数，不归 AgentConfig
     )
     return agent_loop, session, store
 

@@ -1,10 +1,15 @@
 from typing import Any
 
 from myagent.agent.core import Tool
+from myagent.agent.core.provider import RawToolCall
 from myagent.agent.core.tool.register import ToolRegister
 from myagent.agent.core.tool.tool import ToolResult
 from myagent.agent.execption import ToolValueError, ToolConsecutiveFailureError
 import pytest
+
+def call(name: str, arguments: str = "{}", call_id: str = "call_1") -> RawToolCall:
+    """构造一次模型原始工具调用（arguments 为 wire 上的 JSON 字符串）"""
+    return RawToolCall(id=call_id, name=name, arguments=arguments)
 
 class WeatherTool(Tool):
     def __init__(self):
@@ -50,9 +55,8 @@ class AnotherTool(Tool):
     def parameters(self) -> dict[str, Any]:
         return {"type": "object", "properties": {}, "required": []}
 
-    def execute(self, **kwargs) -> str:
+    async def execute(self, **kwargs) -> str:
         return "12:00"
-
 ALLOWED_TYPES = {"string", "number", "integer", "boolean", "array", "object"}
 
 
@@ -175,6 +179,71 @@ def test_to_schemas(register: ToolRegister):
 
 
 # ---------------------------------------------------------------------------
+# 参数 JSON 解析（信任边界：模型输出的 arguments 不可信，解析在工具层）
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_非法JSON返回错误结果_不执行工具但计入熔断(register: ToolRegister):
+    """模型输出单引号/括号不匹配等非法 JSON：返回带 hint 的错误 ToolResult，
+    工具本体不执行；解析失败与执行失败同等计入熔断（熔断防的是模型反复
+    调用同一工具一直出错，模型侧写坏参数也算）"""
+    tool = FlakyTool(max_consecutive_failures=5)
+    register.register(tool)
+
+    result = await register.execute(call("flaky", '{"date": "2026-09-02"'))  # 缺右括号
+
+    assert result.is_error is True
+    assert result.is_parse_error is True
+    assert "不是合法 JSON" in result.content
+    assert '{"date": "2026-09-02"' in result.content, "原文应回显给模型定位错误"
+    assert "hint" in result.content
+    assert tool.calls == 0, "解析失败不应执行工具本体"
+    assert register._consecutive_failures == {"flaky": 1}, "解析失败应计入熔断计数"
+
+
+@pytest.mark.asyncio
+async def test_连续JSON解析失败同样触发熔断(register: ToolRegister):
+    """模型反复用非法 JSON 调同一工具：连续解析失败达到阈值即熔断，
+    防止坏参数调用无限循环"""
+    tool = FlakyTool(max_consecutive_failures=5)
+    register.register(tool)
+
+    for _ in range(4):
+        result = await register.execute(call("flaky", '{"date": "2026'))
+        assert result.is_error is True and result.is_parse_error is True
+    assert register.to_schemas() == [tool.to_schema()], "4 < 5，不应熔断"
+    assert tool.calls == 0, "工具本体从未执行"
+
+    result = await register.execute(call("flaky", '{"date": "2026'))
+    assert register.to_schemas() == [], "连续第 5 次解析失败应熔断"
+    assert "已熔断" in result.content, "触发熔断的当次结果附 hint"
+
+
+@pytest.mark.asyncio
+async def test_JSON解析结果非dict返回错误结果(register: ToolRegister):
+    """arguments 是合法 JSON 但不是对象（如数组）：返回带 hint 的错误结果"""
+    register.register(WeatherTool())
+
+    result = await register.execute(call("get_weather", '[1, 2]'))
+
+    assert result.is_error is True
+    assert result.is_parse_error is True
+    assert "不是 JSON 对象" in result.content or "JSON 对象" in result.content
+
+
+@pytest.mark.asyncio
+async def test_空串参数按空对象处理正常执行(register: ToolRegister):
+    """arguments 为空串：按 "{}" 处理，无参数工具正常执行"""
+    register.register(AnotherTool())
+
+    result = await register.execute(call("get_time", ""))
+
+    assert result.is_error is False
+    assert result.content == "12:00"
+
+
+# ---------------------------------------------------------------------------
 # 熔断（连续失败计数 / 触发 / 拦截 / 清零，规格见 架构设计/工具调用.md）
 # ---------------------------------------------------------------------------
 
@@ -220,7 +289,7 @@ async def test_未配置熔断_失败不计数不熔断(register: ToolRegister):
     tool = FlakyTool()
     register.register(tool)
     for _ in range(8):
-        result = await register.execute("flaky")
+        result = await register.execute(call("flaky"))
         assert result.is_error is True
     # 未熔断：schema 保留；不计数：失败表为空
     assert register.to_schemas() == [tool.to_schema()]
@@ -235,12 +304,12 @@ async def test_连续失败达阈值_熔断且当次结果附hint(register: Tool
 
     # 前 4 次：普通错误结果，无熔断字样
     for _ in range(4):
-        result = await register.execute("flaky")
+        result = await register.execute(call("flaky"))
         assert result.is_error is True
         assert "已熔断" not in result.content
 
     # 第 5 次：触发熔断，当次结果附 hint
-    result = await register.execute("flaky")
+    result = await register.execute(call("flaky"))
     assert result.is_error is True
     assert "已熔断" in result.content
     assert "请改用其他工具" in result.content
@@ -255,16 +324,16 @@ async def test_成功一次清零连续计数(register: ToolRegister):
     tool = FlakyTool(max_consecutive_failures=5)
     register.register(tool)
 
-    await register.execute("flaky")  # 失败 1
-    await register.execute("flaky")  # 失败 2
+    await register.execute(call("flaky"))  # 失败 1
+    await register.execute(call("flaky"))  # 失败 2
     tool.fail = False
-    await register.execute("flaky")  # 成功，清零
+    await register.execute(call("flaky"))  # 成功，清零
     tool.fail = True
     for _ in range(4):
-        await register.execute("flaky")  # 重新连续失败 4 次
+        await register.execute(call("flaky"))  # 重新连续失败 4 次
     assert register.to_schemas() == [tool.to_schema()], "4 < 5，不应熔断"
 
-    await register.execute("flaky")  # 重新连续第 5 次失败
+    await register.execute(call("flaky"))  # 重新连续第 5 次失败
     assert register.to_schemas() == [], "连续第 5 次失败应熔断"
 
 
@@ -274,7 +343,7 @@ async def test_turn_end清空熔断_下一turn恢复可用(register: ToolRegiste
     tool = FlakyTool(max_consecutive_failures=5)
     register.register(tool)
     for _ in range(5):
-        await register.execute("flaky")
+        await register.execute(call("flaky"))
     assert register.to_schemas() == []
 
     register.reset_breaker()
@@ -290,10 +359,10 @@ async def test_熔断即抛错_raise_on_break(register: ToolRegister):
     register.register(tool)
 
     for _ in range(4):
-        await register.execute("flaky")  # 未达阈值，正常返回错误结果
+        await register.execute(call("flaky"))  # 未达阈值，正常返回错误结果
 
     with pytest.raises(ToolConsecutiveFailureError):
-        await register.execute("flaky")  # 第 5 次触发熔断并抛错
+        await register.execute(call("flaky"))  # 第 5 次触发熔断并抛错
     assert register._tripped == {"flaky"}
 
 
@@ -304,14 +373,14 @@ async def test_execute_intercept模式_熔断后入口驳回(register: ToolRegis
     register.register(tool)
 
     for _ in range(5):
-        await register.execute("flaky")
+        await register.execute(call("flaky"))
 
     # schema 不被过滤（与 schema_hide 的区别）
     assert register.to_schemas() == [tool.to_schema()]
 
     # 熔断后调用：入口驳回，返回错误结果，工具本体不执行
     calls_before = tool.calls
-    result = await register.execute("flaky")
+    result = await register.execute(call("flaky"))
     assert result.is_error is True
     assert "已因连续失败" in result.content
     assert tool.calls == calls_before
@@ -321,7 +390,7 @@ async def test_execute_intercept模式_熔断后入口驳回(register: ToolRegis
 async def test_execute返回str包装为成功ToolResult(register: ToolRegister):
     """子类 execute 返回 str：register 包装为 is_error=False 的 ToolResult"""
     register.register(WeatherTool())
-    result = await register.execute("get_weather", date="2026-09-02")
+    result = await register.execute(call("get_weather", '{"date": "2026-09-02"}'))
     assert isinstance(result, ToolResult)
     assert result.is_error is False
     assert result.content == "2026-09-02的天气是晴天"

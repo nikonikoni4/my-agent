@@ -46,7 +46,7 @@ async def test_load_往返_解包chunk_还原嵌套消息(tmp_path):
     meta = SessionMetaData(cwd="", session_id="s1", name="s1")
     comp = make_presist(path, meta)
     user_rec = SessionRecordData(
-        type="user/message", seq=10, turn=1, step=1, surface_op="append",
+        type="user/message", seq=11, turn=1, step=1, surface_op="append",
         data=UserMessageData(message=Message(role="user", content="hi")),
     )
     comp._buffer.extend([*make_chunk_record_list(), user_rec])
@@ -67,9 +67,9 @@ async def test_load_往返_解包chunk_还原嵌套消息(tmp_path):
     assert meta_restored.format_version == 1
     assert isinstance(meta_restored.created_at, datetime.datetime)
 
-    # 总数：9 条 chunk 解包 + 1 条 user/message
-    assert len(records) == 10
-    assert records[-1].seq == 10
+    # 总数：10 条 chunk 解包 + 1 条 user/message
+    assert len(records) == 11
+    assert records[-1].seq == 11
 
     # user/message：嵌套 Message 从 dict 还原为类型实例，surface_op 保留
     user_restored = records[-1]
@@ -80,8 +80,8 @@ async def test_load_往返_解包chunk_还原嵌套消息(tmp_path):
     assert user_restored.surface_op == "append"
 
     # chunk 解包：type/data 类型还原，seq 从 source_event_seqs 逐位恢复
-    chunk_records = records[:9]
-    assert [r.seq for r in chunk_records] == list(range(1, 10))
+    chunk_records = records[:10]
+    assert [r.seq for r in chunk_records] == list(range(1, 11))
     assert all(r.type == "assistant/chunk" for r in chunk_records)
     assert all(isinstance(r.data, AssistantChunkData) for r in chunk_records)
     assert all(r.surface_op is None and r.source_event_seqs is None for r in chunk_records)
@@ -99,6 +99,12 @@ async def test_load_往返_解包chunk_还原嵌套消息(tmp_path):
     assert chunk_records[6].data.index == 1
     assert chunk_records[6].data.id == "call_b" and chunk_records[6].data.name == "get_time"
     assert chunk_records[6].data.args == "{}"
+
+    # finish 片段：结束原因走独立 finish_reason 字段，texts 保持 None
+    finish = chunk_records[9]
+    assert finish.data.type == "finish"
+    assert finish.data.finish_reason == "stop"
+    assert finish.data.texts is None
 
     # timestamp 按 组首 + dt 累积重建：固件相邻间隔 1ms，逐条恢复后应与原始一致
     for i, r in enumerate(chunk_records):

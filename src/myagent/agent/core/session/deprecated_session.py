@@ -4,7 +4,7 @@ Session 只负责消息数据和元信息；落盘格式为 jsonl（第一行 me
 之后每行一条 Message 的持久化 dict）。
 """
 from dataclasses import dataclass,field
-from myagent.agent.core.provider import Message, ToolCallRequest
+from myagent.agent.core.provider import Message, RawToolCall
 import datetime
 import uuid,json
 from pathlib import Path
@@ -164,10 +164,11 @@ class SessionManager:
         tool_calls = None
         if data.get("tool_calls"):
             tool_calls = [
-                ToolCallRequest(
+                RawToolCall(
                     id=tc["id"],
                     name=tc["function"]["name"],
-                    arguments=json.loads(tc["function"]["arguments"]),
+                    # arguments 保持 wire 原样 JSON 字符串（与 RawToolCall 契约一致）
+                    arguments=tc["function"]["arguments"] or "{}",
                 )
                 for tc in data["tool_calls"]
             ]

@@ -33,13 +33,14 @@ def make_chunk_record(seq: int, chunk: StreamChunk, *, turn: int = 1, step: int 
 def make_chunk_record_list() -> list[SessionRecordData]:
     """覆盖 _merge_chunks 全部分支的典型序列，seq 从 1 连续递增。
 
-    期望合并为 5 条 text-chunk（type 和 index 都相同才归并）：
+    期望合并为 6 条 text-chunk（type 和 index 都相同才归并）：
       seq1-3  content            连续同类 → 1 条，texts=["你", "好", "！"]
       seq4-5  tool-call index=0  与前面 type 不同 → 新建 1 条；两条同组合并，
                                  args=['{"date"', ': "2026-09-05"}']
       seq6    content            → 1 条
       seq7    tool-call index=1  并行调用的第二个槽位，index 不同 → 1 条
       seq8-9  reasoning          连续同类 → 1 条，texts=["思考", "中"]
+      seq10   finish             → 1 条，finish_reason=["stop"]（独占字段，不占 texts）
     """
     specs = [
         StreamChunk(content="你"),
@@ -53,5 +54,6 @@ def make_chunk_record_list() -> list[SessionRecordData]:
                     tool_arguments_delta="{}"),
         StreamChunk(reasoning_content="思考"),
         StreamChunk(reasoning_content="中"),
+        StreamChunk(finish_reason="stop"),
     ]
     return [make_chunk_record(seq=i + 1, chunk=c) for i, c in enumerate(specs)]
