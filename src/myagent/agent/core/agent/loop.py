@@ -79,20 +79,65 @@ class ReActAgentLoop:
         # 工具熔断状态随 turn 结束清空：接线在此（loop 同时持有 event_service
         # 与 tool_register），清空逻辑在 ToolRegister.reset_breaker
         self._event_service.register(TURN_END.name, self.tool_register.reset_breaker)
+        # 事件循环
+        self._wakeup = asyncio.Event()
 
-    async def send(self,user_prompt : str | list):
+    def cancel(self):
+        self._task.cancel()
+        # 清空inbox
+        self.inbox = {"next_turn":[],"next_step":[]}
+
+    async def _loop ( self ): 
+        while True : 
+            await self ._wakeup.wait() # 无消息时挂起，不占 CPU 
+            self ._wakeup.clear() 
+            while self .inbox[ "next_step" ]: 
+                # 先处理高优先级的 next_step 
+                self._task = asyncio.create_task(self .turn( self .inbox[ "next_step" ].pop( 0 )))
+                self._task.add_done_callback(self._on_turn_done)
+                await self._task
+            while self .inbox[ "next_turn" ]: 
+                self._task =  asyncio.create_task(self .turn( self .inbox[ "next_turn" ].pop( 0 )))
+                self._task.add_done_callback(self._on_turn_done)
+                await self._task
+
+    def _on_turn_done(self,task:asyncio.Task):
+        """turn 任务结束回调：取回 task 异常，防止静默失败。
+
+        create_task 产出的 task 若无人 await、也无人取异常，异常会被 asyncio
+        吞掉（仅在 task 被 GC 时打印 "Task exception was never retrieved"）。
+        本回调在任务结束时显式取回，是这一异常的唯一出口：
+        - cancelled：turn 内已按 interrupted 收口，无需处理
+        - 有异常：记 error 日志（带堆栈），使失败在日志中可见
+
+        注意：取回异常本身也会抑制 asyncio 的 "never retrieved" 警告，
+        因此这里必须保证异常不被丢弃。
+        """
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is None:
+            return
+        logger.error(f"turn 任务异常终止：{exc!r}",exc_info=exc)
+    
+    
+    async def send(self,user_prompt : str | list,send_type : Literal["next_turn","next_step"]):
         """
         将消息发送进inbox
+        arg :
+            user_prompt : user消息
+            send_type : 消息发送类型，存储进turn 还是step，目前无论选turn还是step都会进入turn（暂时）
         """
         if isinstance(user_prompt,str):
             content = [{"type":"text","text":user_prompt}]
         # 整合可能会动态变化的系统提示词(为了缓存命中而不放在开头)
-        # 这里暂时不拼接
-        await self.turn(Message("user",content))
-
+        content.append([{"type":"text","text":self.system_prompt.assemble(self.name).context}])
+        self.inbox["next_turn"].append(content)
+        self._wakeup.set()
     def followup(self):
         pass
 
+    
 
     def persist_session_now(self):
         try:
@@ -102,12 +147,26 @@ class ReActAgentLoop:
             pass 
 
     async def turn(self,user_message):
-        # 默认成功：step 抛出未归一化的异常时仍按成功收口（异常继续上抛）
+        # 默认成功：step 正常返回时以其结果收口；step 抛出未归一化的异常时，
+        # 由下面两个 except 先归一化 result 再原样上抛（异常仍要暴露给
+        # _on_turn_done 记录，不能静默吞掉）
         result = StepOut(reason_type="success",reason_text="")
         try:
             self._session.append("turn/start",TurnStartData())
             self._event_service.trigger(TURN_START,TurnStartPayload())
             result = await self.step(user_message)
+        except asyncio.CancelledError:
+            # 取消需原样上抛（否则 task 不会被标记为 cancelled），只能在此补终态；
+            # step 内的取消已归一化为 interrupted，这里兜 step 之外被取消的情况
+            result = StepOut(reason_type="interrupted",reason_text="用户手动取消")
+            raise
+        except Exception as e:
+            # step 未归一化的异常（如 request/error 无人认领抛出的 LLmError、
+            # 非熔断的 ExceptionGroup）：先归一化 result，否则 finally 会把本轮
+            # 记成 success，污染终态；异常原样上抛交由 _on_turn_done 记录
+            logger.error(f"turn 未归一化异常：{e!r}",exc_info=e)
+            result = StepOut(reason_type="error",reason_text=str(e))
+            raise
         finally:
             # 一轮的结果由 step 汇总：出现过未恢复的 error 则为 error 并带上错误
             # 信息；用户取消则为 interrupted
@@ -206,32 +265,46 @@ class ReActAgentLoop:
                 # 已知限制，这里只会获取第一个group的错误，后续的错误会静默失败
                 matched, rest = eg.split(ToolConsecutiveFailureError)
                 if matched is None:
-                    raise  # 非熔断错误不属于本处理范围，原样上抛
+                    # 非熔断错误不属于本处理范围，原样上抛；先归一化本轮终态，
+                    # 否则 finally 会把它记成 success（与 turn/end 同源的问题）
+                    round_reason_type, round_reason_text = "error", str(eg)
+                    raise
                 if rest is not None:
                     logger.warning(f"熔断处理时忽略同批其他异常: {rest!r}")
                 step_error = matched.exceptions[0]
 
             except LLMCallError as e:
-                step_error = e 
+                step_error = e
+            except Exception as e:
+                # 未归一化异常（provider 内部 bug、session.append 的 ValueError/
+                # TypeError、_request_header 渲染异常等）：没有专门分支接住，
+                # 同样先修正本轮终态再原样上抛，避免 finally 记成 success
+                round_reason_type, round_reason_text = "error", str(e)
+                raise
             finally:
-                if step_error :
-                    exhausted_reason = await self._handle_step_error(step_error)
-                    # 重试耗尽：本轮记为 error 并结束整个 step 循环。不在 finally 内
-                    # break（会抑制在途异常），只置 result，由循环末尾统一退出
-                    if exhausted_reason is not None:
-                        round_reason_type, round_reason_text = "error", exhausted_reason
-                        result = StepOut(reason_type="error",reason_text=exhausted_reason)
-                    step_error = None  # 一次错误只触发一次 request/error，避免后续轮次重复处理
-                self._session.append("step/end",StepEndData(reason_type=round_reason_type,reason_text=round_reason_text))
-                self._event_service.trigger(STEP_END,StepEndPayload())
+                try:
+                    if step_error :
+                        exhausted_reason = await self._handle_step_error(step_error)
+                        # 重试耗尽：本轮记为 error 并结束整个 step 循环。不在 finally 内
+                        # break（会抑制在途异常），只置 result，由循环末尾统一退出
+                        if exhausted_reason is not None:
+                            round_reason_type, round_reason_text = "error", exhausted_reason
+                            result = StepOut(reason_type="error",reason_text=exhausted_reason)
+                        step_error = None  # 一次错误只触发一次 request/error，避免后续轮次重复处理
+                except Exception as e:
+                    # 重试决策自身抛错（如 request/error 无人认领抛出的 LLmError）：
+                    # 同样先修正本轮终态再原样上抛
+                    round_reason_type, round_reason_text = "error", str(e)
+                    raise
+                finally:
+                    # 内层 finally 兜底：无论上面是否抛错，step/end 都必须落盘，
+                    # 否则该轮在 session 里完全不可见（LLmError 路径原来会丢记录）
+                    self._session.append("step/end",StepEndData(reason_type=round_reason_type,reason_text=round_reason_text))
+                    self._event_service.trigger(STEP_END,StepEndPayload())
             if result.reason_type == "error":
                 break  # 终态错误（重试耗尽等）：结束本 step
         return result
-
-
-
-
-                 
+   
     
     async def _ask_model(self)->LLMResponse:
         """
