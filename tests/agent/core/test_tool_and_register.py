@@ -3,7 +3,7 @@ from typing import Any
 from myagent.agent.core import Tool
 from myagent.agent.core.provider import RawToolCall
 from myagent.agent.core.tool.register import ToolRegister
-from myagent.agent.core.tool.tool import ToolResult
+from myagent.agent.core.tool.tool import ToolResult, ToolErrorType
 from myagent.agent.execption import ToolValueError, ToolConsecutiveFailureError
 import pytest
 
@@ -194,7 +194,7 @@ async def test_非法JSON返回错误结果_不执行工具但计入熔断(regis
     result = await register.execute(call("flaky", '{"date": "2026-09-02"'))  # 缺右括号
 
     assert result.is_error is True
-    assert result.is_parse_error is True
+    assert result.error_type is ToolErrorType.PARSE_ERROR
     assert "不是合法 JSON" in result.content
     assert '{"date": "2026-09-02"' in result.content, "原文应回显给模型定位错误"
     assert "hint" in result.content
@@ -211,7 +211,7 @@ async def test_连续JSON解析失败同样触发熔断(register: ToolRegister):
 
     for _ in range(4):
         result = await register.execute(call("flaky", '{"date": "2026'))
-        assert result.is_error is True and result.is_parse_error is True
+        assert result.is_error is True and result.error_type is ToolErrorType.PARSE_ERROR
     assert register.to_schemas() == [tool.to_schema()], "4 < 5，不应熔断"
     assert tool.calls == 0, "工具本体从未执行"
 
@@ -228,7 +228,7 @@ async def test_JSON解析结果非dict返回错误结果(register: ToolRegister)
     result = await register.execute(call("get_weather", '[1, 2]'))
 
     assert result.is_error is True
-    assert result.is_parse_error is True
+    assert result.error_type is ToolErrorType.PARSE_NOT_OBJECT
     assert "不是 JSON 对象" in result.content or "JSON 对象" in result.content
 
 

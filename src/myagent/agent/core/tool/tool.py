@@ -1,30 +1,60 @@
 from abc import ABC,abstractmethod
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Literal
 
 MIN_CONSECUTIVE_FAILURES = 5  # 熔断阈值下限：防止配置过小让工具被轻易熔断
+
+
+class ToolErrorType(str, Enum):
+    """工具调用错误的分类（观测/评估定位"错在哪一类"用）。
+
+    与 docs/flows/2026-09-11-agent-loop错误处理.md 链路 1 的错误分类矩阵一一对应：
+    回喂模型的话术随分类不同，本枚举是该分类在数据层的唯一承载，用于会话与日志
+    观测（如统计各类错误的占比、定位高频失败类型）。
+
+    - TOOL_NOT_FOUND   : 工具不存在/未注册，无熔断对象、不计入计数
+    - PARSE_ERROR      : 参数不是合法 JSON（普通语法错误）
+    - PARSE_TRUNCATED  : 参数 JSON 因 max_tokens 截断而不完整
+    - PARSE_NOT_OBJECT : 参数是合法 JSON 但不是对象（如数组）
+    - PARAM_VALIDATION : 参数校验失败（缺必填、类型/枚举/范围等不符）
+    - TOOL_EXECUTION   : 工具本体执行时抛出异常
+    - BREAKER_INTERCEPT: 熔断拦截（execute_intercept 模式入口驳回）
+    """
+
+    TOOL_NOT_FOUND = "tool_not_found"
+    PARSE_ERROR = "parse_error"
+    PARSE_TRUNCATED = "parse_truncated"
+    PARSE_NOT_OBJECT = "parse_not_object"
+    PARAM_VALIDATION = "param_validation"
+    TOOL_EXECUTION = "tool_execution"
+    BREAKER_INTERCEPT = "breaker_intercept"
 
 
 @dataclass
 class ToolResult:
     """工具执行结果。
 
-    content 是回传给模型的文本（解析/校验/执行失败时含错误信息与 hint）；
-    is_error 标记本次执行是否失败，ToolRegister 依据它做熔断计数（失败累加、
-    成功清零）。is_parse_error 标记失败发生在"模型参数 JSON 解析"这一步
-    （工具未执行）：是模型输出问题而非工具问题，但与执行失败同等计入
-    熔断——熔断防的是"模型反复调用一个工具一直出错"，模型侧写坏参数
-    与工具侧执行失败都算。
+    content 是回传给模型的文本（失败时含错误信息与 hint）；
+    error_type 是本次失败的分类，**唯一的状态来源**——None 表示成功，
+    非 None 表示失败并指明属于哪一类（供观测/评估定位），失败时必有分类。
+    is_error 由 error_type 派生（成功即 False），ToolRegister 依据它做熔断计数
+    （失败累加、成功清零）：解析失败与执行失败同等计入，因为熔断防的是
+    "模型反复调用一个工具一直出错"，模型侧写坏参数与工具侧执行失败都算。
     """
 
     content: str
-    is_error: bool = False
-    is_parse_error: bool = False
+    error_type: ToolErrorType | None = None
+
+    @property
+    def is_error(self) -> bool:
+        """本次执行是否失败（error_type 非空即失败，成功为 False）。"""
+        return self.error_type is not None
 
     @classmethod
-    def error(cls, content: str) -> "ToolResult":
-        """构造失败结果（is_error=True）。"""
-        return cls(content=content, is_error=True)
+    def error(cls, content: str, error_type: ToolErrorType) -> "ToolResult":
+        """构造失败结果；必须给出错误分类（观测要求失败必有类型）。"""
+        return cls(content=content, error_type=error_type)
 
 
 @dataclass
@@ -210,7 +240,8 @@ class Tool(ABC):
 
         Returns:
             返回 str 视为成功（由 register 包装为 ToolResult(content=...)）；
-            要标记失败时返回 ToolResult.error(...)，register 会据此做熔断计数。
+            要标记失败时返回 ToolResult.error(内容, ToolErrorType.XXX)，
+            register 会据 error_type 做熔断计数并记录失败分类。
         """
         pass
 

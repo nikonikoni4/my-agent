@@ -31,3 +31,9 @@ abstract: known-limitations 目录索引；收录当前系统"这样运作是有
 - path: `docs/known-limitations/2026-09-11-event-service无隔离机制.md`
 - 触发规则：改动 `EventService` 订阅/派发逻辑、多 agent 共享事件总线、或排查 agent 间状态串扰时阅读
 - 内容摘要：EventService 仅以事件名分组、无 agent/session 隔离与解绑机制，多 agent 共享实例时订阅互相串扰；列出当前生效的两个订阅节点（`turn/end`、`session/event`）与已触发但无订阅方的事件
+
+## 工具熔断抛错时机与人在回路挂点缺失
+- updated_at : 2026-09-11
+- path: `docs/known-limitations/2026-09-11-工具熔断抛错时机与人在回路挂点缺失.md`
+- 触发规则：改动工具熔断（`raise_on_break` / `_on_failure`）、`request/error` 决策分支、或开始实现人在回路时阅读
+- 内容摘要：`raise_on_break` 熔断错误在 loop 写 `tool/result` 之前抛出，导致会话出现无配对的 assistant tool_calls、step 终态可能被记为 success；且 request/error 为同步 waterfall、loop 仅识别 retry 类决策，无法承载人在回路的异步等待。该路径由配置开关挡住，当前默认关闭，改造方向已定

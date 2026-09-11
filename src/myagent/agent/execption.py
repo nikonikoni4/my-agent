@@ -6,26 +6,26 @@
 
 from myagent.infra.exception import MyAgentError
 
-class ToolValueError(MyAgentError):
+class ToolExecuteError(MyAgentError):
+    """工具调用错误的父类。
+
+    __cause__ 保留工具抛出的原始异常，供上层排查。
+    """
+
+class ToolValueError(ToolExecuteError):
     """工具注册/注销时传入非法输入。
 
     典型场景：tools 为 None 或类型不对、列表中混入非 Tool/非 str 元素、
     工具的 name / description / parameters 为空。
     """
 
-class ToolExecuteError(MyAgentError):
-    """工具执行过程中抛出异常时由 ToolRegister.execute 包装抛出。
-
-    __cause__ 保留工具抛出的原始异常，供上层排查。
-    """
-
-class ToolValidateParameterError(MyAgentError):
+class ToolValidateParameterError(ToolExecuteError):
     """模型传入的工具参数未通过 schema 校验。
 
     典型场景：缺少 required 中声明的字段、参数类型与 schema 声明不符。
     """
 
-class ToolConsecutiveFailureError(MyAgentError):
+class ToolConsecutiveFailureError(ToolExecuteError):
     """单个工具连续失败达到熔断阈值，且该工具配置了熔断即抛错（人在回路入口）。
 
     由 ToolRegister.execute 在触发熔断时抛出；经 step 内 TaskGroup 以

@@ -4,8 +4,8 @@ from typing import Any, Literal
 import json
 
 from myagent.agent.core.provider import RawToolCall
-from myagent.agent.execption import ToolValueError,ToolExecuteError,ToolValidateParameterError,ToolConsecutiveFailureError
-from .tool import Tool, ToolResult, ParsedToolCall
+from myagent.agent.execption import ToolValueError,ToolValidateParameterError,ToolConsecutiveFailureError
+from .tool import Tool, ToolResult, ParsedToolCall, ToolErrorType
 import logging
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -249,8 +249,8 @@ class ToolRegister:
             call: 模型发起的原始工具调用
 
         Returns:
-            ParsedToolCall（解析成功）或 ToolResult（is_error=True 且
-            is_parse_error=True，解析失败）
+            ParsedToolCall（解析成功）或 ToolResult（error_type 为 PARSE_*
+            之一，解析失败）
         """
         raw = call.arguments or "{}"
         try:
@@ -269,21 +269,22 @@ class ToolRegister:
                 )
             return ToolResult(
                 content=(
-                    f"status : error \n message : 工具调用({call.name})参数不是合法 JSON："
+                    f"status : error\n message : 工具调用({call.name})参数不是合法 JSON："
                     f"{e.msg}（位置 {e.pos}）\n raw_arguments : {raw}" + hint
                 ),
-                is_error=True,
-                is_parse_error=True,
+                error_type=(
+                    ToolErrorType.PARSE_TRUNCATED if call.truncated
+                    else ToolErrorType.PARSE_ERROR
+                ),
             )
         if not isinstance(arguments, dict):
             return ToolResult(
                 content=(
-                    f"status : error \n message : 工具调用({call.name})参数解析结果不是"
+                    f"status : error\n message : 工具调用({call.name})参数解析结果不是"
                     f"JSON 对象（得到 {type(arguments).__name__}）\n raw_arguments : {raw}"
                     "\n hint : arguments 必须是 {...} 形式的 JSON 对象；请重新调用该工具"
                 ),
-                is_error=True,
-                is_parse_error=True,
+                error_type=ToolErrorType.PARSE_NOT_OBJECT,
             )
         return ParsedToolCall(call_id=call.id, tool_name=call.name, arguments=arguments)
 
@@ -308,7 +309,10 @@ class ToolRegister:
         tool_name = call.name
         if tool_name not in self._tools:
             logger.warning(f"{tool_name}工具不存在/未注册")
-            return ToolResult.error(f"status : error \n message : {tool_name}工具不存在 \n hint : 可用工具 {','.join(self.tool_list())} ")
+            return ToolResult.error(
+                f"status : error\n message : {tool_name}工具不存在\n hint : 可用工具 {','.join(self.tool_list())}",
+                ToolErrorType.TOOL_NOT_FOUND,
+            )
         tool = self._tools[tool_name]
 
         # 熔断拦截：仅 execute_intercept 模式在入口驳回。schema_hide 模式由
@@ -316,8 +320,9 @@ class ToolRegister:
         # （缺口记录在 架构设计/工具调用.md 已知限制 4）
         if tool.breaker_mode == "execute_intercept" and tool_name in self._tripped:
             return ToolResult.error(
-                f"工具{tool_name}已因连续失败{self._consecutive_failures.get(tool_name, 0)}次被熔断，"
-                f"本轮内不可再调用，请改用其他工具完成任务，或告知用户当前工具不可用"
+                f"status : error\n message : 工具{tool_name}已因连续失败{self._consecutive_failures.get(tool_name, 0)}次被熔断，本轮内不可再调用"
+                f"\n hint : 请改用其他工具完成任务，或告知用户当前工具不可用",
+                ToolErrorType.BREAKER_INTERCEPT,
             )
 
         # 解析失败：模型输出问题，但与执行失败同等计入熔断——熔断防的是
@@ -334,11 +339,19 @@ class ToolRegister:
                 result = raw if isinstance(raw, ToolResult) else ToolResult(content=str(raw))
             except ToolValidateParameterError as e:
                 logger.error(f"{tool_name}工具调用错误，参数:{parsed.arguments},错误信息：{e}")
-                result = ToolResult.error(f"{tool_name}工具调用错误，参数:{parsed.arguments},错误信息：{e}, hint : 请分析上述调用错误信息,重新调用")
+                result = ToolResult.error(
+                    f"status : error\n message : {tool_name}工具调用参数未通过校验：{e}\n 参数 : {parsed.arguments}"
+                    f"\n hint : 请分析上述调用错误信息，修正参数后重新调用",
+                    ToolErrorType.PARAM_VALIDATION,
+                )
             except Exception as e:
                 # 暂时的写法，这里工具调用错误还需要分类进行
-                logger.error(f"{tool_name}工具调用错误，参数:{parsed.arguments}")
-                result = ToolResult.error(f"{tool_name}工具调用错误，参数:{parsed.arguments}")
+                logger.error(f"{tool_name}工具调用错误，参数:{parsed.arguments},错误信息{e}")
+                result = ToolResult.error(
+                    f"status : error\n message : {tool_name}工具调用过程中出现异常，属于工具内部错误\n 参数 : {parsed.arguments}"
+                    f"\n hint : 重试后若仍不可行，建议放弃使用该工具",
+                    ToolErrorType.TOOL_EXECUTION,
+                )
 
         # 熔断计数：解析/校验/执行的失败都算一次，成功清零
         if result.is_error:
