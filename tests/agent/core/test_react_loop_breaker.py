@@ -23,7 +23,6 @@ from myagent.agent.core.provider import (
 from myagent.agent.core.session.session import Session
 from myagent.agent.core.session.types import SessionMetaData
 from myagent.agent.core.systemprompt.systemprompt import SystemPrompt
-from myagent.agent.core.tool.register import ToolRegister
 from myagent.agent.core.tool.tool import Tool
 from myagent.agent.execption import ToolConsecutiveFailureError
 from myagent.infra.events.eventspec import REQUEST_ERROR
@@ -87,12 +86,11 @@ def make_loop(tool: Tool, rounds: list[list], step_limit: int):
     event_service = EventService()
     session = Session(EventService(), SessionMetaData(cwd="."))
     session.presistence = NoopPersistence()
-    register = ToolRegister()
-    register.register(tool)
     config = SimpleNamespace(step_limit=step_limit, prompt_render_parame={})
     provider = FakeProvider(rounds)
-    loop = ReActAgentLoop(event_service, session, register, SystemPrompt(), config, provider)
-    return loop, provider, register
+    loop = ReActAgentLoop(event_service, session, SystemPrompt(), config, provider)
+    loop.tool_register.register(tool)
+    return loop, provider, loop.tool_register
 
 
 def tool_round(call_id: str) -> list:

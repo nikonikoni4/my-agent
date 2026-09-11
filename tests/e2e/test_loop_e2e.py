@@ -29,7 +29,6 @@ from myagent.agent.core.provider import ChatParams
 from myagent.agent.core.session.store import SessionStore
 from myagent.agent.core.systemprompt.systemprompt import SystemPrompt
 from myagent.agent.core.systemprompt.types import PrompSection
-from myagent.agent.core.tool.register import ToolRegister
 from myagent.agent.core.tool.tool import Tool
 from myagent.agent.llm.openai_provider import OpenAIProvider
 from myagent.infra.events.service import EventService
@@ -122,9 +121,6 @@ def build_agent(session_folder: Path, project_path: Path, session_name: str):
     store = SessionStore(session_folder, event_service)
     session = store.create(session_name, project_path)
 
-    tool_register = ToolRegister()
-    tool_register.register([WeatherTool(), AddressTool()])
-
     system_prompt = SystemPrompt()
     system_prompt.register_section(AGENT_NAME, PrompSection(
         name="tool_guide",
@@ -142,10 +138,11 @@ def build_agent(session_folder: Path, project_path: Path, session_name: str):
         step_limit=20,  # 步数兜底（单轮 2 工具 + 汇总回复约 3 步）；采样参数由 provider 的 chat_params 提供
     )
     agent_loop = ReActAgentLoop(
-        event_service, session, tool_register, system_prompt,
+        event_service, session, system_prompt,
         agent_config, llm_client, name=AGENT_NAME,
         prompt_render_parame={},  # 渲染参数是 loop 构造参数，不归 AgentConfig
     )
+    agent_loop.tool_register.register([WeatherTool(), AddressTool()])
     return agent_loop, session, store
 
 

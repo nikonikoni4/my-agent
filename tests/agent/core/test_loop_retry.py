@@ -17,7 +17,6 @@ from myagent.agent.core.provider import LLMProvider, LLMResponse, Usage
 from myagent.agent.core.session.session import Session
 from myagent.agent.core.session.types import SessionMetaData
 from myagent.agent.core.systemprompt.systemprompt import SystemPrompt
-from myagent.agent.core.tool.register import ToolRegister
 from myagent.agent.execption import LLMAuthError, LLMRateLimitError
 from myagent.agent.llm.llm_retry import LLMRerty
 from myagent.infra.events.eventspec import REQUEST_ERROR
@@ -62,10 +61,9 @@ def make_loop(script: list, max_retry_count: int, strategy: LLMRerty):
     event_service = EventService()
     session = Session(EventService(), SessionMetaData(cwd="."))
     session.presistence = NoopPersistence()
-    register = ToolRegister()
     config = SimpleNamespace(step_limit=10, max_retry_count=max_retry_count)
     provider = ScriptedErrorProvider(script)
-    loop = ReActAgentLoop(event_service, session, register, SystemPrompt(), config, provider)
+    loop = ReActAgentLoop(event_service, session, SystemPrompt(), config, provider)
     event_service.register(REQUEST_ERROR.name, strategy.request_error_event)
     return loop, provider, session
 

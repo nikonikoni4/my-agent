@@ -51,7 +51,6 @@ class ReActAgentLoop:
         self,
         event_service:EventService,
         session :Session,
-        tool_register:ToolRegister,
         system_prompt : SystemPrompt,
         agent_config :AgentConfig,
         llm_client:LLMProvider,
@@ -61,12 +60,12 @@ class ReActAgentLoop:
         Args:
             event_service: 事件服务，用于在循环关键节点发布事件（埋点尚未接入）。
             session: 本循环绑定的会话，所有消息读写都落在它上面。
-            tool_register: 工具注册表，提供工具 schema 与执行。
             llm_client: LLM 调用实现（LLMProvider 接口）。
         """
         self.name =name  if name else str(uuid.uuid4())[:8] # 若没有名称/id , 
         self._event_service = event_service
-        self.tool_register = tool_register
+        # 工具注册表由 loop 自持（非依赖注入）：外部通过 loop.tool_register.register(...) 注册工具
+        self.tool_register = ToolRegister()
         self.system_prompt = system_prompt
         self._llm_client = llm_client
         self.agent_config = agent_config
@@ -74,7 +73,7 @@ class ReActAgentLoop:
         self.inbox = {"next_turn":[],"next_step":[]} # next_turn 的消息要等待agentturn完成之后才会调用，而next_step会在下一个step马上打断并调用
         self._session = session
         self._task = None
-        self.state :Literal["idle","running","maintenance"] = "idle"# maintenance 暂时没用
+        self.state :Literal["idle","running","maintenance"] = "idle"# 暂时没用
         self._LLM_CALL_TIMEOUT = LLM_CALL_TIMEOUT
         # 工具熔断状态随 turn 结束清空：接线在此（loop 同时持有 event_service
         # 与 tool_register），清空逻辑在 ToolRegister.reset_breaker
@@ -435,3 +434,5 @@ class ReActAgentLoop:
         if delay > 0:
             await asyncio.sleep(delay)
         return delay
+
+    

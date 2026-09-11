@@ -50,7 +50,6 @@ from myagent.agent.core.provider import (
 from myagent.agent.core.session.session import Session
 from myagent.agent.core.session.types import SessionMetaData
 from myagent.agent.core.systemprompt.systemprompt import SystemPrompt
-from myagent.agent.core.tool.register import ToolRegister
 from myagent.agent.core.tool.tool import Tool
 from myagent.agent.execption import (
     LLMAuthError,
@@ -172,15 +171,14 @@ def make_loop(script, *, tools=None, step_limit=10, max_retry_count=2, retry_str
     event_service = EventService()
     session = Session(EventService(), SessionMetaData(cwd="."))
     session.presistence = NoopPersistence()
-    register = ToolRegister()
-    if tools is not None:
-        register.register(tools)
     config = SimpleNamespace(step_limit=step_limit, max_retry_count=max_retry_count)
     provider = ScriptedProvider(script)
     loop = ReActAgentLoop(
-        event_service, session, register, SystemPrompt(), config, provider,
+        event_service, session, SystemPrompt(), config, provider,
         prompt_render_parame={},
     )
+    if tools is not None:
+        loop.tool_register.register(tools)
     if retry_strategy is not None:
         event_service.register(REQUEST_ERROR.name, retry_strategy.request_error_event)
     return loop, provider, session
