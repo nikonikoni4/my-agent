@@ -82,32 +82,57 @@ class ReActAgentLoop:
         # 事件循环
         self._wakeup = asyncio.Event()
 
+    def start(self) -> asyncio.Task:
+        """启动后台循环：整个 loop 对应一个 task，由 _task 持有直到结束。
+
+        turn 在 _loop 内被直接 await，不再每轮单独建 task——turn 是循环内的
+        一段顺序执行，不是并发单元；每轮建 task 只会让 _task 被反复覆盖、
+        cancel 失去稳定目标。已在运行时直接返回现有 task，避免跑出两个 _loop。
+        """
+        if self._task is not None and not self._task.done():
+            return self._task
+        self._task = asyncio.create_task(self._loop())
+        self._task.add_done_callback(self._on_loop_done)
+        return self._task
+
     def cancel(self):
+        """取消当前在途 turn、作废 inbox 中排队的消息，并结束循环。
+
+        与 asyncio 原设计对齐：取消就是要停下来。取消异常由 step/turn 记录
+        interrupted 后原样上抛，最终在 _loop 统一捕获：记一条 warning 后 break，
+        让任务以正常结束（而非 cancelled）收场，不把取消影响扩散给外部等待方。
+        之后再 send() 会按需重新启动循环（见 send）。
+        """
+        if self._task is None:
+            return
         self._task.cancel()
         # 清空inbox
         self.inbox = {"next_turn":[],"next_step":[]}
 
     async def _loop ( self ): 
         while True : 
-            await self ._wakeup.wait() # 无消息时挂起，不占 CPU 
-            self ._wakeup.clear() 
-            while self .inbox[ "next_step" ]: 
-                # 先处理高优先级的 next_step 
-                self._task = asyncio.create_task(self .turn( self .inbox[ "next_step" ].pop( 0 )))
-                self._task.add_done_callback(self._on_turn_done)
-                await self._task
-            while self .inbox[ "next_turn" ]: 
-                self._task =  asyncio.create_task(self .turn( self .inbox[ "next_turn" ].pop( 0 )))
-                self._task.add_done_callback(self._on_turn_done)
-                await self._task
+            try : 
+                await self ._wakeup.wait() # 无消息时挂起，不占 CPU 
+                self ._wakeup.clear() 
+                while self .inbox[ "next_step" ]: 
+                    # 先处理高优先级的 next_step 
+                    await self .turn( self .inbox[ "next_step" ].pop( 0 ))
+                while self .inbox[ "next_turn" ]: 
+                    await self .turn( self .inbox[ "next_turn" ].pop( 0 ))
+            except asyncio.CancelledError:
+                # 取消 = 结束循环。吞掉取消后协程不会被标记为 cancelled，while
+                # 也不会自己停，所以必须在此显式 break；在途的取消已由 step/turn
+                # 记好 interrupted 终态，并原样上抛到这里
+                logger.warning("agent loop 收到取消：打断循环，任务结束")
+                break
 
-    def _on_turn_done(self,task:asyncio.Task):
-        """turn 任务结束回调：取回 task 异常，防止静默失败。
+    def _on_loop_done(self,task:asyncio.Task):
+        """loop 任务结束回调：取回 task 异常，防止静默失败。
 
         create_task 产出的 task 若无人 await、也无人取异常，异常会被 asyncio
         吞掉（仅在 task 被 GC 时打印 "Task exception was never retrieved"）。
-        本回调在任务结束时显式取回，是这一异常的唯一出口：
-        - cancelled：turn 内已按 interrupted 收口，无需处理
+        start() 的调用方通常也不 await 该 task，本回调是这一异常的唯一出口：
+        - 正常结束（含因取消 break）：exc 为 None，无需处理
         - 有异常：记 error 日志（带堆栈），使失败在日志中可见
 
         注意：取回异常本身也会抑制 asyncio 的 "never retrieved" 警告，
@@ -118,7 +143,7 @@ class ReActAgentLoop:
         exc = task.exception()
         if exc is None:
             return
-        logger.error(f"turn 任务异常终止：{exc!r}",exc_info=exc)
+        logger.error(f"agent loop 任务异常终止：{exc!r}",exc_info=exc)
     
     
     async def send(self,user_prompt : str | list,send_type : Literal["next_turn","next_step"]):
@@ -128,6 +153,11 @@ class ReActAgentLoop:
             user_prompt : user消息
             send_type : 消息发送类型，存储进turn 还是step，目前无论选turn还是step都会进入turn（暂时）
         """
+        # send 是唯一入口：循环可能从未启动、已被 cancel 停掉、或因异常终止，
+        # 此时入队将无人消费（消息静默积压），所以先确认循环活着；只入队不消费
+        # 就是故障，按需重启比"停下即失效"更省心（循环停止期间不占资源）
+        if self._task is None or self._task.done():
+            self.start()
         if isinstance(user_prompt,str):
             content = [{"type":"text","text":user_prompt}]
         # 整合可能会动态变化的系统提示词(为了缓存命中而不放在开头)
@@ -148,22 +178,23 @@ class ReActAgentLoop:
 
     async def turn(self,user_message):
         # 默认成功：step 正常返回时以其结果收口；step 抛出未归一化的异常时，
-        # 由下面两个 except 先归一化 result 再原样上抛（异常仍要暴露给
-        # _on_turn_done 记录，不能静默吞掉）
+        # 由下面的 except Exception 先归一化 result 再原样上抛（异常仍要暴露给
+        # _on_loop_done 记录，不能静默吞掉）
         result = StepOut(reason_type="success",reason_text="")
         try:
             self._session.append("turn/start",TurnStartData())
             self._event_service.trigger(TURN_START,TurnStartPayload())
             result = await self.step(user_message)
         except asyncio.CancelledError:
-            # 取消需原样上抛（否则 task 不会被标记为 cancelled），只能在此补终态；
-            # step 内的取消已归一化为 interrupted，这里兜 step 之外被取消的情况
+            # 取消原样上抛（与 asyncio 原设计对齐）：先记下本 turn 的 interrupted
+            # 终态（否则 finally 会写成 success），再由 _loop 统一捕获并结束循环。
+            # 这里不能吞掉——吞掉后取消传播不到 _loop，循环就不会被打断
             result = StepOut(reason_type="interrupted",reason_text="用户手动取消")
             raise
         except Exception as e:
             # step 未归一化的异常（如 request/error 无人认领抛出的 LLmError、
             # 非熔断的 ExceptionGroup）：先归一化 result，否则 finally 会把本轮
-            # 记成 success，污染终态；异常原样上抛交由 _on_turn_done 记录
+            # 记成 success，污染终态；异常原样上抛交由 _on_loop_done 记录
             logger.error(f"turn 未归一化异常：{e!r}",exc_info=e)
             result = StepOut(reason_type="error",reason_text=str(e))
             raise
@@ -172,6 +203,7 @@ class ReActAgentLoop:
             # 信息；用户取消则为 interrupted
             self._session.append("turn/end",TurnEndData(reason_type=result.reason_type,reason_text=result.reason_text))
             self._event_service.trigger(TURN_END,TurnEndPayload())
+    
     def _request_header(self):
         # 组装systemprompt
         assembly_prompt : AssemblyPrompt = self.system_prompt.assemble(self.name)
@@ -250,10 +282,12 @@ class ReActAgentLoop:
 
             except asyncio.CancelledError:
                 # 取消中断比较特殊，单独处理，不走request/error（不是 LLM 调用错误）：
-                # 本 step 记为 interrupted 后结束，终态由 turn 汇总写入 turn/end
+                # 本 step 记为 interrupted 后原样上抛（不能只 break——那只是结束本轮，
+                # 取消会被吞掉、_loop 收不到，循环就不会被打断），终态由 finally
+                # 落 step/end、再由 turn 汇总写 turn/end
                 round_reason_type, round_reason_text = "interrupted","用户手动取消"
                 result = StepOut(reason_type="interrupted",reason_text="用户手动取消")
-                break
+                raise
 
             except ExceptionGroup as eg:
                 # TaskGroup 把子任务（工具执行）异常包成 ExceptionGroup 上抛。

@@ -4,17 +4,19 @@
 术语：一条"出路"= 一次 turn/step 结束并落盘一条终态记录（step/end / turn/end）的路径。
 
 == 入口 / 调度层 ==
-E1  send 把消息写入 inbox["next_turn"] 并唤醒 _loop
-E2  _loop 被唤醒后创建 turn 任务并消费 inbox（next_step 优先于 next_turn）
-E3  _on_turn_done：turn 异常结束 → logger.error 留痕（防止静默失败）
-E4  cancel() 取消在途 turn → step/turn 记 interrupted，且不产生 task 异常
+E1  start() 启动后台循环（整个 loop 一个 task）；send 把消息写入 inbox["next_turn"] 并唤醒
+E2  _loop 被唤醒后按序执行 turn 并消费 inbox（next_step 优先于 next_turn）
+E3  _on_loop_done：loop 因未归一化异常终止 → logger.error 留痕（防止静默失败）
+E4  cancel() 打断在途 turn 并结束循环：step/turn 记 interrupted，取消传播到 _loop 后
+    被消化（记 warning + break），loop task 正常结束、无 error 日志
+E5  cancel() 落在空闲等待时：同样记 warning + break 结束循环；之后 send() 按需重启循环
 
 == turn/step 层：收敛为 StepOut（不上抛） ==
 P1  模型不再请求工具 → step/end success，turn/end success
 P2  工具循环正常收敛（工具调用 → 结果回喂 → 收敛）→ success
 P3  工具执行失败被工具层兜底（功能降级）→ 回喂错误结果，不上抛 → success
 P4  参数 JSON 解析失败 → 回喂带 hint 结果，不上抛 → success
-P5  用户取消（模型调用挂起）→ step/end interrupted，turn/end interrupted
+P5  用户取消（模型调用挂起）→ step/end、turn/end 记 interrupted，取消原样上抛
 P6  达到 step_limit → 在下一轮 step/start 前拦截并终止，turn/end error（已执行的步各自 success）
 
 == turn/step 层：异常上抛（经 except 归一化终态后继续上抛） ==
@@ -225,6 +227,18 @@ async def wait_until(predicate, timeout: float = 2.0):
         await asyncio.sleep(0.005)
 
 
+async def shutdown(loop, loop_task):
+    """收尾：cancel 掉 loop 并等其 task 收敛。
+
+    cancel() 的约定是"取消并结束循环"：取消在 _loop 内被消化后 break，任务以正常
+    结束收场，因此这里直接 cancel 即可停住循环。gather(return_exceptions=True)
+    顺带取回 task 异常，避免遗留 pending task 与 "exception was never retrieved"
+    干扰后续用例。
+    """
+    loop.cancel()
+    await asyncio.gather(loop_task, return_exceptions=True)
+
+
 # ===========================================================================
 # 入口 / 调度层
 # ===========================================================================
@@ -232,9 +246,9 @@ async def wait_until(predicate, timeout: float = 2.0):
 
 @pytest.mark.asyncio
 async def test_E1_send入inbox并唤醒_loop完成一轮():
-    """send 把消息写入 next_turn 并唤醒 _loop；_loop 创建 turn 跑完后 inbox 清空"""
+    """start() 启动整个 loop 的单一 task；send 唤醒后跑完一轮，inbox 清空"""
     loop, provider, session = make_loop([LLMResponse(content="你好", finish_reason="stop")])
-    loop_task = asyncio.create_task(loop._loop())
+    loop_task = loop.start()
     try:
         await loop.send("你好", "next_turn")
         await wait_until(lambda: records(session, "turn/end"))
@@ -243,60 +257,85 @@ async def test_E1_send入inbox并唤醒_loop完成一轮():
         assert loop.inbox["next_step"] == []
         assert last(session, "turn/end").data.reason_type == "success"
     finally:
-        loop_task.cancel()
+        await shutdown(loop, loop_task)
 
 
 @pytest.mark.asyncio
 async def test_E2_loop优先消费next_step():
-    """inbox 中同时有 next_step 与 next_turn 时，next_step 的 turn 先被创建/执行"""
+    """inbox 中同时有 next_step 与 next_turn 时，next_step 的消息先被处理"""
     loop, provider, session = make_loop([
         LLMResponse(content="第一轮", finish_reason="stop"),
         LLMResponse(content="第二轮", finish_reason="stop"),
     ])
-    loop_task = asyncio.create_task(loop._loop())
+    loop_task = loop.start()
     try:
         loop.inbox["next_turn"].append(user_message("turn消息"))
         loop.inbox["next_step"].append(user_message("step消息"))
         loop._wakeup.set()
         await wait_until(lambda: len(records(session, "turn/end")) == 2)
-        # 第一次模型调用看到的是 next_step 的消息（先创建先运行）
+        # 第一次模型调用看到的是 next_step 的消息（先被消费）
         first_seen = provider.seen_messages[0]
         assert any(getattr(m, "content", None) == "step消息" for m in first_seen)
     finally:
-        loop_task.cancel()
+        await shutdown(loop, loop_task)
 
 
 @pytest.mark.asyncio
-async def test_E3_on_turn_done_异常turn记error日志(caplog):
-    """turn 任务异常结束时 _on_turn_done 取回异常并 logger.error，避免静默失败"""
+async def test_E3_on_loop_done_异常终止记error日志(caplog):
+    """loop 因未归一化异常终止时 _on_loop_done 取回异常并 logger.error，避免静默失败"""
     loop, provider, session = make_loop([RuntimeError("provider boom")])
-    loop_task = asyncio.create_task(loop._loop())
+    loop_task = loop.start()
     try:
         with caplog.at_level(logging.ERROR, logger=LOOP_LOGGER):
             await loop.send("你好", "next_turn")
-            await wait_until(lambda: "turn 任务异常终止" in caplog.text)
+            await wait_until(lambda: "agent loop 任务异常终止" in caplog.text)
         assert "provider boom" in caplog.text
     finally:
-        loop_task.cancel()
+        await shutdown(loop, loop_task)
 
 
 @pytest.mark.asyncio
-async def test_E4_cancel中断在途turn并记interrupted(caplog):
-    """cancel() 取消运行中的 turn：step/turn 记 interrupted，且不属于"异常结束"（无 error 日志）"""
+async def test_E4_cancel打断在途turn并结束循环(caplog):
+    """cancel() 在途取消：step/turn 记 interrupted，取消传播到 _loop 后被消化
+    （记 warning + break），loop task 正常结束、无 error 日志"""
     loop, provider, session = make_loop(["hang"])
-    loop_task = asyncio.create_task(loop._loop())
+    loop_task = loop.start()
+    with caplog.at_level(logging.WARNING, logger=LOOP_LOGGER):
+        await loop.send("取消我", "next_turn")
+        await wait_until(lambda: records(session, "step/start"))
+        loop.cancel()
+        await asyncio.gather(loop_task, return_exceptions=True)
+    assert last(session, "step/end").data.reason_type == "interrupted"
+    assert last(session, "turn/end").data.reason_type == "interrupted"
+    assert loop_task.done(), "cancel() 应打断循环"
+    assert loop_task.cancelled() is False, "取消在 _loop 内被消化，任务应以正常结束收场"
+    assert "打断循环" in caplog.text
+    assert "agent loop 任务异常终止" not in caplog.text, "取消已按 interrupted 收口，不应报异常"
+
+
+@pytest.mark.asyncio
+async def test_E5_空闲态cancel结束循环_可重启(caplog):
+    """loop 空闲（挂在 _wakeup.wait()）时 cancel()：同样打断循环、任务正常结束；
+    之后再 send() 会按需重启循环并正常处理消息"""
+    loop, provider, session = make_loop([LLMResponse(content="你好", finish_reason="stop")])
+    loop_task = loop.start()
     try:
-        with caplog.at_level(logging.ERROR, logger=LOOP_LOGGER):
-            await loop.send("取消我", "next_turn")
-            await wait_until(lambda: loop._task is not None)
+        await asyncio.sleep(0)  # 让 _loop 先启动并挂到等待上（否则取消会落在"未启动"的协程上）
+        with caplog.at_level(logging.WARNING, logger=LOOP_LOGGER):
             loop.cancel()
-            await wait_until(lambda: records(session, "turn/end"))
-            await asyncio.sleep(0)  # 让 _on_turn_done 执行
-        assert last(session, "step/end").data.reason_type == "interrupted"
-        assert last(session, "turn/end").data.reason_type == "interrupted"
-        assert "turn 任务异常终止" not in caplog.text, "取消已按 interrupted 收口，不应报异常"
+            await asyncio.gather(loop_task, return_exceptions=True)
+        assert loop_task.done(), "空闲态 cancel() 也应结束 loop"
+        assert loop_task.cancelled() is False, "取消在 _loop 内被消化，任务应以正常结束收场"
+        assert "打断循环" in caplog.text
+        assert provider.calls == 0
+        # cancel 后 loop 仍可用：send 自动重启循环
+        await loop.send("你好", "next_turn")
+        assert loop._task is not loop_task, "send 应重启出一个新的 loop task"
+        await wait_until(lambda: records(session, "turn/end"))
+        assert last(session, "turn/end").data.reason_type == "success"
+        assert provider.calls == 1
     finally:
-        loop_task.cancel()
+        await shutdown(loop, loop._task)
 
 
 # ===========================================================================
@@ -395,16 +434,18 @@ async def test_P4_参数JSON解析失败_回喂带hint结果():
 
 
 @pytest.mark.asyncio
-async def test_P5_用户取消_step与turn记interrupted():
-    """模型调用挂起时取消 turn 任务：取消被 step 收敛为 interrupted，turn 正常返回不抛"""
+async def test_P5_用户取消_step与turn记interrupted后上抛():
+    """模型调用挂起时取消 turn 任务：step/turn 先落 interrupted 终态，取消再原样上抛，
+    使 task 处于 cancelled（与 asyncio 原设计对齐）"""
     loop, provider, session = make_loop(["hang"])
 
     task = asyncio.create_task(loop.turn(user_message("取消我")))
     await asyncio.sleep(0.01)  # 让任务进入挂起的模型调用
     task.cancel()
-    await task  # 取消被收敛，不再上抛
+    with pytest.raises(asyncio.CancelledError):
+        await task
 
-    assert task.cancelled() is False, "取消被收敛为正常结束，task 不应停留在 cancelled"
+    assert task.cancelled() is True, "取消原样上抛，task 应处于 cancelled"
     assert last(session, "step/end").data.reason_type == "interrupted"
     assert last(session, "turn/end").data.reason_type == "interrupted"
     assert last(session, "turn/end").data.reason_text == "用户手动取消"
