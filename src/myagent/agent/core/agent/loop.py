@@ -145,7 +145,7 @@ class ReActAgentLoop:
         logger.error(f"agent loop 任务异常终止：{exc!r}",exc_info=exc)
     
     
-    async def send(self,user_prompt : str | list,send_type : Literal["next_turn","next_step"]):
+    async def send(self,user_prompt : str | list,send_type : Literal["next_turn","next_step"]="next_turn"):
         """
         将消息发送进inbox
         arg :
@@ -158,10 +158,10 @@ class ReActAgentLoop:
         if self._task is None or self._task.done():
             self.start()
         if isinstance(user_prompt,str):
-            content = [{"type":"text","text":user_prompt}]
+            content = [{"type":"text","text":user_prompt}] 
         # 整合可能会动态变化的系统提示词(为了缓存命中而不放在开头)
         content.append([{"type":"text","text":self.system_prompt.assemble(self.name).context}])
-        self.inbox["next_turn"].append(content)
+        self.inbox["next_turn"].append(Message(role= "user",content=content))
         self._wakeup.set()
     def followup(self):
         pass
@@ -272,7 +272,14 @@ class ReActAgentLoop:
                         # 回喂内容与截断/语法话术均由工具层产出（ToolResult.content），
                         # loop 只负责把结果按 tool_call_id 配对写回
                         self._session.append("tool/result",ToolResultData(call_id=tool_call.id,tool_name=tool_call.name,message=Message(role="tool",content=tool_result.content,tool_call_id=tool_call.id,),is_error=tool_result.is_error),surface_op="append",source_event_seqs=[])
-                        self._event_service.trigger(TOOL_RESULT,ToolResultPayload())
+                        # 事件负载与 session 记录同源，供评估/观测订阅（如 ToolEvaluate）消费
+                        self._event_service.trigger(TOOL_RESULT,ToolResultPayload(
+                            tool_name=tool_call.name,
+                            arguments=tool_call.arguments,
+                            is_error=tool_result.is_error,
+                            error_type=tool_result.error_type.value if tool_result.error_type else None,
+                            content=tool_result.content,
+                        ))
                 else:
                     break # 模型不再请求工具，本轮结束（ReAct 终止条件）
                 

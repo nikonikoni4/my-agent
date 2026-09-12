@@ -17,6 +17,7 @@ from myagent.agent.core.agent.loop import ReActAgentLoop
 from myagent.agent.core.provider import (
     LLMProvider,
     LLMResponse,
+    Message,
     RawToolCall,
     Usage,
 )
@@ -103,6 +104,10 @@ def text_round(content: str) -> list:
     return [LLMResponse(content=content, usage=Usage())]
 
 
+def user_message(text="你好"):
+    return Message(role="user", content=text)
+
+
 @pytest.mark.asyncio
 async def test_熔断抛错记入step_error_触发一次request_error后循环继续():
     """raise_on_break 工具第 5 次失败触发熔断抛错：loop 只记入 step_error 并触发
@@ -121,7 +126,7 @@ async def test_熔断抛错记入step_error_触发一次request_error后循环�
         return {"decision": "dont_retry"}
     loop._event_service.register(REQUEST_ERROR.name, on_error)
 
-    await loop.send("触发熔断")  # 不外抛，send 正常返回
+    await loop.turn(user_message("触发熔断"))  # 不外抛，turn 正常返回
 
     # 抛错后循环继续：第 6 次模型请求拿到纯文本，turn 正常收敛
     assert provider.calls == 6, "熔断抛错不应终止循环，第 6 次请求应正常发生"
@@ -143,7 +148,7 @@ async def test_步数兜底_未配置熔断时达到上限强制终止():
         return {"decision": "dont_retry"}
     loop._event_service.register(REQUEST_ERROR.name, on_error)
 
-    await loop.send("测试步数兜底")
+    await loop.turn(user_message("测试步数兜底"))
 
     assert provider.calls == 5, "恰好执行 step_limit 次模型请求后强制终止"
     assert len(errors) == 1
@@ -158,7 +163,7 @@ async def test_熔断后schema过滤_turn结束自动恢复():
     rounds = [tool_round(f"call_{i}") for i in range(5)] + [text_round("工具不可用了")]
     loop, provider, register = make_loop(tool, rounds, step_limit=20)
 
-    await loop.send("触发 schema 熔断")
+    await loop.turn(user_message("触发 schema 熔断"))
 
     # 两次 request/header：初始 + 熔断后 schema 变化（reason=change）
     headers = [r for r in loop._session.record_list if r.type == "request/header"]
@@ -190,7 +195,7 @@ async def test_非法JSON参数_工具不执行_回喂解析错误与原文():
     ]
     loop, provider, _ = make_loop(tool, rounds, step_limit=10)
 
-    await loop.send("测试非法 JSON")
+    await loop.turn(user_message("测试非法 JSON"))
 
     assert tool.calls == 0, "解析失败不应执行工具本体"
     # 熔断计数在 turn/end 的 reset_breaker 后已清空（不跨 turn），
@@ -218,7 +223,7 @@ async def test_截断的非法JSON_回喂结果带截断hint():
     ]
     loop, _, _ = make_loop(tool, rounds, step_limit=10)
 
-    await loop.send("测试截断")
+    await loop.turn(user_message("测试截断"))
 
     assert tool.calls == 0, "解析失败不应执行工具本体"
     tool_results = [r for r in loop._session.record_list if r.type == "tool/result"]

@@ -13,7 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 from myagent.agent.core.agent.loop import ReActAgentLoop
-from myagent.agent.core.provider import LLMProvider, LLMResponse, Usage
+from myagent.agent.core.provider import LLMProvider, LLMResponse, Message, Usage
 from myagent.agent.core.session.session import Session
 from myagent.agent.core.session.types import SessionMetaData
 from myagent.agent.core.systemprompt.systemprompt import SystemPrompt
@@ -88,6 +88,10 @@ def last_record(session, record_type):
     return [r for r in session.record_list if r.type == record_type][-1]
 
 
+def user_message(text="你好"):
+    return Message(role="user", content=text)
+
+
 @pytest.mark.asyncio
 async def test_两个错误_仅走重试的那个记记录并等待():
     """先 429 限流（backoff_retry）再 401 认证失败（dont_retry），第三次成功：
@@ -101,7 +105,7 @@ async def test_两个错误_仅走重试的那个记记录并等待():
     loop, provider, session = make_loop(script, max_retry_count=5, strategy=strategy)
     waits = install_recording_delay(loop)
 
-    await loop.send("你好")
+    await loop.turn(user_message("你好"))
 
     assert provider.calls == 3, "两个错误后模型第三次返回成功"
     records = retry_records(session)
@@ -125,7 +129,7 @@ async def test_连续重试达上限_step与turn记为error():
     loop, provider, session = make_loop(script, max_retry_count=2, strategy=strategy)
     install_recording_delay(loop)
 
-    await loop.send("你好")  # 重试耗尽不再上抛，正常返回
+    await loop.turn(user_message("你好"))  # 重试耗尽不再上抛，正常返回
 
     assert provider.calls == 3, "上限 2 次重试后第 3 次调用失败即耗尽"
     assert len(retry_records(session)) == 2, "耗尽前正常记了 2 次 llm/retry"
@@ -144,10 +148,11 @@ async def test_用户取消_step与turn记为interrupted():
     strategy = LLMRerty()
     loop, provider, session = make_loop(["hang"], max_retry_count=3, strategy=strategy)
 
-    task = asyncio.create_task(loop.send("你好"))
+    task = asyncio.create_task(loop.turn(user_message("你好")))
     await asyncio.sleep(0.01)  # 让任务进入挂起的模型调用
     task.cancel()
-    await task  # 取消被 step 收敛为 interrupted，不再上抛
+    with pytest.raises(asyncio.CancelledError):
+        await task  # 取消原样上抛（step 已收敛为 interrupted）
 
     step_ends = [r for r in session.record_list if r.type == "step/end"]
     assert [r.data.reason_type for r in step_ends] == ["interrupted"]
