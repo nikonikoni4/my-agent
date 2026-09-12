@@ -59,8 +59,18 @@ class ToolCallPayload(Payload):
 
 @dataclass
 class ToolResultPayload(Payload):
-    """tool/result : tool_name"""
-    pass
+    """tool/result : 一次工具执行的结果，供评估/观测订阅消费。
+
+    字段与 session 的 tool/result 记录同源，由 loop 在写回结果时填充：
+    tool_name 工具名；arguments 模型发起的原始参数（wire 上的 JSON 字符串，
+    解析失败时即坏 JSON 原文）；is_error 是否失败；error_type 失败分类
+    （ToolErrorType 的值，成功为 None）；content 回喂给模型的内容。
+    """
+    tool_name: str = ""
+    arguments: str = "{}"
+    is_error: bool = False
+    error_type: str | None = None
+    content: str = ""
 
 
 @dataclass
