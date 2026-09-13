@@ -63,7 +63,9 @@ class Message:
         """
         if not self.role:
             raise ValueError("role 为空")
-        if self.role not in ["assistant", "user",  "tool"]: # system 提示词不写入，而是动态编排
+        # 允许 system：system 提示词不落 session 的 message list（session 落盘走
+        # asdict），而是请求时动态编排到 wire 最前面，故此处必须放行
+        if self.role not in ["assistant", "user", "system", "tool"]:
             raise ValueError(f"{self.role} 不在['assistant','user','system','tool']之中")
 
         # content 为 None 仅在 assistant 发起工具调用时合法（wire 格式中该消息 content 为 null）

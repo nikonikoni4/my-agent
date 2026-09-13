@@ -157,10 +157,9 @@ class ReActAgentLoop:
         # 就是故障，按需重启比"停下即失效"更省心（循环停止期间不占资源）
         if self._task is None or self._task.done():
             self.start()
-        if isinstance(user_prompt,str):
-            content = [{"type":"text","text":user_prompt}] 
-        # 整合可能会动态变化的系统提示词(为了缓存命中而不放在开头)
-        content.append([{"type":"text","text":self.system_prompt.assemble(self.name).context}])
+        # 只入队原始用户消息：system prompt / system reminder / runtime context
+        # 由 _request_header 在组装请求时统一处理（此处不组装，避免重复 assemble）
+        content = [{"type":"text","text":user_prompt}] if isinstance(user_prompt,str) else user_prompt
         self.inbox["next_turn"].append(Message(role= "user",content=content))
         self._wakeup.set()
     def followup(self):
@@ -203,14 +202,38 @@ class ReActAgentLoop:
             self._session.append("turn/end",TurnEndData(reason_type=result.reason_type,reason_text=result.reason_text))
             self._event_service.trigger(TURN_END,TurnEndPayload())
     
-    def _request_header(self):
-        # 组装systemprompt
+    def _request_header(self,user_message : Message | None) -> list[Message]:
+        """组装本 step 的完整请求消息列表（每 step 唯一一次提示词组装点）。
+
+        产出的 Message List 布局：第 1 位 System Prompt、第 2 位 System Reminder
+        （role=user，为空则省略），其后是 session 的会话消息面。
+
+        三类内容的持久化落点（保证每一步输入可复现）：
+        - System Prompt / System Reminder 不落 session 的 message list，以
+          request/header 事件落盘（仅首次与配置变更时写入）
+        - runtime context 合并进当前用户消息后落 user/message
+
+        args:
+            user_message: 本 step 的用户消息；工具调用循环的后续 step 为 None
+        return:
+            完整请求消息列表
+        """
+        # 提示词组装只在此处发生一次
         assembly_prompt : AssemblyPrompt = self.system_prompt.assemble(self.name)
         system_prompt = self.system_prompt.render(assembly_prompt,self.prompt_render_parame)
+        system_reminder = assembly_prompt.system_reminder
+
+        # 当前用户消息：合并 runtime context 后落盘（append-only，输入即落盘）
+        if user_message:
+            merged = self._merge_runtime_context(user_message,assembly_prompt.context)
+            self._session.append("user/message",UserMessageData(merged),surface_op="append")
+            self._event_service.trigger(USER_MESSAGE,UserMessagePayload())
+
         current = RequestHeaderData(
             reason="initial",
             model_name=self._llm_client.model,
             system_prompt=system_prompt,
+            system_reminder=system_reminder,
             tools=self.tool_register.to_schemas(),
             params=self._llm_client.params,
         )
@@ -220,11 +243,38 @@ class ReActAgentLoop:
             # 本会话从未写入过配置快照
             self._session.append("request/header", current)
             self._event_service.trigger(REQUEST_HEADER,RequestHeaderPayload())
-        elif (last.model_name, last.system_prompt, last.tools, last.params) != (current.model_name, current.system_prompt, current.tools, current.params):
+        elif (last.model_name, last.system_prompt, last.system_reminder, last.tools, last.params) != (current.model_name, current.system_prompt, current.system_reminder, current.tools, current.params):
             current.reason = "change"
             self._session.append("request/header", current)
             self._event_service.trigger(REQUEST_HEADER,RequestHeaderPayload())
         # 除 reason 外完全一致：不写入，request/header 仅首次和配置变更时记录
+
+        messages : list[Message] = []
+        if system_prompt:
+            messages.append(Message(role="system",content=system_prompt))
+        if system_reminder:
+            messages.append(Message(role="user",content=f"<system-reminder>{system_reminder}</system-reminder>"))
+        messages.extend(self._session.derive_messages())
+        return messages
+
+    @staticmethod
+    def _merge_runtime_context(message : Message,runtime_context : str) -> Message:
+        """把 runtime context 合并进当前用户消息（作为追加的文本块）。
+
+        runtime context 是运行过程中动态生成的标注，必须随输入落盘才能保证会话
+        可复现；无内容时原样返回，不产生多余文本块。
+        """
+        if not runtime_context:
+            return message
+        content = [{"type":"text","text":message.content}] if isinstance(message.content,str) else list(message.content)
+        content.append({"type":"text","text":runtime_context})
+        return Message(
+            role=message.role,
+            content=content,
+            tool_calls=message.tool_calls,
+            tool_call_id=message.tool_call_id,
+            reasoning_content=message.reasoning_content,
+        )
 
     async def step(self,user_message) -> StepOut:
         step_error = None
@@ -246,14 +296,13 @@ class ReActAgentLoop:
             try:
                 self._session.append("step/start",StepStartData())
                 self._event_service.trigger(STEP_START,StepStartPayload())
-                self._request_header()
-                if user_message:
-                    self._session.append("user/message",UserMessageData(user_message),surface_op="append")
-                    self._event_service.trigger(USER_MESSAGE,UserMessagePayload())
-                    user_message = None # 用户消息只写首个step，后续step（工具循环）不再重复写
+                # 组装本 step 的完整请求：用户消息（含 runtime context）落盘 +
+                # request/header 快照 + 完整消息列表（System Prompt/Reminder 置前）
+                messages = self._request_header(user_message)
+                user_message = None # 用户消息只写首个step，后续step（工具循环）不再重复写
                 # 在模型请求前强制保存session
                 self.persist_session_now()
-                response = await asyncio.wait_for(self._ask_model(),self._LLM_CALL_TIMEOUT)
+                response = await asyncio.wait_for(self._ask_model(messages),self._LLM_CALL_TIMEOUT)
 
                 # 工具调用循环前强制保存session
                 self.persist_session_now()
@@ -346,9 +395,11 @@ class ReActAgentLoop:
         return result
    
     
-    async def _ask_model(self)->LLMResponse:
+    async def _ask_model(self,messages : list[Message])->LLMResponse:
         """
         请求模型，并触发assistant/message 和 assistant/chunk事件
+        args:
+            messages: 本 step 的完整请求消息列表（由 _request_header 组装）
         return : 
             LLMResponse
         raise:
@@ -363,7 +414,7 @@ class ReActAgentLoop:
         """
         finish_emitted = False
         try:
-            async for item in self._llm_client.stream_chat(self._session.derive_messages(),self.tool_register.to_schemas()):
+            async for item in self._llm_client.stream_chat(messages,self.tool_register.to_schemas()):
                 if isinstance(item, LLMResponse):
                     response = item
                     self._session.append("assistant/message",AssistantMessageData(Message(

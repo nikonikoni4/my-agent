@@ -8,3 +8,5 @@ __pycache__
 .env
 localData/
 .pytest_cache
+lifeprismData
+lifeprismevalue

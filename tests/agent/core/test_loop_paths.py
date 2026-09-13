@@ -29,6 +29,8 @@ P12 非熔断 ExceptionGroup → step/end error（不再误记 success）+ 上�
 P13 其他未捕获异常（provider 内部 bug）→ step/end error（不再误记 success）+ 上抛
 P14 LLM 调用失败且流中未产出 finish 块 → _ask_model 补 finish_reason=error 的 chunk
 
+请求组装的用例（System Prompt / System Reminder / runtime context 的落点）见文件末尾"请求组装"一节。
+
 openai provider 的 mock 数据用例见 test_openai_provider_mock.py。
 """
 
@@ -48,8 +50,10 @@ from myagent.agent.core.provider import (
     Usage,
 )
 from myagent.agent.core.session.session import Session
+from myagent.agent.core.session.store import SessionStore
 from myagent.agent.core.session.types import SessionMetaData
 from myagent.agent.core.systemprompt.systemprompt import SystemPrompt
+from myagent.agent.core.systemprompt.types import PrompSection
 from myagent.agent.core.tool.tool import Tool
 from myagent.agent.execption import (
     LLMAuthError,
@@ -608,3 +612,188 @@ async def test_P14_调用失败且无finish块_补齐error结束块():
     chunks = records(session, "assistant/chunk")
     assert [c.data.finish_reason for c in chunks] == [None, "error"]
     assert last(session, "turn/end").data.reason_type == "error"
+
+
+# ===========================================================================
+# 请求组装：System Prompt / System Reminder / runtime context
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_请求组装_system_prompt置首位():
+    """每 step 组装的请求消息列表：第 1 位是 System Prompt（role=system），
+    其后才是会话消息面；system prompt 由 request/header 承载，不落 message 记录"""
+    loop, provider, session = make_loop([LLMResponse(content="好的", finish_reason="stop")])
+
+    await loop.turn(user_message("你好"))
+
+    seen = provider.seen_messages[0]
+    assert seen[0].role == "system"
+    assert "个人助手" in seen[0].content  # 全局 identity section
+    assert seen[1].role == "user" and seen[1].content == "你好"
+    # session 里没有 system 记录（system prompt 走 request/header）
+    msg_roles = [r.data.message.role for r in session.record_list if hasattr(r.data, "message")]
+    assert "system" not in msg_roles
+
+
+@pytest.mark.asyncio
+async def test_请求组装_system_reminder置第二位并落request_header():
+    """注册 system reminder：第 2 位是 role=user 的 <system-reminder> 包裹消息，
+    内容同时以 request/header 事件落盘（不新增 message 记录）"""
+    loop, provider, session = make_loop([LLMResponse(content="好的", finish_reason="stop")])
+    loop.system_prompt.register_system_reminder(loop.name, "请遵守编码规范")
+
+    await loop.turn(user_message("你好"))
+
+    seen = provider.seen_messages[0]
+    assert seen[0].role == "system"
+    assert seen[1].role == "user"
+    assert seen[1].content == "<system-reminder>请遵守编码规范</system-reminder>"
+    assert seen[2].content == "你好"
+    assert session.latest_request_header().system_reminder == "请遵守编码规范"
+
+
+@pytest.mark.asyncio
+async def test_请求组装_无reminder不产生第二位消息():
+    """未注册 system reminder：不产生多余的第 2 位消息，request/header 记空串"""
+    loop, provider, session = make_loop([LLMResponse(content="好的", finish_reason="stop")])
+
+    await loop.turn(user_message("你好"))
+
+    seen = provider.seen_messages[0]
+    assert [m.role for m in seen] == ["system", "user"]
+    assert session.latest_request_header().system_reminder == ""
+
+
+@pytest.mark.asyncio
+async def test_请求组装_runtime_context合并进用户消息并落盘():
+    """runtime context 作为追加文本块合并进当前用户消息，并随 user/message 落盘，
+    保证每一步的输入都可由 session 复现"""
+    loop, provider, session = make_loop([LLMResponse(content="好的", finish_reason="stop")])
+    loop.system_prompt.register_context(loop.name, "当前时间: 2026-09-12")
+
+    await loop.turn(user_message("你好"))
+
+    user_record = records(session, "user/message")[0]
+    expected = [
+        {"type": "text", "text": "你好"},
+        {"type": "text", "text": "当前时间: 2026-09-12"},
+    ]
+    assert user_record.data.message.content == expected
+    # 发给模型的消息与落盘记录一致（输入即落盘）
+    assert provider.seen_messages[0][-1].content == expected
+
+
+@pytest.mark.asyncio
+async def test_请求组装_工具循环后续step复用请求前缀():
+    """工具调用循环：user/message 只写首个 step，但每个 step 都重新组装出
+    System Prompt 置首的完整请求"""
+    loop, provider, session = make_loop(
+        [tool_round("c1"), LLMResponse(content="完成", finish_reason="stop")],
+        tools=OkTool(),
+    )
+
+    await loop.turn(user_message("你好"))
+
+    assert len(records(session, "user/message")) == 1
+    assert provider.calls == 2
+    for seen in provider.seen_messages:
+        assert seen[0].role == "system"
+    # 第二个 step 不重复发出用户消息：请求里仍只有一条 user 消息
+    assert sum(1 for m in provider.seen_messages[1] if m.role == "user") == 1
+
+
+@pytest.mark.asyncio
+async def test_请求组装_自定义提示词与落盘还原(tmp_path):
+    """自定义提示词段 + system reminder + runtime context：组装正确，
+    且落盘还原后能重建出与请求一致的消息列表（每一步输入可复现）"""
+    event_service = EventService()
+    project_path = tmp_path / "proj"
+    store = SessionStore(tmp_path / "sessions", event_service)
+    session = store.create("请求组装落盘", project_path)
+
+    system_prompt = SystemPrompt()
+    system_prompt.register_section("coder", PrompSection(name="tool_guide", order=10, text="你可以使用工具查询天气。"))
+    system_prompt.register_system_reminder("coder", "请遵守编码规范")
+    system_prompt.register_context("coder", "当前时间: 2026-09-12")
+
+    provider = ScriptedProvider([LLMResponse(content="好的", finish_reason="stop")])
+    config = SimpleNamespace(step_limit=10, max_retry_count=2)
+    loop = ReActAgentLoop(event_service, session, system_prompt, config, provider,
+                          name="coder", prompt_render_parame={})
+
+    await loop.turn(user_message("你好"))
+    session.presistence.presist()
+
+    # 组装正确：第 1 位 system（全局 + 自定义段按 order 有序），第 2 位 reminder，第 3 位用户消息
+    seen = provider.seen_messages[0]
+    assert seen[0].role == "system"
+    assert "个人助手" in seen[0].content  # 全局 identity（order=-100）
+    assert "你可以使用工具查询天气。" in seen[0].content  # 自定义段（order=10）
+    assert seen[0].content.index("个人助手") < seen[0].content.index("你可以使用工具查询天气。")
+    assert seen[1].content == "<system-reminder>请遵守编码规范</system-reminder>"
+    assert seen[2].content == [
+        {"type": "text", "text": "你好"},
+        {"type": "text", "text": "当前时间: 2026-09-12"},
+    ]
+
+    # 落盘还原：system prompt / reminder 由 request/header 承载，runtime 由 user/message 承载
+    restored = store.load(session.meta_data.session_id, project_path)
+    header_mem, header_disk = session.latest_request_header(), restored.latest_request_header()
+    assert header_disk.system_prompt == header_mem.system_prompt
+    assert header_disk.system_reminder == "请遵守编码规范"
+    assert restored.derive_messages() == session.derive_messages()
+
+    # 由落盘内容重建完整请求，应与实际发出的逐条一致（其后多出的 assistant 为模型回复）
+    rebuilt = [
+        Message(role="system", content=header_disk.system_prompt),
+        Message(role="user", content=f"<system-reminder>{header_disk.system_reminder}</system-reminder>"),
+    ]
+    rebuilt.extend(restored.derive_messages())
+    assert rebuilt[-1].role == "assistant"
+    assert [m.role for m in rebuilt[:len(seen)]] == [m.role for m in seen]
+    assert [m.content for m in rebuilt[:len(seen)]] == [m.content for m in seen]
+
+
+@pytest.mark.asyncio
+async def test_请求组装_提示词变化写change快照():
+    """更换提示词段：下一轮组装结果变化，写 reason=change 的 request/header 快照，
+    且新一轮请求以最新 system prompt 置首"""
+    loop, provider, session = make_loop([
+        LLMResponse(content="回复一", finish_reason="stop"),
+        LLMResponse(content="回复二", finish_reason="stop"),
+    ])
+
+    await loop.turn(user_message("第一轮"))
+    headers = records(session, "request/header")
+    assert len(headers) == 1 and headers[0].data.reason == "initial"
+
+    # 遮蔽全局 identity：换一段提示词，组装结果随之变化
+    loop.system_prompt.register_section(loop.name, PrompSection(name="identity", order=-100, text="你是新助手"))
+    await loop.turn(user_message("第二轮"))
+
+    headers = records(session, "request/header")
+    assert len(headers) == 2
+    assert headers[1].data.reason == "change"
+    assert "你是新助手" in headers[1].data.system_prompt
+    assert "你是新助手" in provider.seen_messages[1][0].content
+
+
+@pytest.mark.asyncio
+async def test_请求组装_多轮对话用户消息不重复发出():
+    """两轮对话：每轮各写一条 user/message，历史里的旧用户消息不重复发出"""
+    loop, provider, session = make_loop([
+        LLMResponse(content="回复一", finish_reason="stop"),
+        LLMResponse(content="回复二", finish_reason="stop"),
+    ])
+
+    await loop.turn(user_message("第一轮"))
+    await loop.turn(user_message("第二轮"))
+
+    assert [r.data.message.content for r in records(session, "user/message")] == ["第一轮", "第二轮"]
+
+    second_seen = provider.seen_messages[1]
+    # system 置首；历史按 第一轮 → 回复一 → 第二轮 只出现一次
+    assert [m.role for m in second_seen] == ["system", "user", "assistant", "user"]
+    assert sum(1 for m in second_seen if m.content == "第一轮") == 1
+    assert sum(1 for m in second_seen if m.content == "第二轮") == 1

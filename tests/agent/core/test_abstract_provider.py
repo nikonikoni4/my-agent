@@ -64,6 +64,15 @@ def test_user_message_to_dict(user_message:Message):
     }, "user 消息应只含 role 和 content 两个键"
 
 
+def test_system_message_to_dict():
+    """system 消息允许上 wire：system prompt 不落 session 的 message list，
+    而是请求时动态编排到最前面，故 wire 序列化必须放行"""
+    assert Message(role="system", content="你是一个个人助手").to_dict() == {
+        "role": "system",
+        "content": "你是一个个人助手",
+    }
+
+
 def test_assistant_toolcall_message_to_dict(assistant_toolcall_message:Message):
     """assistant 发起工具调用：content 为 None 是合法的，arguments 序列化为 JSON 字符串"""
     d = assistant_toolcall_message.to_dict()

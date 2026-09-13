@@ -38,12 +38,17 @@ class StepStartData(SessionData):
 
 @dataclass
 class RequestHeaderData(SessionData):
-    """request/header：一次 LLM 请求的配置快照，仅首次和配置变更时写入。"""
+    """request/header：一次 LLM 请求的配置快照，仅首次和配置变更时写入。
+
+    system_prompt / system_reminder 是动态编排的两段请求前缀（分别位于 Message List
+    第 1、2 位），不落 session 的 message list，由本事件承载以保证每一步输入可复现。
+    """
     reason: Literal["initial", "resume", "change"]
     model_name: str
     system_prompt: str
     tools: list[dict]  # 工具 schema 列表（Tool.to_schema() 的输出）
     params: ChatParams | None  # 采样参数，None 表示全部用供应商默认值
+    system_reminder: str = ""  # System Reminder（第 2 位消息），空表示无
 
 
 @dataclass

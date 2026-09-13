@@ -11,7 +11,7 @@ import logging
 import pytest
 
 from myagent.agent.core.systemprompt.systemprompt import SystemPrompt
-from myagent.agent.core.systemprompt.types import PrompSection
+from myagent.agent.core.systemprompt.types import ContextItem, ContextType, PrompSection
 
 
 def make_section(name: str, order: int, text: str) -> PrompSection:
@@ -87,6 +87,55 @@ def test_context_isolated_between_agents(sp):
     """测试场景：agent A 的 context 不出现在 agent B 的组装结果中"""
     sp.register_context("coder", "终端位置: /home/coder")
     assert "终端位置" not in sp.assemble("writer").context
+
+
+# ---------- 带类型标注的 context（System Reminder / Runtime） ----------
+
+def test_agent_context_stored_as_typed_items(sp):
+    """测试场景：注册的上下文以 ContextItem 存储并带正确类型标注"""
+    sp.register_context("coder", "运行时标注")
+    sp.register_system_reminder("coder", "文件读取的提醒")
+    items = sp._agent_context["coder"]
+    assert all(isinstance(it, ContextItem) for it in items)
+    assert [it.context_type for it in items] == [
+        ContextType.RUNTIME,
+        ContextType.SYSTEM_REMINDER,
+    ]
+
+
+def test_runtime_and_system_reminder_split_in_assembly(sp):
+    """测试场景：assemble 将 runtime 与 system reminder 分别落到两个字段"""
+    sp.register_context("coder", "当前时间: 2026-09-07")
+    sp.register_system_reminder("coder", "请遵守编码规范")
+    assembly = sp.assemble("coder")
+    assert "当前时间: 2026-09-07" in assembly.context
+    assert "请遵守编码规范" not in assembly.context
+    assert "请遵守编码规范" in assembly.system_reminder
+    assert "当前时间: 2026-09-07" not in assembly.system_reminder
+
+
+def test_multiple_contexts_joined_by_newline(sp):
+    """测试场景：同类多条上下文按换行拼接，保持注册顺序"""
+    sp.register_context("coder", "第一条")
+    sp.register_context("coder", "第二条")
+    sp.register_system_reminder("coder", "提醒一")
+    sp.register_system_reminder("coder", "提醒二")
+    assembly = sp.assemble("coder")
+    assert assembly.context == "第一条\n第二条"
+    assert assembly.system_reminder == "提醒一\n提醒二"
+
+
+def test_system_reminder_isolated_between_agents(sp):
+    """测试场景：agent A 的 system reminder 不出现在 agent B 的组装结果中"""
+    sp.register_system_reminder("coder", "只给 coder 的提醒")
+    assert "只给 coder 的提醒" not in sp.assemble("writer").system_reminder
+
+
+def test_unregister_removes_system_reminder(sp):
+    """测试场景：注销后 system reminder 一并清除"""
+    sp.register_system_reminder("coder", "待清除提醒")
+    sp.unregister("coder")
+    assert "待清除提醒" not in sp.assemble("coder").system_reminder
 
 
 # ---------- 注销 ----------
