@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 CSV_FILE_SUFFIX = "tool_result_stats.csv"  # 文件名为 YYYY-MM-DD-tool_result_stats.csv
-CSV_COLUMNS = ["timestamp", "date", "name", "argument", "is_error", "error_type", "content"]
+CSV_COLUMNS = ["timestamp", "date", "name", "argument", "is_error", "error_type", "content", "duration_ms"]
 DATE_FORMAT = "%Y-%m-%d"
 UNKNOWN_ERROR_TYPE = "unknown"  # 失败但未带分类时（历史数据/未分类路径）的兜底键
 
@@ -47,6 +47,7 @@ class ToolCallRecord:
     is_error: bool            # True=调用失败，False=调用成功
     error_type: str | None    # 失败分类（ToolErrorType 的值），成功为 None
     content: str              # 回喂给模型的内容（失败时为错误详情）
+    duration_ms: int | None = None  # 工具执行耗时（墙钟毫秒）；旧数据/未采集为 None
 
     def to_row(self) -> dict[str, str]:
         """转为 CSV 行（全部字段按字符串序列化）。"""
@@ -58,12 +59,14 @@ class ToolCallRecord:
             "is_error": str(self.is_error),
             "error_type": self.error_type or "",
             "content": self.content,
+            "duration_ms": "" if self.duration_ms is None else str(self.duration_ms),
         }
 
     @classmethod
     def from_row(cls, row: dict[str, str]) -> "ToolCallRecord":
         """从 CSV 行还原记录。"""
         raw_argument = row.get("argument", "")
+        raw_duration = row.get("duration_ms", "")
         return cls(
             timestamp=row.get("timestamp", ""),
             date=row.get("date", ""),
@@ -72,6 +75,7 @@ class ToolCallRecord:
             is_error=row.get("is_error", "").strip().lower() == "true",
             error_type=row.get("error_type") or None,
             content=row.get("content", ""),
+            duration_ms=int(raw_duration) if raw_duration not in ("", None) else None,
         )
 
 
@@ -154,6 +158,7 @@ class ToolEvaluate:
             is_error=payload.is_error,
             error_type=payload.error_type,
             content=payload.content,
+            duration_ms=payload.duration_ms,
         )
         self._records.setdefault(record.name, []).append(record)
         self._append_record(record)

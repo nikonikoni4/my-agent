@@ -2,6 +2,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Literal
 import json
+import time
 
 from myagent.agent.core.provider import RawToolCall
 from myagent.agent.execption import ToolValueError,ToolValidateParameterError,ToolConsecutiveFailureError
@@ -289,7 +290,7 @@ class ToolRegister:
         return ParsedToolCall(call_id=call.id, tool_name=call.name, arguments=arguments)
 
     async def execute(self, call: RawToolCall) -> ToolResult:
-        """执行一次模型发起的工具调用：解析参数 → 校验 → 执行。
+        """执行一次模型发起的工具调用：解析参数 → 校验 → 执行，并记录执行耗时。
 
         Args:
             call: 模型发起的原始工具调用，arguments 为 wire 上的 JSON 字符串
@@ -303,6 +304,15 @@ class ToolRegister:
             ToolConsecutiveFailureError: 工具触发熔断且配置了 raise_on_break
                 （人在回路入口），上抛由 loop 接住中断本 turn。
         """
+        # 计时口径：整个 execute（解析→校验→执行），即"一次工具调用换回结果的真实等待"；
+        # 成功与失败都记。熔断抛错路径不返回结果，故不填耗时（无结果可承载）。
+        started = time.perf_counter()
+        result = await self._execute(call)
+        result.duration_ms = int((time.perf_counter() - started) * 1000)
+        return result
+
+    async def _execute(self, call: RawToolCall) -> ToolResult:
+        """解析→校验→执行的实现（耗时由 execute 包裹，本方法不关心）。"""
         # 信任边界：先解析模型给的原始 arguments（纯解析，无副作用）
         parsed = self.parse_call(call)
 

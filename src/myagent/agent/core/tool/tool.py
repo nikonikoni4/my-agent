@@ -41,10 +41,13 @@ class ToolResult:
     is_error 由 error_type 派生（成功即 False），ToolRegister 依据它做熔断计数
     （失败累加、成功清零）：解析失败与执行失败同等计入，因为熔断防的是
     "模型反复调用一个工具一直出错"，模型侧写坏参数与工具侧执行失败都算。
+    duration_ms 由 ToolRegister 在执行边界测量并填充（工具实现不负责），
+    成功失败都记，供耗时观测（区分"慢在模型还是慢在工具"）。
     """
 
     content: str
     error_type: ToolErrorType | None = None
+    duration_ms: int | None = None  # 本次工具执行耗时（墙钟毫秒），由 ToolRegister 填充
 
     @property
     def is_error(self) -> bool:

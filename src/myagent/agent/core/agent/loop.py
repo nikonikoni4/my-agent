@@ -320,7 +320,7 @@ class ReActAgentLoop:
                         tool_result =  task.result()
                         # 回喂内容与截断/语法话术均由工具层产出（ToolResult.content），
                         # loop 只负责把结果按 tool_call_id 配对写回
-                        self._session.append("tool/result",ToolResultData(call_id=tool_call.id,tool_name=tool_call.name,message=Message(role="tool",content=tool_result.content,tool_call_id=tool_call.id,),is_error=tool_result.is_error),surface_op="append",source_event_seqs=[])
+                        self._session.append("tool/result",ToolResultData(call_id=tool_call.id,tool_name=tool_call.name,message=Message(role="tool",content=tool_result.content,tool_call_id=tool_call.id,),is_error=tool_result.is_error,duration_ms=tool_result.duration_ms),surface_op="append",source_event_seqs=[])
                         # 事件负载与 session 记录同源，供评估/观测订阅（如 ToolEvaluate）消费
                         self._event_service.trigger(TOOL_RESULT,ToolResultPayload(
                             tool_name=tool_call.name,
@@ -328,6 +328,7 @@ class ReActAgentLoop:
                             is_error=tool_result.is_error,
                             error_type=tool_result.error_type.value if tool_result.error_type else None,
                             content=tool_result.content,
+                            duration_ms=tool_result.duration_ms,
                         ))
                 else:
                     break # 模型不再请求工具，本轮结束（ReAct 终止条件）

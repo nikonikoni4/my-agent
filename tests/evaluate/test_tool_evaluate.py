@@ -48,7 +48,7 @@ def emit(event_service, *, name, arguments="{}", is_error=False, error_type=None
     ))
 
 
-def csv_row(day, name, *, is_error=False, error_type="", argument="{}", content=""):
+def csv_row(day, name, *, is_error=False, error_type="", argument="{}", content="", duration_ms=""):
     """按模块约定的列格式造一行 CSV 数据（用于构造跨日期固件）。"""
     return {
         "timestamp": f"{day}T10:00:00",
@@ -58,6 +58,7 @@ def csv_row(day, name, *, is_error=False, error_type="", argument="{}", content=
         "is_error": str(is_error),
         "error_type": error_type,
         "content": content,
+        "duration_ms": "" if duration_ms == "" else str(duration_ms),
     }
 
 
