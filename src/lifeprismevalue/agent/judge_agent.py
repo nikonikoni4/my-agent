@@ -1,0 +1,126 @@
+"""裁判 agent（评测的"评估方"）。
+
+角色：在 `judge.mode: model` 时上线，依据用例的 `rubric` 与导出的 `evidence`
+判断该用例通过 / 失败并给出理由。
+
+现状：骨架已接好，并把 `Judge_prompt` 注册为 System Prompt（**当前只判"产出是否满足判分要点"**）。
+后续：扩展判定内容（如工具调用顺序）；角色提示词改为从
+      `lifeprismTestData/defs/agents/judge.md` 加载；本角色只做判定，不注册记录类工具。
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+from myagent.agent.core.agent.loop import ReActAgentLoop
+from myagent.agent.core.agent.types import AgentConfig
+from myagent.agent.core.session import Session, SessionStore
+from myagent.agent.core.systemprompt import PrompSection, SystemPrompt
+from myagent.agent.llm.llm_retry import LLMRerty
+from myagent.agent.llm.openai_provider import OpenAIProvider
+from myagent.infra.events import EventService
+from myagent.infra.events.eventspec import REQUEST_ERROR
+
+from lifeprismevalue.config import get_lifeprism_data_path
+
+load_dotenv()
+
+AGENT_NAME = "judge"
+# 会话落盘根目录（gitignored）；lifeprism 数据目录编码为其下的一层项目子目录
+SESSION_FOLDER = Path("localData")
+
+MODEL = os.getenv("LIFEPRISM_MODEL", "doubao-seed-1-6-flash-250828")
+BASE_URL = os.getenv("LIFEPRISM_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3")
+
+# 裁判提示词（当前简化版：只判"产出是否满足判分要点"）。
+# 输入约定：runner 会把「判分要点 + 本次证据 + 被评估 agent 对话」拼成一条 user 消息发过来。
+Judge_prompt = """
+# role
+你是一个评测裁判。你的唯一任务是：依据「判分要点」，判断被评估 agent 本次的产出是否达标。
+
+# 输入说明
+发来的消息里会包含三段：
+1. 判分要点（rubric）：本次用例的判定标准
+2. 本次证据（evidence）：本次运行窗口内的落库 / 落盘结果（含记录内容与规则文件状态）
+3. 对话记录：被评估 agent 的 user / assistant / tool_result 消息（仅作参考）
+
+# rule
+1. **只以证据为准**，不以被评估 agent 的自我陈述为准——它说“已记录”但证据里没有，判不达标。
+2. 判分要点里的每条都要核对；关键字段不符、该记的没记、不该记的多记，都算不达标。
+3. 允许被评估 agent 用词不同，但不得偏离判分要点的实质。
+4. 只输出 JSON，不要输出任何多余文字。
+
+# 输出格式
+{"pass": true, "reason": "一句话说明依据（哪几条满足 / 不满足）"}
+"""
+
+
+def build_judge_system_prompt(agent_name: str = AGENT_NAME) -> SystemPrompt:
+    """组装裁判 agent 的 System Prompt。
+
+    把 `Judge_prompt` 注册为一个 section；注册名用 `identity` 以遮蔽全局默认的
+    「你是一个个人助手…」，避免与「评测裁判」角色冲突。
+    """
+    system_prompt = SystemPrompt()
+    system_prompt.register_section(
+        agent_name,
+        PrompSection(name="identity", order=0, text=Judge_prompt),
+    )
+    return system_prompt
+
+
+def create_judge_agent(
+    *,
+    data_path: Path | None = None,
+    session_folder: Path = SESSION_FOLDER,
+    name: str = AGENT_NAME,
+    session_id: str | None = None,
+    step_limit: int = 20,
+    max_retry_count: int = 3,
+) -> ReActAgentLoop:
+    """创建一个裁判 agent。
+
+    注意（TODO）：
+    - System Prompt 现由 `build_judge_system_prompt` 注册（`Judge_prompt`），
+      当前只判"产出是否满足判分要点"；后续扩展判定内容（工具调用顺序等）时再补。
+    - **暂不注册工具**：本角色只做判定，不记录数据。
+
+    Args:
+        data_path: lifeprism 数据根目录，默认取 lifeprismevalue.config 的配置。
+        session_folder: 会话落盘根目录；data_path 会编码为其下的一层项目子目录。
+        name: agent 名称，同时作为会话名与 SystemPrompt 注册键。
+        session_id: 传入则尝试 load 已有会话，找不到时新建。
+        step_limit: 单 turn 最大 step 数（步数兜底）。
+        max_retry_count: LLM 调用错误的最大重试次数。
+    """
+    data_path = (data_path or get_lifeprism_data_path()).resolve()
+
+    event_service = EventService()
+    llm_retry = LLMRerty()
+    event_service.register(REQUEST_ERROR.name, llm_retry.request_error_event)
+
+    store = SessionStore(session_folder, event_service)
+    session: Session | None = store.load(session_id, data_path) if session_id else None
+    if session is None:
+        session = store.create(name, data_path)
+
+    llm_client = OpenAIProvider(
+        model=MODEL,
+        api_key=os.getenv("ARK_API_KEY", ""),
+        base_url=BASE_URL,
+    )
+    agent_config = AgentConfig(step_limit=step_limit, max_retry_count=max_retry_count)
+    agent_loop = ReActAgentLoop(
+        event_service,
+        session,
+        build_judge_system_prompt(name),
+        agent_config,
+        llm_client,
+        name=name,
+    )
+    # EventService 以弱引用持有订阅者：retry 策略对象必须由外部强引用
+    agent_loop.llm_retry = llm_retry
+    return agent_loop
