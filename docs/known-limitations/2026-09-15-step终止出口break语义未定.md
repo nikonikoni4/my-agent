@@ -1,8 +1,8 @@
 ---
-version: 1.0
+version: 1.1
 created_at: 2026-09-15
 updated_at: 2026-09-15
-last_updated: 创建文档，记录 step 的 break 终止出口语义未定且当前不可达
+last_updated: 补记 dont_retry 已从策略表移除（该出口回到不可达）、更新代码位置链接
 abstract: step 中"终止但不抛异常"的 break 出口语义未定（算不算失败、终态由谁写入都不确定），当前因策略表不存在非 retry 决策而不可达；一旦新增此类决策，turn/end 会把失败的轮次记成 success
 ---
 
@@ -15,13 +15,14 @@ abstract: step 中"终止但不抛异常"的 break 出口语义未定（算不�
 | 版本 | 更新内容 |
 | ---- | -------- |
 | 1.0 | 创建文档初稿 |
+| 1.1 | 补记：`dont_retry` 档已从 `LLMRerty` 移除，策略表只剩 `retry` / `backoff_retry`，该出口回到"当前不可达"；同步代码位置链接 |
 
 ## 问题描述
 
 `ReActAgentLoop.step` 的错误处理收拢在 `finally` 中，出口有两个：
 
 - **抛出**：取消原样上抛；`request/error` 无决策时抛 `AgentUnclaimedError`（`from` 原错误）。
-- **`break`**：`_handle_error` 的返回值不是 `"retry"` 时走 `else: break`。
+- **`break`**：`_handle_error` 返回了真值决策、且该决策不属于 `RETRY_DECISIONS`（`"retry"` / `"backoff_retry"`）时 `break`；无错误（返回 `None`）不 break——正常工具循环靠 try 内"无工具调用"那条 break 收敛。
 
 第二个出口的**语义未定**：
 
@@ -40,18 +41,18 @@ abstract: step 中"终止但不抛异常"的 break 出口语义未定（算不�
 
 **策略表（`LLMRerty`）中不存在会返回"非 `retry` 真值决策"的条目。**
 
-具体地：`dont_retry` 一类条目将被全部移除，于是 `_handle_error` 的返回值只可能是：
+具体地：`dont_retry` 一类条目已全部移除，于是 `_handle_error` 的返回值只可能是：
 
 - `None` —— 本轮无错误（正常结束），以及
-- `"retry"` —— 继续下一轮。
+- `"retry"` / `"backoff_retry"` —— 继续下一轮。
 
-两者都不会命中 `else: break` 的"终止"含义，因此该出口目前**只承担"无错误、退出循环"**这一含义。
+两者都不会命中 `break` 的"终止"含义，因此该出口目前**不可达**。
 
-> 为什么移除 `dont_retry`：认证 / 模型 / 接入点这类配置错误，本 turn 内重试不会变好；应明确停止、让用户去改配置，而不是"放过这条、继续下一条"。
+> 为什么移除 `dont_retry`：认证 / 模型 / 接入点这类配置错误，本 turn 内重试不会变好；应明确停止、让用户去改配置，而不是"放过这条、继续下一条"。移除后这类错误落到无人认领 → 抛 `AgentUnclaimedError` 停止本 turn。
 
 ## 触发条件
 
-策略表新增任意一个"**决定终止、但不抛异常**"的决策值（例如恢复 `dont_retry`，或新增 `give_up`），`else: break` 立刻成为真正的终止出口。届时需要一并补上：
+策略表新增任意一个"**决定终止、但不抛异常**"的决策值（例如恢复 `dont_retry`，或新增 `give_up`），该 `break` 立刻成为真正的终止出口。届时需要一并补上：
 
 - `turn` 如何得知本轮终止（异常之外的第二条通路）；
 - `turn/end` 的 `reason_type` 取值规则。
@@ -69,4 +70,4 @@ abstract: step 中"终止但不抛异常"的 break 出口语义未定（算不�
 
 - 决策依据：[session 错误信息记录策略](..\adr\2026-09-15-session错误信息记录策略.md)（终态记录形态：类别 + 异常链文本）
 - 相关决策：[异常分类树新增策略域与未知域](..\adr\2026-09-15-异常分类树新增策略域与未知域.md)、[LLM 错误处理分类策略](..\adr\2026-09-09-LLM错误处理分类策略.md)
-- 代码位置：[loop.py - step 的 finally 与 break](file:///d:/desktop/软件开发/agent/src/myagent/agent/core/agent/loop.py#L216-L231)、[loop.py - turn 的终态记录（依赖异常）](file:///d:/desktop/软件开发/agent/src/myagent/agent/core/agent/loop.py#L102-L120)
+- 代码位置：[loop.py - step 的 finally 与 break](file:///d:/desktop/软件开发/agent/src/myagent/agent/core/agent/loop.py#L538-L549)、[loop.py - turn 的终态记录（依赖异常）](file:///d:/desktop/软件开发/agent/src/myagent/agent/core/agent/loop.py#L340-L361)

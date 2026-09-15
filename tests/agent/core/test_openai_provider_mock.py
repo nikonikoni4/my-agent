@@ -3,7 +3,8 @@
 覆盖：
 O1  stream_chat：mock 流式 chunk 聚合（正文 / 推理 / 工具调用碎片 / usage / finish）
 O2  _classify_openai_error：SDK 异常按状态码与响应体关键词映射到 execption 分类树
-O3  stream_chat：SDK 异常翻译后抛出（调用方按 LLMCallError 分类接住）
+O3  stream_chat：SDK 异常翻译后抛出，并以 raise ... from 带上原始 SDK 异常（原因链在
+    调用点建立，分类函数本身不设 cause）
 O4  _retry_after：从响应头提取服务端建议的重试等待秒数
 
 现有 test_openai_provider.py 覆盖 chat() 的非流式解析与 length 截断标记，本文件不重复。
@@ -189,7 +190,6 @@ def test_O2_SDK异常分类映射(factory, expected):
 
     assert isinstance(classified, expected)
     assert isinstance(classified, LLMCallError), "分类结果必须落在 LLMCallError 分类树内"
-    assert classified.__cause__ is error, "保留原始 SDK 异常便于排查"
     assert classified.details.get("http_status") == getattr(error, "status_code", None)
 
 
@@ -200,7 +200,8 @@ def test_O2_SDK异常分类映射(factory, expected):
 
 @pytest.mark.asyncio
 async def test_O3_stream_chat_SDK异常翻译后抛出():
-    """流式调用中 SDK 抛错：翻译为分类树子类后抛出（loop 侧按 LLMCallError 接住走重试决策）"""
+    """流式调用中 SDK 抛错：翻译为分类树子类后抛出（loop 侧按 LLMCallError 接住走重试决策），
+    并以 raise ... from e 保留原始 SDK 异常便于排查"""
     provider = make_provider()
     provider._client.chat.completions.create = AsyncMock(
         side_effect=_status_error(
@@ -209,9 +210,11 @@ async def test_O3_stream_chat_SDK异常翻译后抛出():
         )
     )
 
-    with pytest.raises(LLMRateLimitError):
+    with pytest.raises(LLMRateLimitError) as excinfo:
         async for _ in provider.stream_chat([Message(role="user", content="hi")]):
             pass
+
+    assert isinstance(excinfo.value.__cause__, openai.RateLimitError)
 
 
 # ---------------------------------------------------------------------------

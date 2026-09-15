@@ -2,8 +2,10 @@
 
 覆盖（对应 架构设计/工具调用.md 的决策点）：
 1. raise_on_break 工具触发熔断 → ToolConsecutiveFailureError 经 TaskGroup 以
-   ExceptionGroup 上抛，loop 接住：记录 request/error、终止本 turn、不外抛
-2. step_limit 兜底：工具未配置熔断时，达到最大步数强制终止 while True
+   ExceptionGroup 上抛，loop 触发一次 request/error；无人认领 → 抛
+   AgentUnclaimedError（cause 为该 group），turn/end 记 error
+2. step_limit 兜底：工具未配置熔断时，达到最大步数抛 MaxStepsExceededError，
+   它同样无人认领 → AgentUnclaimedError（cause 为 MaxStepsExceededError）
 3. schema_hide 熔断后下一次请求的 schema 不含该工具（request/header 记
    reason=change）；turn/end 事件清空熔断状态，工具恢复
 """
@@ -25,7 +27,11 @@ from myagent.agent.core.session.session import Session
 from myagent.agent.core.session.types import SessionMetaData
 from myagent.agent.core.systemprompt.systemprompt import SystemPrompt
 from myagent.agent.core.tool.tool import Tool
-from myagent.agent.execption import ToolConsecutiveFailureError
+from myagent.agent.execption import (
+    AgentUnclaimedError,
+    MaxStepsExceededError,
+    ToolConsecutiveFailureError,
+)
 from myagent.infra.events.eventspec import REQUEST_ERROR
 from myagent.infra.events.service import EventService
 
@@ -108,51 +114,67 @@ def user_message(text="你好"):
     return Message(role="user", content=text)
 
 
+def leaves(error) -> list[BaseException]:
+    """展开 ExceptionGroup，取出全部叶子异常（TaskGroup 抛出的 group 需要它才能断言内层）。"""
+    if isinstance(error, BaseExceptionGroup):
+        return [leaf for child in error.exceptions for leaf in leaves(child)]
+    return [error]
+
+
 @pytest.mark.asyncio
-async def test_熔断抛错记入step_error_触发一次request_error后循环继续():
-    """raise_on_break 工具第 5 次失败触发熔断抛错：loop 只记入 step_error 并触发
-    一次 request/error（waterfall 控制信号挂点），不终止循环；turn 由模型收敛结束"""
+async def test_熔断抛错_无人认领上抛():
+    """raise_on_break 工具第 5 次失败触发熔断抛错：经 TaskGroup 以 ExceptionGroup 上抛，
+    loop 触发一次 request/error（订阅方不给出决策）→ 抛 AgentUnclaimedError，cause 为该 group"""
     tool = FlakyTool(max_consecutive_failures=5, raise_on_break=True)
-    # 5 轮工具调用（第 5 轮触发熔断抛错），第 6 轮模型返回纯文本收敛结束
-    rounds = [tool_round(f"call_{i}") for i in range(5)] + [text_round("工具不可用了")]
+    rounds = [tool_round(f"call_{i}") for i in range(5)]
     loop, provider, _ = make_loop(tool, rounds, step_limit=20)
 
     errors = []
     # REQUEST_ERROR 是 waterfall 语义事件，回调需接受 (payload, next) 两个参数，
-    # 并按契约返回决策（loop 消费 {"decision": ...} 控制信号）；
+    # 并按契约返回决策（loop 消费 {"decision": ...} 控制信号）；返回 None 表示无人认领
     # 必须用具名局部函数注册（EventService 弱引用 lambda 会立即失效）
     def on_error(payload, nxt):
         errors.append(payload.error_type)
-        return {"decision": "dont_retry"}
+        return None
+
     loop._event_service.register(REQUEST_ERROR.name, on_error)
 
-    await loop.turn(user_message("触发熔断"))  # 不外抛，turn 正常返回
+    with pytest.raises(AgentUnclaimedError) as excinfo:
+        await loop.turn(user_message("触发熔断"))
 
-    # 抛错后循环继续：第 6 次模型请求拿到纯文本，turn 正常收敛
-    assert provider.calls == 6, "熔断抛错不应终止循环，第 6 次请求应正常发生"
-    # 一次错误只触发一次 request/error（不因后续轮次重复触发）
+    # 第 5 次工具调用触发熔断：抛错即终止本 turn，不再有第 6 次模型请求
+    assert provider.calls == 5
+    # 一次错误只触发一次 request/error
     assert len(errors) == 1
-    assert isinstance(errors[0], ToolConsecutiveFailureError)
+    assert isinstance(errors[0], ExceptionGroup)
+    assert [type(e) for e in leaves(errors[0])] == [ToolConsecutiveFailureError]
+    assert excinfo.value.__cause__ is errors[0]
 
 
 @pytest.mark.asyncio
-async def test_步数兜底_未配置熔断时达到上限强制终止():
-    """工具未配置熔断（None）：连续失败不熔断，由 step_limit 强制终止 while True"""
+async def test_步数兜底_未配置熔断时达到上限上抛():
+    """工具未配置熔断（None）：连续失败不熔断，由 step_limit 兜底——抛
+    MaxStepsExceededError，它同样无人认领 → AgentUnclaimedError（cause 为前者）"""
     tool = FlakyTool()  # max_consecutive_failures=None
     rounds = [tool_round(f"call_{i}") for i in range(20)]
     loop, provider, _ = make_loop(tool, rounds, step_limit=5)
 
     errors = []
+
     def on_error(payload, nxt):
         errors.append(payload.error_type)
-        return {"decision": "dont_retry"}
+        return None
+
     loop._event_service.register(REQUEST_ERROR.name, on_error)
 
-    await loop.turn(user_message("测试步数兜底"))
+    with pytest.raises(AgentUnclaimedError) as excinfo:
+        await loop.turn(user_message("测试步数兜底"))
 
     assert provider.calls == 5, "恰好执行 step_limit 次模型请求后强制终止"
     assert len(errors) == 1
+    assert isinstance(errors[0], MaxStepsExceededError)
     assert "达到最大步数" in str(errors[0])
+    assert excinfo.value.__cause__ is errors[0]
 
 
 @pytest.mark.asyncio

@@ -3,31 +3,40 @@
 本文件顶部穷举当前 loop 的所有出路，随后每个出路至少一条用例。
 术语：一条"出路"= 一次 turn/step 结束并落盘一条终态记录（step/end / turn/end）的路径。
 
+本轮重构后 step 只有 2 个 except（取消 / 兜底，均只收集异常）+ 1 个 finally
+（补全 → 记账 → 决策），终止统一以"抛出"表达，turn 由 except 得知终态。
+
 == 入口 / 调度层 ==
 E1  start() 启动后台循环（整个 loop 一个 task）；send 把消息写入 inbox["next_turn"] 并唤醒
 E2  _loop 被唤醒后按序执行 turn 并消费 inbox（next_step 优先于 next_turn）
-E3  _on_loop_done：loop 因未归一化异常终止 → logger.error 留痕（防止静默失败）
+E3  loop 因异常终止 → 异常留在 loop task 上（由调用方取回，不静默丢弃），循环停止
 E4  cancel() 打断在途 turn 并结束循环：step/turn 记 interrupted，取消传播到 _loop 后
-    被消化（记 warning + break），loop task 正常结束、无 error 日志
-E5  cancel() 落在空闲等待时：同样记 warning + break 结束循环；之后 send() 按需重启循环
+    被消化（break），loop task 正常结束
+E5  cancel() 落在空闲等待时：同样 break 结束循环；之后 send() 按需重启循环
 
-== turn/step 层：收敛为 StepOut（不上抛） ==
+== 正常收敛（不外抛） ==
 P1  模型不再请求工具 → step/end success，turn/end success
 P2  工具循环正常收敛（工具调用 → 结果回喂 → 收敛）→ success
 P3  工具执行失败被工具层兜底（功能降级）→ 回喂错误结果，不上抛 → success
 P4  参数 JSON 解析失败 → 回喂带 hint 结果，不上抛 → success
-P5  用户取消（模型调用挂起）→ step/end、turn/end 记 interrupted，取消原样上抛
-P6  达到 step_limit → 在下一轮 step/start 前拦截并终止，turn/end error（已执行的步各自 success）
 
-== turn/step 层：异常上抛（经 except 归一化终态后继续上抛） ==
-P7  LLM 调用超时（TimeoutError）→ request/error 无人认领 → LLmError 上抛
-P8  LLMCallError 细分 dont_retry → 不终止、无等待重试，最终 step_limit 收口 error
-P9  LLMCallError 细分 backoff_retry → 记 llm/retry + 退避，超限收口 error
-P10 LLMCallError 基类（未细分）→ 无人认领 → LLmError 上抛
+== 终止出口（统一抛出） ==
+P5  用户取消（模型调用挂起）→ step/end、turn/end 记 interrupted，取消原样上抛
+P6  达到 step_limit → MaxStepsExceededError 无人认领 → AgentUnclaimedError（cause 为前者）
+P7  LLM 调用超时（TimeoutError）→ 无人认领 → AgentUnclaimedError
+P8  401 认证失败（配置类错误，策略表不再覆盖）→ 无人认领 → AgentUnclaimedError，不等待
+P9  429 限流 backoff_retry → 记 llm/retry + 退避；超限 → RetryExhaustedError（cause 为限流）
+P10 LLMCallError 基类（来源未细分）→ 无人认领 → AgentUnclaimedError
 P11 工具熔断 raise_on_break → ToolConsecutiveFailureError（经 ExceptionGroup）→ 无人认领 → 上抛
-P12 非熔断 ExceptionGroup → step/end error（不再误记 success）+ 上抛
-P13 其他未捕获异常（provider 内部 bug）→ step/end error（不再误记 success）+ 上抛
-P14 LLM 调用失败且流中未产出 finish 块 → _ask_model 补 finish_reason=error 的 chunk
+P12 非熔断 ExceptionGroup → 无人认领 → AgentUnclaimedError（cause 为 group）
+P13 provider 内部 bug（RuntimeError）→ 无人认领 → AgentUnclaimedError（cause 为 RuntimeError）
+P14 流中途失败：不补 finish 块（provider 只在正常结束产 finish），异常上抛
+
+== 记录形态 ==
+R1  每次失败都在发生点落 llm/retry（unclaimed / exhausted 也落），含 error_type + 异常链文本
+R2  异常链文本：逐层缩进、限深 3 层（超出显式标注）、展开 ExceptionGroup
+R3  step_opened：预算在开步前拒绝的那一轮不写 step/end（step/start 与 step/end 严格配对）
+R4  补全：异常打断工具调用时补齐占位 tool/result（is_error=True），避免非法消息面
 
 请求组装的用例（System Prompt / System Reminder / runtime context 的落点）见文件末尾"请求组装"一节。
 
@@ -35,12 +44,11 @@ openai provider 的 mock 数据用例见 test_openai_provider_mock.py。
 """
 
 import asyncio
-import logging
 from types import SimpleNamespace
 
 import pytest
 
-from myagent.agent.core.agent.loop import ReActAgentLoop
+from myagent.agent.core.agent.loop import ReActAgentLoop, _format_error_chain
 from myagent.agent.core.provider import (
     LLMProvider,
     LLMResponse,
@@ -56,17 +64,17 @@ from myagent.agent.core.systemprompt.systemprompt import SystemPrompt
 from myagent.agent.core.systemprompt.types import PrompSection
 from myagent.agent.core.tool.tool import Tool
 from myagent.agent.execption import (
+    AgentUnclaimedError,
     LLMAuthError,
     LLMCallError,
     LLMRateLimitError,
-    LLmError,
+    MaxStepsExceededError,
+    RetryExhaustedError,
     ToolConsecutiveFailureError,
 )
 from myagent.agent.llm.llm_retry import LLMRerty
 from myagent.infra.events.eventspec import REQUEST_ERROR
 from myagent.infra.events.service import EventService
-
-LOOP_LOGGER = "myagent.agent.core.agent.loop"
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +216,13 @@ def last(session, record_type):
     return records(session, record_type)[-1]
 
 
+def leaves(error) -> list[BaseException]:
+    """展开 ExceptionGroup，取出全部叶子异常（TaskGroup 抛出的 group 需要它才能断言内层）。"""
+    if isinstance(error, BaseExceptionGroup):
+        return [leaf for child in error.exceptions for leaf in leaves(child)]
+    return [error]
+
+
 def user_message(text="你好"):
     return Message(role="user", content=text)
 
@@ -283,52 +298,52 @@ async def test_E2_loop优先消费next_step():
 
 
 @pytest.mark.asyncio
-async def test_E3_on_loop_done_异常终止记error日志(caplog):
-    """loop 因未归一化异常终止时 _on_loop_done 取回异常并 logger.error，避免静默失败"""
+async def test_E3_loop异常终止_异常留在task上不静默():
+    """loop 内的异常不就地吞掉：turn 归一化终态后原样上抛，_loop 只消化取消，
+    故异常留在 loop task 上（调用方取回），循环随之停止、不再消费后续消息"""
     loop, provider, session = make_loop([RuntimeError("provider boom")])
     loop_task = loop.start()
     try:
-        with caplog.at_level(logging.ERROR, logger=LOOP_LOGGER):
-            await loop.send("你好", "next_turn")
-            await wait_until(lambda: "agent loop 任务异常终止" in caplog.text)
-        assert "provider boom" in caplog.text
+        await loop.send("你好", "next_turn")
+        await wait_until(lambda: loop_task.done())
+        error = loop_task.exception()
+        assert isinstance(error, AgentUnclaimedError)
+        assert isinstance(error.__cause__, RuntimeError)
+        assert "provider boom" in str(error.__cause__)
+        assert provider.calls == 1, "异常终止后循环停止，不再调模型"
+        assert last(session, "turn/end").data.reason_type == "error"
     finally:
         await shutdown(loop, loop_task)
 
 
 @pytest.mark.asyncio
-async def test_E4_cancel打断在途turn并结束循环(caplog):
+async def test_E4_cancel打断在途turn并结束循环():
     """cancel() 在途取消：step/turn 记 interrupted，取消传播到 _loop 后被消化
-    （记 warning + break），loop task 正常结束、无 error 日志"""
+    （break），loop task 正常结束"""
     loop, provider, session = make_loop(["hang"])
     loop_task = loop.start()
-    with caplog.at_level(logging.WARNING, logger=LOOP_LOGGER):
-        await loop.send("取消我", "next_turn")
-        await wait_until(lambda: records(session, "step/start"))
-        loop.cancel()
-        await asyncio.gather(loop_task, return_exceptions=True)
+    await loop.send("取消我", "next_turn")
+    await wait_until(lambda: records(session, "step/start"))
+    loop.cancel()
+    await asyncio.gather(loop_task, return_exceptions=True)
     assert last(session, "step/end").data.reason_type == "interrupted"
     assert last(session, "turn/end").data.reason_type == "interrupted"
     assert loop_task.done(), "cancel() 应打断循环"
     assert loop_task.cancelled() is False, "取消在 _loop 内被消化，任务应以正常结束收场"
-    assert "打断循环" in caplog.text
-    assert "agent loop 任务异常终止" not in caplog.text, "取消已按 interrupted 收口，不应报异常"
 
 
 @pytest.mark.asyncio
-async def test_E5_空闲态cancel结束循环_可重启(caplog):
+async def test_E5_空闲态cancel结束循环_可重启():
     """loop 空闲（挂在 _wakeup.wait()）时 cancel()：同样打断循环、任务正常结束；
     之后再 send() 会按需重启循环并正常处理消息"""
     loop, provider, session = make_loop([LLMResponse(content="你好", finish_reason="stop")])
     loop_task = loop.start()
     try:
         await asyncio.sleep(0)  # 让 _loop 先启动并挂到等待上（否则取消会落在"未启动"的协程上）
-        with caplog.at_level(logging.WARNING, logger=LOOP_LOGGER):
-            loop.cancel()
-            await asyncio.gather(loop_task, return_exceptions=True)
+        loop.cancel()
+        await asyncio.gather(loop_task, return_exceptions=True)
         assert loop_task.done(), "空闲态 cancel() 也应结束 loop"
         assert loop_task.cancelled() is False, "取消在 _loop 内被消化，任务应以正常结束收场"
-        assert "打断循环" in caplog.text
         assert provider.calls == 0
         # cancel 后 loop 仍可用：send 自动重启循环
         await loop.send("你好", "next_turn")
@@ -341,7 +356,7 @@ async def test_E5_空闲态cancel结束循环_可重启(caplog):
 
 
 # ===========================================================================
-# turn/step 层：收敛为 StepOut（不上抛）
+# 正常收敛（不外抛）
 # ===========================================================================
 
 
@@ -450,82 +465,93 @@ async def test_P5_用户取消_step与turn记interrupted后上抛():
     assert task.cancelled() is True, "取消原样上抛，task 应处于 cancelled"
     assert last(session, "step/end").data.reason_type == "interrupted"
     assert last(session, "turn/end").data.reason_type == "interrupted"
-    assert last(session, "turn/end").data.reason_text == "用户手动取消"
+    assert last(session, "turn/end").data.reason_text == "用户主动打断"
 
 
 @pytest.mark.asyncio
-async def test_P6_达到step_limit_强制终止记error():
-    """工具一直成功但模型每轮都继续请求工具：达到 step_limit 强制终止，turn/end 记 error
+async def test_P6_达到step_limit_无人认领上抛记error():
+    """工具一直成功但模型每轮都继续请求工具：达到 step_limit 强制终止。
 
-    step_limit 在下一轮 step/start 之前拦截并 break，因此不存在对应"超限"这一轮的
-    step/end；已执行的 step_limit 步各自正常结束（success），超限只体现在 turn/end。
+    预算检查在开步之前，故超限那一轮没有 step/start、也不写 step/end；已执行的
+    step_limit 步各自 success，超限经无人认领上抛（cause 为 MaxStepsExceededError），
+    turn/end 记 error。
     """
     script = [tool_round(f"c{i}") for i in range(3)]
     loop, provider, session = make_loop(script, tools=OkTool(), step_limit=3)
 
-    await loop.turn(user_message())
+    with pytest.raises(AgentUnclaimedError) as excinfo:
+        await loop.turn(user_message())
 
     assert provider.calls == 3, "恰好执行 step_limit 次模型请求后强制终止"
     assert [r.data.reason_type for r in records(session, "step/end")] == ["success"] * 3
+    assert isinstance(excinfo.value.__cause__, MaxStepsExceededError)
     assert last(session, "turn/end").data.reason_type == "error"
     assert "达到最大步数" in last(session, "turn/end").data.reason_text
 
 
 # ===========================================================================
-# turn/step 层：异常上抛
+# 终止出口：异常上抛（step/turn 均先归一化终态）
 # ===========================================================================
 
 
 @pytest.mark.asyncio
 async def test_P7_LLM调用超时_无人认领上抛且stepend记error():
-    """等待模型超时（TimeoutError）：request/error 无人认领 → LLmError 上抛；
-    step/end 与 turn/end 都必须记 error（修复前 step/end 会误记 success/缺失）"""
+    """等待模型超时（TimeoutError）：request/error 无人认领 → AgentUnclaimedError 上抛；
+    step/end 与 turn/end 都必须记 error"""
     loop, provider, session = make_loop(["hang"])
     loop._LLM_CALL_TIMEOUT = 0.01
 
-    with pytest.raises(LLmError):
+    with pytest.raises(AgentUnclaimedError) as excinfo:
         await loop.turn(user_message("超时"))
 
+    assert isinstance(excinfo.value.__cause__, TimeoutError)
     assert last(session, "step/end").data.reason_type == "error"
     assert last(session, "turn/end").data.reason_type == "error"
 
 
 @pytest.mark.asyncio
-async def test_P8_dont_retry_不等待重试_由step_limit收口():
-    """401 认证失败属 dont_retry：不等待、不记 llm/retry，控制流回到循环顶部再调模型，
-    直到 step_limit 兜底终止并记 error"""
+async def test_P8_认证失败无人认领_不等待直接终止():
+    """401 认证失败属配置类错误：策略表已无对应档 → waterfall 无决策 → 记一条
+    llm/retry(unclaimed) 后抛 AgentUnclaimedError；不重试、不退避，模型只调一次"""
     strategy = LLMRerty()  # 强引用，保证弱引用注册有效
     script = [LLMAuthError("401 认证失败") for _ in range(3)]
     loop, provider, session = make_loop(script, step_limit=2, retry_strategy=strategy)
+    waits = install_recording_delay(loop)
 
-    await loop.turn(user_message())
+    with pytest.raises(AgentUnclaimedError) as excinfo:
+        await loop.turn(user_message())
 
-    assert provider.calls == 2, "dont_retry 不终止，重试到 step_limit"
-    assert records(session, "llm/retry") == [], "dont_retry 不记重试记录"
+    assert provider.calls == 1, "配置类错误不再继续下一次调用"
+    assert isinstance(excinfo.value.__cause__, LLMAuthError)
+    assert waits == [], "不重试就不退避"
+    retry_records = records(session, "llm/retry")
+    assert [r.data.reason for r in retry_records] == ["unclaimed"]
+    assert retry_records[0].data.error_type == "LLMAuthError"
     assert last(session, "turn/end").data.reason_type == "error"
-    assert "达到最大步数" in last(session, "turn/end").data.reason_text
 
 
 @pytest.mark.asyncio
-async def test_P9_backoff_retry_记记录并退避_超限收口error():
-    """429 限流属 backoff_retry：每次决策记 llm/retry 并退避；达到上限后收口 error，
-    reason_text 保留重试档位与原始错误"""
+async def test_P9_backoff_retry_记记录并退避_超限上抛error():
+    """429 限流属 backoff_retry：每次决策记 llm/retry 并退避；超过上限后抛
+    RetryExhaustedError（cause 为限流），turn/end 的 reason_text 保留重试档位与原始错误"""
     strategy = LLMRerty()
     script = [LLMRateLimitError("429 限流") for _ in range(3)]
     loop, provider, session = make_loop(script, max_retry_count=2, retry_strategy=strategy)
     waits = install_recording_delay(loop)
 
-    await loop.turn(user_message())
+    with pytest.raises(RetryExhaustedError) as excinfo:
+        await loop.turn(user_message())
 
     assert provider.calls == 3, "上限 2 次重试后第 3 次失败即耗尽"
+    assert isinstance(excinfo.value.__cause__, LLMRateLimitError)
     retry_records = records(session, "llm/retry")
-    assert len(retry_records) == 2
-    assert [r.data.retry_count for r in retry_records] == [1, 2]
-    assert all(r.data.reason == "backoff_retry" for r in retry_records)
-    assert len(waits) == 2, "两次重试各退避一次"
-    assert [r.data.reason_type for r in records(session, "step/end")] == [
-        "success", "success", "error"
-    ], "中间轮次的重试不算 error"
+    assert [r.data.reason for r in retry_records] == [
+        "backoff_retry", "backoff_retry", "exhausted"
+    ], "两次重试 + 一次耗尽，都在发生点落记录"
+    assert [r.data.retry_count for r in retry_records] == [1, 2, 2]
+    assert len(waits) == 2, "两次重试各退避一次（耗尽不再等待）"
+    assert [r.data.reason_type for r in records(session, "step/end")] == ["error"] * 3, \
+        "每次失败的尝试各占一步，各记 error"
     assert last(session, "turn/end").data.reason_type == "error"
     assert "2/2" in last(session, "turn/end").data.reason_text
     assert "429 限流" in last(session, "turn/end").data.reason_text
@@ -533,13 +559,14 @@ async def test_P9_backoff_retry_记记录并退避_超限收口error():
 
 @pytest.mark.asyncio
 async def test_P10_LLMCallError基类_无人认领上抛():
-    """来源未细分的 LLMCallError：策略注册表不匹配 → waterall 无决策 → LLmError 上抛"""
+    """来源未细分的 LLMCallError：策略注册表不匹配 → waterfall 无决策 → AgentUnclaimedError 上抛"""
     strategy = LLMRerty()
     loop, provider, session = make_loop([LLMCallError("未知来源错误")], retry_strategy=strategy)
 
-    with pytest.raises(LLmError):
+    with pytest.raises(AgentUnclaimedError) as excinfo:
         await loop.turn(user_message())
 
+    assert isinstance(excinfo.value.__cause__, LLMCallError)
     assert last(session, "step/end").data.reason_type == "error"
     assert last(session, "turn/end").data.reason_type == "error"
 
@@ -547,7 +574,7 @@ async def test_P10_LLMCallError基类_无人认领上抛():
 @pytest.mark.asyncio
 async def test_P11_工具熔断抛错_经ExceptionGroup上抛():
     """raise_on_break 工具连续失败触发熔断抛错：经 TaskGroup 以 ExceptionGroup 上抛，
-    loop 识别并触发一次 request/error；订阅方不给出决策 → LLmError 上抛"""
+    loop 触发一次 request/error；订阅方不给出决策 → AgentUnclaimedError 上抛（cause 为 group）"""
     errors = []
 
     def on_error(payload, nxt):
@@ -559,19 +586,21 @@ async def test_P11_工具熔断抛错_经ExceptionGroup上抛():
     loop, provider, session = make_loop(script, tools=tool, step_limit=20)
     loop._event_service.register(REQUEST_ERROR.name, on_error)
 
-    with pytest.raises(LLmError):
+    with pytest.raises(AgentUnclaimedError) as excinfo:
         await loop.turn(user_message())
 
     assert len(errors) == 1, "一次错误只触发一次 request/error"
-    assert isinstance(errors[0], ToolConsecutiveFailureError)
+    assert isinstance(errors[0], ExceptionGroup), "熔断错经 TaskGroup 上抛，外层是 group"
+    assert [type(e) for e in leaves(errors[0])] == [ToolConsecutiveFailureError]
+    assert errors[0] is excinfo.value.__cause__
     assert last(session, "step/end").data.reason_type == "error"
     assert last(session, "turn/end").data.reason_type == "error"
 
 
 @pytest.mark.asyncio
-async def test_P12_非熔断ExceptionGroup_stepend不再误记success():
-    """工具执行抛出非熔断异常（经 TaskGroup 包成 ExceptionGroup）：loop 原样上抛，
-    但 step/end 必须先归一化为 error（修复前会被 finally 记成 success）"""
+async def test_P12_非熔断ExceptionGroup_无人认领上抛():
+    """工具执行抛出非熔断异常（经 TaskGroup 包成 ExceptionGroup）：无人认领 → 抛
+    AgentUnclaimedError，cause 保留原始 group"""
     loop, provider, session = make_loop([tool_round("c1")], tools=OkTool())
 
     async def boom(call):
@@ -579,39 +608,128 @@ async def test_P12_非熔断ExceptionGroup_stepend不再误记success():
 
     loop.tool_register.execute = boom
 
-    with pytest.raises(ExceptionGroup):
+    with pytest.raises(AgentUnclaimedError) as excinfo:
         await loop.turn(user_message())
 
+    assert [type(e) for e in leaves(excinfo.value.__cause__)] == [RuntimeError]
     assert last(session, "step/end").data.reason_type == "error"
     assert last(session, "turn/end").data.reason_type == "error"
 
 
 @pytest.mark.asyncio
-async def test_P13_其他未捕获异常_stepend不再误记success():
-    """provider 内部 bug（非 LLMCallError）穿透 step 的 except 链：走新增兜底分支，
-    step/end 记 error 并原样上抛，turn/end 同步记 error"""
+async def test_P13_其他未捕获异常_无人认领上抛():
+    """provider 内部 bug（非 LLMCallError）穿透 step 的 except 链：step/end 记 error，
+    无人认领后以 AgentUnclaimedError 上抛（cause 为原异常），turn/end 同步记 error"""
     loop, provider, session = make_loop([RuntimeError("provider boom")])
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(AgentUnclaimedError) as excinfo:
         await loop.turn(user_message())
 
+    assert isinstance(excinfo.value.__cause__, RuntimeError)
     assert last(session, "step/end").data.reason_type == "error"
     assert last(session, "turn/end").data.reason_type == "error"
 
 
 @pytest.mark.asyncio
-async def test_P14_调用失败且无finish块_补齐error结束块():
-    """流中途失败且未产出 finish 块：_ask_model 补一个 finish_reason=error 的 chunk，
-    使日志上可区分"正常结束"与"调用失败"；异常仍上抛"""
+async def test_P14_流中途失败_不补finish块():
+    """流中途失败：provider 只在流正常结束时产出 finish 块（见 openai_provider），
+    失败时该块自然缺失——session 上只剩半截 content chunk，以此区分"正常结束"与
+    "调用失败"；异常经无人认领上抛"""
     script = [[StreamChunk(content="半截"), LLMCallError("连接断了")]]
     loop, provider, session = make_loop(script)
 
-    with pytest.raises(LLmError):
+    with pytest.raises(AgentUnclaimedError) as excinfo:
         await loop.turn(user_message())
 
+    assert isinstance(excinfo.value.__cause__, LLMCallError)
     chunks = records(session, "assistant/chunk")
-    assert [c.data.finish_reason for c in chunks] == [None, "error"]
+    assert [c.data.finish_reason for c in chunks] == [None], "失败时没有 finish 块"
     assert last(session, "turn/end").data.reason_type == "error"
+
+
+# ===========================================================================
+# 记录形态：发生点记账 / 异常链文本 / step 配对 / 消息面补全
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_R1_耗尽也在发生点落llm_retry():
+    """决定终止的那一次失败同样可结构化查询：llm/retry 记下 reason、error_type 与异常链文本"""
+    strategy = LLMRerty()
+    script = [LLMRateLimitError("429 限流") for _ in range(3)]
+    loop, provider, session = make_loop(script, max_retry_count=1, retry_strategy=strategy)
+    install_recording_delay(loop)
+
+    with pytest.raises(RetryExhaustedError):
+        await loop.turn(user_message())
+
+    retry_records = records(session, "llm/retry")
+    assert [r.data.reason for r in retry_records] == ["backoff_retry", "exhausted"]
+    assert all(r.data.error_type == "LLMRateLimitError" for r in retry_records)
+    assert all("429 限流" in r.data.error_message for r in retry_records)
+
+
+def test_R2_异常链文本_逐层缩进_限深3层_展开group():
+    """_format_error_chain：逐层缩进输出；超过 3 层显式标注截断（不静默丢弃）；
+    ExceptionGroup 展开其成员（TaskGroup 的 group 其 __cause__ 为空，只能从 exceptions 取）"""
+    deep: BaseException = RuntimeError("第4层")
+    for i in (3, 2, 1):  # 逐层以 raise ... from 挂起因，构造 4 层异常链
+        try:
+            raise RuntimeError(f"第{i}层") from deep
+        except RuntimeError as e:
+            deep = e
+
+    assert _format_error_chain(deep).splitlines() == [
+        "RuntimeError: 第1层",
+        "  RuntimeError: 第2层",
+        "    RuntimeError: 第3层",
+        "      …（更深的异常未展开）",
+    ]
+    assert "第4层" not in _format_error_chain(deep)
+
+    group = ExceptionGroup("批失败", [ValueError("甲"), TypeError("乙")])
+    assert _format_error_chain(group).splitlines() == [
+        "ExceptionGroup: 批失败 (2 sub-exceptions)",
+        "  ValueError: 甲",
+        "  TypeError: 乙",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_R3_预算拒绝的那一轮不留step_end():
+    """step/start 与 step/end 严格配对：超限那一轮在开步前就被拒绝，
+    既不写 step/start 也不写 step/end"""
+    script = [tool_round(f"c{i}") for i in range(3)]
+    loop, provider, session = make_loop(script, tools=OkTool(), step_limit=2)
+
+    with pytest.raises(AgentUnclaimedError):
+        await loop.turn(user_message())
+
+    assert len(records(session, "step/start")) == 2
+    assert len(records(session, "step/end")) == 2
+
+
+@pytest.mark.asyncio
+async def test_R4_异常打断工具调用_补齐占位tool_result():
+    """工具执行抛错时 tool/call 已落盘却没有配对结果：补一条 is_error=True 的占位
+    tool/result，避免消息面出现"有 tool_calls 却没有 tool 响应"的非法组合"""
+    loop, provider, session = make_loop([tool_round("c1")], tools=OkTool())
+
+    async def boom(call):
+        raise RuntimeError("工具外异常")
+
+    loop.tool_register.execute = boom
+
+    with pytest.raises(AgentUnclaimedError):
+        await loop.turn(user_message())
+
+    assert [c.data.call_id for c in records(session, "tool/call")] == ["c1"]
+    results = records(session, "tool/result")
+    assert [r.data.call_id for r in results] == ["c1"]
+    assert results[0].data.is_error is True
+    assert "被中断" in results[0].data.message.content
+    # 补齐后消息面合法：tool_calls 之后必有 role=tool 的响应
+    assert session.derive_messages()[-1].role == "tool"
 
 
 # ===========================================================================

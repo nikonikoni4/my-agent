@@ -7,7 +7,7 @@ from myagent.agent.core.session import session
 from myagent.agent.core.systemprompt import AssemblyPrompt, SystemPrompt
 from myagent.infra.events import EventService
 from myagent.agent.core.tool.register import ToolRegister
-from myagent.agent.execption import AgentUnknownError, LLMCallError, MaxStepsExceededError, RetryExhaustedError
+from myagent.agent.execption import AgentUnclaimedError, LLMCallError, MaxStepsExceededError, RetryExhaustedError
 from myagent.agent.core.provider import LLMProvider,ChatParams, LLMResponse,Message, StreamChunk,Usage
 from myagent.agent.core.session.types import (
     AssistantChunkData, SessionMetaData,ToolCallChunksData,AssistantMessageData, StepEndData,CompactionStartData,
@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 LLM_CALL_TIMEOUT = 120
 TOOL_CALL_TIMEOUT = 60
-# 异常链渲染的层数上限：当前错误链最长 3 层（httpx->LLMConnectionError->AgentUnknownError）
+# 异常链渲染的层数上限：当前错误链最长 3 层（httpx->LLMConnectionError->AgentUnclaimedError）
 ERROR_CHAIN_MAX_DEPTH = 3
 # 需要"继续下一轮"的决策；其余决策一律结束本 turn 的循环
 RETRY_DECISIONS = ("retry","backoff_retry")
@@ -475,7 +475,7 @@ class ReActAgentLoop:
 
         Raises:
             MaxStepsExceededError: 步数达到 agent_config.step_limit。
-            AgentUnknownError: request/error 无人认领该错误。
+            AgentUnclaimedError: request/error 无人认领该错误。
             RetryExhaustedError: 重试次数超过 agent_config.max_retry_count。
             asyncio.CancelledError: 取消，原样上抛。
             Exception: _ask_model / 工具执行 / session.append 抛出的其它异常原样上抛；
@@ -545,7 +545,7 @@ class ReActAgentLoop:
                     self._event_service.trigger(STEP_END,StepEndPayload())
                 # 阶段 3：错误处理
                 decision = await self._handle_error(step_error)
-                if decision not in RETRY_DECISIONS:
+                if decision and decision not in RETRY_DECISIONS:
                     break
 
     @staticmethod
@@ -666,7 +666,7 @@ class ReActAgentLoop:
         """本轮的处置决策：返回决策值供循环判断是否继续；None 表示本轮无错误。
 
         - 取消：原样上抛（由 _loop / 上层收尾），不进入决策链
-        - 无决策（无人认领）：抛 AgentUnknownError（from 原错误）
+        - 无决策（无人认领）：抛 AgentUnclaimedError（from 原错误）
         - retry / backoff_retry：按策略退避等待后返回决策（循环继续）
         - 重试次数耗尽：抛 RetryExhaustedError（from 最后一次错误）
         - 其它决策：原样返回（循环走 break；语义未定，见 docs/known-limitations）
@@ -686,7 +686,7 @@ class ReActAgentLoop:
 
         Raises:
             asyncio.CancelledError: 原样上抛，不进入决策链。
-            AgentUnknownError: request/error 返回的 decision 为 None（无人认领）。
+            AgentUnclaimedError: request/error 返回的 decision 为 None（无人认领）。
             RetryExhaustedError: attempt 超过 agent_config.max_retry_count。
         """
         # 步骤 1：无错直接返回 None
@@ -698,12 +698,12 @@ class ReActAgentLoop:
         # 步骤 3：触发 request/error waterfall，取决策与退避策略
         request_error_result = self._event_service.trigger(REQUEST_ERROR,RequestErrorPayLoad(error_type=step_error))
         decision = (request_error_result or {}).get("decision",None)
-        # 步骤 4：无人认领——先记账，再抛 AgentUnknownError
+        # 步骤 4：无人认领——先记账，再抛 AgentUnclaimedError
         if decision is None:
             # 必记：本分支直接上抛，不会走到下面"决定重试"的那条记录；漏记则这次
             # 失败只剩终态 reason_text 里的文本形态，无法结构化查询。
             self._record_llm_failure(step_error,"unclaimed")
-            raise AgentUnknownError("无错误处理策略的错误") from step_error
+            raise AgentUnclaimedError("无错误处理策略的错误") from step_error
         # 步骤 5：非重试决策原样返回（调用方据此 break）
         if decision not in RETRY_DECISIONS:
             return decision

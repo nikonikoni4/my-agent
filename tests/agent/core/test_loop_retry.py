@@ -1,10 +1,10 @@
 """ReActAgentLoop 重试决策与退避延迟的行为测试。
 
-覆盖（对应 ADR 2026-09-10-LLM重试延迟退避策略）：
-1. mock provider 连续抛两个不同策略的错误——429 限流（backoff_retry）与 401 认证
-   失败（dont_retry）：只有前者记 llm/retry 并退避等待，后者直接跳过，策略分流正确
-2. 连续 backoff_retry 直到 max_retry_count： 并保留最后
-   一次原始错误（重试次数 + 限流原因，供界面展示 10/10 之类信息）
+覆盖（对应 ADR 2026-09-10-LLM重试延迟退避策略 + 2026-09-15-agent-loop错误处理重构）：
+1. mock provider 连续抛两个错误——429 限流（backoff_retry）与 401 认证失败
+   （策略表已无对应档）：前者记 llm/retry 并退避等待，后者无人认领直接上抛
+2. 连续 backoff_retry 直到 max_retry_count：抛 RetryExhaustedError，
+   并保留最后一次原始错误（重试次数 + 限流原因，供界面展示 10/10 之类信息）
 """
 
 import asyncio
@@ -17,7 +17,12 @@ from myagent.agent.core.provider import LLMProvider, LLMResponse, Message, Usage
 from myagent.agent.core.session.session import Session
 from myagent.agent.core.session.types import SessionMetaData
 from myagent.agent.core.systemprompt.systemprompt import SystemPrompt
-from myagent.agent.execption import LLMAuthError, LLMRateLimitError
+from myagent.agent.execption import (
+    AgentUnclaimedError,
+    LLMAuthError,
+    LLMRateLimitError,
+    RetryExhaustedError,
+)
 from myagent.agent.llm.llm_retry import LLMRerty
 from myagent.infra.events.eventspec import REQUEST_ERROR
 from myagent.infra.events.service import EventService
@@ -94,8 +99,8 @@ def user_message(text="你好"):
 
 @pytest.mark.asyncio
 async def test_两个错误_仅走重试的那个记记录并等待():
-    """先 429 限流（backoff_retry）再 401 认证失败（dont_retry），第三次成功：
-    只有限流那次记 llm/retry 并退避等待，认证失败不等待；最终 turn 记为 success"""
+    """先 429 限流（backoff_retry）再 401 认证失败（策略表无对应档）：限流那次记
+    llm/retry 并退避等待，认证失败无人认领直接上抛（不再"跳过、继续下一条"）"""
     strategy = LLMRerty()
     script = [
         LLMRateLimitError("429 限流"),
@@ -105,46 +110,51 @@ async def test_两个错误_仅走重试的那个记记录并等待():
     loop, provider, session = make_loop(script, max_retry_count=5, strategy=strategy)
     waits = install_recording_delay(loop)
 
-    await loop.turn(user_message("你好"))
+    with pytest.raises(AgentUnclaimedError) as excinfo:
+        await loop.turn(user_message("你好"))
 
-    assert provider.calls == 3, "两个错误后模型第三次返回成功"
+    assert provider.calls == 2, "限流重试后第二次调用认证失败，随即终止"
+    assert isinstance(excinfo.value.__cause__, LLMAuthError)
     records = retry_records(session)
-    assert len(records) == 1, "只有走重试的错误才记 llm/retry"
+    assert [r.data.reason for r in records] == ["backoff_retry", "unclaimed"], \
+        "走重试的那次记 backoff_retry，无人认领的那次也落记录（原因为 unclaimed）"
     assert records[0].data.retry_count == 1
-    assert records[0].data.reason == "backoff_retry"
     assert len(waits) == 1, "只有走重试的错误才退避等待"
     assert waits[0][2] == 1, "第 1 次重试"
     assert waits[0][1].base_delay == 1.0, "取 backoff 档的退避参数"
-    # 中间轮次的重试不算 error：最终成功，step 与 turn 都记 success
-    assert all(r.data.reason_type == "success" for r in session.record_list if r.type == "step/end")
-    assert last_record(session, "turn/end").data.reason_type == "success"
+    assert [r.data.reason_type for r in session.record_list if r.type == "step/end"] == ["error", "error"]
+    assert last_record(session, "turn/end").data.reason_type == "error"
 
 
 @pytest.mark.asyncio
-async def test_连续重试达上限_step与turn记为error():
-    """连续 429 限流直到 max_retry_count：不再抛异常，step 与 turn 双双记为 error，
-    reason_text 保留重试次数与最后一次原始错误（供界面展示 10/10 与限流原因）"""
+async def test_连续重试达上限_上抛并记error():
+    """连续 429 限流直到 max_retry_count：抛 RetryExhaustedError，step 与 turn 双双记为
+    error，reason_text 保留重试次数与最后一次原始错误（供界面展示 10/10 与限流原因）"""
     strategy = LLMRerty()
     script = [LLMRateLimitError("429 限流") for _ in range(3)]
     loop, provider, session = make_loop(script, max_retry_count=2, strategy=strategy)
     install_recording_delay(loop)
 
-    await loop.turn(user_message("你好"))  # 重试耗尽不再上抛，正常返回
+    with pytest.raises(RetryExhaustedError) as excinfo:
+        await loop.turn(user_message("你好"))
 
     assert provider.calls == 3, "上限 2 次重试后第 3 次调用失败即耗尽"
-    assert len(retry_records(session)) == 2, "耗尽前正常记了 2 次 llm/retry"
+    assert isinstance(excinfo.value.__cause__, LLMRateLimitError)
+    assert [r.data.reason for r in retry_records(session)] == [
+        "backoff_retry", "backoff_retry", "exhausted"
+    ], "两次重试 + 一次耗尽（决定终止的那次同样落记录）"
     step_ends = [r for r in session.record_list if r.type == "step/end"]
-    assert [r.data.reason_type for r in step_ends] == ["success", "success", "error"]
-    assert "2/2" in step_ends[-1].data.reason_text
-    assert "429 限流" in step_ends[-1].data.reason_text, "保留原始错误信息"
+    assert [r.data.reason_type for r in step_ends] == ["error"] * 3, "每次失败的尝试各占一步"
+    assert "429 限流" in step_ends[-1].data.reason_text, "step/end 记本步自己的错误"
     turn_end = last_record(session, "turn/end")
     assert turn_end.data.reason_type == "error"
+    # 终态决策只在 turn/end：重试耗尽（RetryExhaustedError）+ 原始错误都在链上
     assert "2/2" in turn_end.data.reason_text and "429 限流" in turn_end.data.reason_text
 
 
 @pytest.mark.asyncio
 async def test_用户取消_step与turn记为interrupted():
-    """模型调用挂起时取消任务：step 与 turn 记 interrupted，reason_text 为用户手动取消"""
+    """模型调用挂起时取消任务：step 与 turn 记 interrupted，reason_text 为用户主动打断"""
     strategy = LLMRerty()
     loop, provider, session = make_loop(["hang"], max_retry_count=3, strategy=strategy)
 
@@ -156,7 +166,7 @@ async def test_用户取消_step与turn记为interrupted():
 
     step_ends = [r for r in session.record_list if r.type == "step/end"]
     assert [r.data.reason_type for r in step_ends] == ["interrupted"]
-    assert step_ends[-1].data.reason_text == "用户手动取消"
+    assert step_ends[-1].data.reason_text == "用户主动打断"
     turn_end = last_record(session, "turn/end")
     assert turn_end.data.reason_type == "interrupted"
-    assert turn_end.data.reason_text == "用户手动取消"
+    assert turn_end.data.reason_text == "用户主动打断"

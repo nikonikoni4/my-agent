@@ -1,8 +1,8 @@
 ---
-version: 1.0
+version: 1.1
 created_at: 2026-09-15
 updated_at: 2026-09-15
-last_updated: 创建文档初稿
+last_updated: 补记两项未决项的落定：兜底域类名定为 AgentUnclaimedError、dont_retry 档已从策略表移除；同步测试跟进状态
 abstract: ReActAgentLoop 的错误处理重构为「2 个 except + finally 内三阶段（补全/记账/决策）」；终止统一以抛出表达（turn 由异常得知终态），预算检查并入同一决策路径并以 step_opened 保证 step 配对，每次失败在发生点落 llm/retry
 status: decided
 ---
@@ -14,6 +14,7 @@ status: decided
 | 版本 | 更新内容 |
 | ---- | -------- |
 | 1.0 | 创建文档初稿 |
+| 1.1 | 补记未决项落定（类名 → `AgentUnclaimedError`）、`dont_retry` 移除已落地、测试已按新结构重写 |
 
 ## 问题界定
 
@@ -37,7 +38,7 @@ status: decided
 - 错误类型树的分域——见《异常分类树新增策略域与未知域》。
 - session 错误记录的字段与层级——见《session 错误信息记录策略》。
 - 各错误类别的具体处置策略（人在回路、降级等）——后续独立决策。
-- 未决项：`FinalResult.error_type` 的最终落点、`AgentUnknownError` 是否改名为 `AgentUnclaimedError`。
+- 未决项：`FinalResult.error_type` 的最终落点（类名已于 1.1 定为 `AgentUnclaimedError`）。
 
 ### 模糊信息的明确定义
 
@@ -63,7 +64,7 @@ status: decided
 - 前提 2（现状事实）：异常路径上 `turn`/`step` 的终态只能取到默认值；错误信息只有 `str(异常)`，且"无人认领"时会覆盖真实错误。
 - 前提 3（现状事实）：`tool/call` 缺配对会产生非法消息面，必须补齐才能续跑。
 - 前提 4（现状事实）：`step_limit` 检查在 `try` 之外，不进入错误处理；挪进 `try` 后又会与 `step/start` 失配（写出无配对的 `step/end`）。
-- 前提 5（实测事实）：当前错误链最长 3 层（`httpx.*` → `LLMConnectionError` → `AgentUnknownError`）；`ExceptionGroup` 的 `__cause__`/`__context__` 均为 `None`，不在链上。
+- 前提 5（实测事实）：当前错误链最长 3 层（`httpx.*` → `LLMConnectionError` → `AgentUnclaimedError`）；`ExceptionGroup` 的 `__cause__`/`__context__` 均为 `None`，不在链上。
 - 前提 6（用户约束）：认证 / 模型 / 接入点这类配置错误，"不重试但继续下一条"没有意义，应停止让用户去改配置。
 - 前提 7（用户约束）：当前没有为"终止但不抛"的错误类型想好处置，故该出口先不承担终止。
 
@@ -73,7 +74,7 @@ status: decided
 
 - `step` 只保留 2 个 `except`：取消（`CancelledError`）与兜底（`Exception`），二者都只把错误收进 `step_error`，不做任何判断。
 - `finally` 按序做三件事：① `_complete_session` 补全 session；② 写 `step/end`；③ `await _handle_error` 决策。
-- 终止统一以**抛出**表达：取消原样上抛、无人认领抛 `AgentUnknownError`、重试耗尽抛 `RetryExhaustedError`；`turn` 用 `except` 得知终态并在 `finally` 写 `turn/end`。
+- 终止统一以**抛出**表达：取消原样上抛、无人认领抛 `AgentUnclaimedError`、重试耗尽抛 `RetryExhaustedError`；`turn` 用 `except` 得知终态并在 `finally` 写 `turn/end`。
 - 预算检查挪进 `try`（从而进入同一决策路径），并用 `step_opened` 保证 `step/start`↔`step/end` 配对。
 - 每次失败（含 `unclaimed` / `exhausted`）都在发生点落一条 `llm/retry`。
 
@@ -135,7 +136,7 @@ status: decided
 - `step` 收敛为 2 个 `except`（取消 / 兜底，均只收集）+ 1 个 `finally`（补全 → 记账 → 决策）。
 - 终止统一抛出；`turn` 用 `except` 收终态并在 `finally` 写 `turn/end`，不再依赖返回值。
 - 预算检查在 `try` 内、`step/start` 之前；`step_opened` 保证不写无配对的 `step/end`。
-- `_handle_error` 为 async：取消上抛；无人认领抛 `AgentUnknownError`；`retry`/`backoff_retry` 退避后返回；耗尽抛 `RetryExhaustedError`。
+- `_handle_error` 为 async：取消上抛；无人认领抛 `AgentUnclaimedError`；`retry`/`backoff_retry` 退避后返回；耗尽抛 `RetryExhaustedError`。
 - 每次失败（含两种收尾）先落一条 `llm/retry`，携带 `error_type` + `error_message`。
 - `reason_text` 用异常链文本（限深 3、展开 `ExceptionGroup`、截断显式标注）。
 - 恢复 `RetryPolicy` + `retry_delay(error, policy, attempt)`（沿用旧名与签名），退避取本地计算与服务端 `Retry-After` 的较大值。
@@ -152,9 +153,10 @@ status: decided
 
 ## 后续影响
 
-- 未决项（本 ADR 不含）：`FinalResult.error_type` 的最终落点（当前算出但未写入 `turn/end`）、`AgentUnknownError` 是否改名为 `AgentUnclaimedError`。
+- 未决项（本 ADR 不含）：`FinalResult.error_type` 的最终落点（当前算出但未写入 `turn/end`）。
+- 兜底域类名落定为 `AgentUnclaimedError`（原 `LLmError` → 中间态 `AgentUnknownError`）；`LLMRerty` 的 `dont_retry` 档已移除，认证 / 模型 / 接入点类错误改走无人认领 → 停止。
 - `LLMRetryData` 语义扩展为"失败处置记录"并新增两个字段；**注意 session 加载边界是"字段不符抛异常"**，历史 session 中只有 2 个字段的 `llm/retry` 记录可能加载失败，待验证。
 - `llm_retry_count` 的口径随之扩大（`unclaimed`/`exhausted` 也计入）；因二者都是终止、之后不再计算 `attempt`，退避次数不受影响，但**统计 `llm/retry` 条数的地方要同步认知**。
 - `_complete_session` 目前是"扫描全量记录、补齐未配对的 `tool/call`"，实现者已标注需要重做（性能与作用域都需要收窄到本轮）。
-- 测试待跟进：`tests/agent/core/test_loop_paths.py` 仍引用已改名的 `LLmError`（collection error）；`test_react_loop_breaker.py` 的步数兜底用例断言的是旧行为（就地终止、不外抛），现在会收到 `AgentUnknownError`（其 cause 为 `MaxStepsExceededError`）。
-- `break` 作为"终止但不抛"的出口语义未定且当前不可达，另行记录于 known-limitations。
+- 测试已按新结构重写：出路穷举（E/P/R 三组）+ 异常链渲染 + `step` 配对 + 消息面补全；断言口径为 `AgentUnclaimedError`（cause 为触发它的原错误）。
+- `break` 作为"终止但不抛"的出口语义未定且当前不可达（`dont_retry` 移除后策略表只剩重试档），另行记录于 known-limitations。
