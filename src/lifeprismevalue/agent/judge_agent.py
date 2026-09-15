@@ -36,16 +36,11 @@ MODEL = os.getenv("LIFEPRISM_MODEL", "doubao-seed-1-6-flash-250828")
 BASE_URL = os.getenv("LIFEPRISM_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3")
 
 # 裁判提示词（当前简化版：只判"产出是否满足判分要点"）。
-# 输入约定：runner 会把「判分要点 + 本次证据 + 被评估 agent 对话」拼成一条 user 消息发过来。
+# 输入约定：runner 会把「判分要点 + 本次证据 + 被评估 agent 对话」拼成一条 user 消息发过来，
+# 各段的含义与 evidence 的结构见下面的 Evidence_prompt。
 Judge_prompt = """
 # role
 你是一个评测裁判。你的唯一任务是：依据「判分要点」，判断被评估 agent 本次的产出是否达标。
-
-# 输入说明
-发来的消息里会包含三段：
-1. 判分要点（rubric）：本次用例的判定标准
-2. 本次证据（evidence）：本次运行窗口内的落库 / 落盘结果（含记录内容与规则文件状态）
-3. 对话记录：被评估 agent 的 user / assistant / tool_result 消息（仅作参考）
 
 # rule
 1. **只以证据为准**，不以被评估 agent 的自我陈述为准——它说“已记录”但证据里没有，判不达标。
@@ -57,17 +52,47 @@ Judge_prompt = """
 {"pass": true, "reason": "一句话说明依据（哪几条满足 / 不满足）"}
 """
 
+# 输入说明：单独一段，专门讲清"发过来的东西是什么"（尤其 evidence.json 的结构）。
+# 结构定义与 runner 的 `_export_evidence` 保持一致，两者改动需同步。
+Evidence_prompt = """
+# 输入说明
+你会收到三段内容：
+
+1. **判分要点（rubric）**：本次用例的判定标准，逐条核对它。
+2. **本次证据（evidence）**：JSON，本次运行时间窗内的落库 / 落盘结果，结构为：
+   - `time_window`：本次运行的时间窗（start / end）。
+   - `targets`：按用例声明的证据位置；键是声明原值（如 `custom_expense_log`、
+     `diary/<year>/<month>/<date>.md`），值是下面两类之一：
+     - `kind = "table"`：数据表。`columns` 为列名，`rows` 为时间窗内的行，
+       `row_count` 为行数（**0 表示该表在时间窗内没有任何新增**）；`error` 非空表示读取失败。
+     - `kind = "file"`：文本文件。`changed` 表示是否被改动，`new_file` 表示是否新增，
+       `diff` 是统一 diff（`--- base` / `+++ current`；`+` 开头为新增行，`-` 开头为删除行）；
+       `exists` 为 false 表示该文件不存在。
+   - `other_changed_files`：**未被用例声明、但确实被改动**的文本文件（结构同 `kind="file"`），
+     用于发现"顺手改了别的文件"（如改动提示词、日记等）。
+   - `precondition`：本次运行前写入的预置规则。
+3. **对话记录**：被评估 agent 的 user / assistant / tool_result 消息，**仅作参考**；
+   判定以证据为准，不以它的自述为准。
+"""
+
 
 def build_judge_system_prompt(agent_name: str = AGENT_NAME) -> SystemPrompt:
     """组装裁判 agent 的 System Prompt。
 
-    把 `Judge_prompt` 注册为一个 section；注册名用 `identity` 以遮蔽全局默认的
-    「你是一个个人助手…」，避免与「评测裁判」角色冲突。
+    注册两个 section：
+    - `identity`：角色与判定规则（`Judge_prompt`），注册名用 `identity` 以遮蔽全局默认的
+      「你是一个个人助手…」，避免与「评测裁判」角色冲突；
+    - `evidence_input`：输入说明（`Evidence_prompt`），讲清 rubric / evidence / 对话记录
+      三段输入的含义与 evidence 的结构。
     """
     system_prompt = SystemPrompt()
     system_prompt.register_section(
         agent_name,
         PrompSection(name="identity", order=0, text=Judge_prompt),
+    )
+    system_prompt.register_section(
+        agent_name,
+        PrompSection(name="evidence_input", order=1, text=Evidence_prompt),
     )
     return system_prompt
 

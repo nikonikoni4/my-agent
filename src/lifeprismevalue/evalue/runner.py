@@ -6,9 +6,15 @@ session → 导出 evidence → 跑 judge → 跑 stats → 汇总落盘。
 流程与约定见 [evalue/README.md](./README.md) 与
 [lifeprismTestData/README.md](../../../lifeprismTestData/README.md)。
 
-现状：已实现 a~f（重置状态 → precondition → 用例快照 → 跑 under_test → 取终时）。
-g~k（session 落盘 / evidence / judge / stats）仍为 TODO：`_run_case` 会先返回
-"未判"的部分结果（`passed=None`），待后续补齐。
+现状：a~j 全部实现（重置状态 → precondition → 用例快照 → 跑 under_test → 取终时 →
+session 复制改名 → 导出 evidence → 跑裁判 → 统计）。仍未实现的只有任务模式相关的两处：
+`input_mode=agent` 的 simulator 驱动、`turns[].trigger` 的条件注入。
+
+运行终态：被测评 agent 每一轮的最终结果落在 `turn/end` 记录里（`TurnEndData`，含
+reason_type / reason_text / error_type；后两者分别是异常类别与异常链文本）。loop 对
+任何未恢复的异常都以 `error` 收口（含步数上限与重试耗尽，经 AgentUnclaimedError /
+RetryExhaustedError），取消则为 `interrupted`。若某轮非 success，该用例**不判、不再
+注入后续轮次**，以「运行未正常结束」收口（见 `_under_test_failure` / `_failure_note`）。
 """
 
 from __future__ import annotations
@@ -16,24 +22,33 @@ from __future__ import annotations
 import asyncio
 import csv
 import datetime
+import difflib
 import json
 import logging
+import re
 import shutil
+import sqlite3
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 import yaml
 
+from myagent.utils.helper import project_path_to_session_folder
+
 from lifeprismevalue.evalue.caseload import load_case_set
 from lifeprismevalue.evalue.types import Case, CaseSet
+from lifeprismevalue.stats import analyze_session
 
 logger = logging.getLogger(__name__)
+
+# 数据库相对数据根的路径（lifeprism 的结构化存储）
+DB_REL_PATH = "dataset/lifewatch_ai.db"
 
 # 每个用例运行前需还原的可变状态（相对 base/ 的路径）。
 # DB 会累积记录、custom_prompt.md 会被写入规则，故必须还原，否则跨用例污染。
 MUTABLE_PATHS: tuple[str, ...] = (
-    "dataset/lifewatch_ai.db",
+    DB_REL_PATH,
     "agent/chat/custom_prompt.md",
 )
 
@@ -57,14 +72,32 @@ SUMMARY_COLUMNS = [
 WORK_DIR_NAME = "work"
 SESSIONS_DIR_NAME = "sessions"
 
-# 会话在 ctx.sessions 里的键（步骤 g 复制改名时用）
+# 会话在 ctx.sessions 里的键（步骤 g 复制改名时用），也是落盘文件名的后缀
 UNDER_TEST = "under_test"
+JUDGE = "judge"
 
 # 单轮等待 turn/end 的超时（秒）：避免用例卡死
 DEFAULT_TURN_TIMEOUT = 300.0
 
-# g~k 未实现时，写入"测试结果摘要"的说明（是否通过留空 = 未判）
-_PENDING_NOTE = "TODO: 步骤 g~k（session 落盘/evidence/judge/stats）未实现，暂未判定"
+# 交给裁判的对话里，单条消息的最大字符数（超长则截断并标注）
+TRANSCRIPT_MAX_CHARS = 4000
+
+# 写进 summary 的「运行未正常结束」摘要最大字符数（异常链原文留在 session 里）
+FAILURE_NOTE_MAX_CHARS = 500
+
+# 统一 diff 的上下文行数（0 = 只留变更行）
+DIFF_CONTEXT = 1
+
+# 全树对比时跳过的大文件/二进制后缀（避免把 DB、会话、图片当文本比）
+SKIP_SUFFIXES = frozenset(
+    {
+        ".db", ".db-wal", ".db-shm", ".sqlite", ".sqlite3",
+        ".jsonl", ".pyc", ".pyo",
+        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".pdf",
+        ".zip", ".gz", ".exe", ".dll", ".so",
+    }
+)
+MAX_TEXT_BYTES = 1_000_000
 
 
 # ---------------- 运行时数据结构 ----------------
@@ -117,7 +150,7 @@ class TurnCollector:
         self.assistant_texts: list[str] = []    # 各 step 的 assistant 正文（按序）
         self._done = asyncio.Event()
         self._event_service = event_service
-        self._event_service.register(SESSION_EVENT_NAME, self._on_event)
+        self._event_service.register(_session_event_name(), self._on_event)
 
     def _on_event(self, payload: Any) -> None:
         record = payload.session_record
@@ -143,14 +176,11 @@ class TurnCollector:
         return self.assistant_texts[-1] if self.assistant_texts else ""
 
 
-# SESSION_EVENT 的事件名（延迟导入：避免 runner 在无 myagent 环境下无法 import）
 def _session_event_name() -> str:
+    """session/event 的事件名（延迟导入 myagent，避免 runner 顶层拖入重依赖）。"""
     from myagent.infra.events.eventspec import SESSION_EVENT
 
     return SESSION_EVENT.name
-
-
-SESSION_EVENT_NAME = _session_event_name()
 
 
 # ---------------- 主类 ----------------
@@ -165,7 +195,9 @@ class EvalRunner:
         base_dir: str | Path,
         runs_dir: str | Path,
         agent_factory: Callable[..., Any] | None = None,
+        judge_factory: Callable[..., Any] | None = None,
         turn_timeout: float = DEFAULT_TURN_TIMEOUT,
+        scan_other_changed_files: bool = True,
     ) -> None:
         """
         Args:
@@ -173,12 +205,18 @@ class EvalRunner:
             runs_dir: 结果根目录；每次 run 在其下新建 <run_id>/。
             agent_factory: 创建被测评 agent 的工厂（默认 lifeprism 复刻 agent）；
                 测试可注入假 agent。
+            judge_factory: 创建裁判 agent 的工厂（默认 judge_agent）；
+                测试可注入假 agent。
             turn_timeout: 单轮等待 turn/end 的超时秒数。
+            scan_other_changed_files: 导出证据时，是否额外全树对比、把"未被 evidence
+                声明但确实改了的文本文件"也收进 evidence（防漏判）。
         """
         self.base_dir = Path(base_dir)
         self.runs_dir = Path(runs_dir)
         self._agent_factory = agent_factory or default_under_test_agent_factory
+        self._judge_factory = judge_factory or default_judge_agent_factory
         self.turn_timeout = turn_timeout
+        self.scan_other_changed_files = scan_other_changed_files
 
     # ---------- 顶层 ----------
 
@@ -223,8 +261,9 @@ class EvalRunner:
 
         用例目录：`runs/<run_id>/<meta.id>/<index:03d>_<case.id>/`
 
-        已实现 a~f；g~k（session 落盘、evidence、judge、stats）仍为 TODO，
-        故先返回 `passed=None` 的部分结果。
+        已实现 a~j。若被测评 agent 的某一轮以非 success 收场（`turn/end` 的终态），
+        该用例**不判**、不重试，直接以「运行未正常结束」收口（错误信息取自 turn 终态）；
+        证据与统计仍照常落盘，供事后排查。
         """
         case_dir = self._case_dir(ctx, case_set, index, case)
         case_dir.mkdir(parents=True, exist_ok=True)
@@ -237,7 +276,44 @@ class EvalRunner:
         session_id = await self._run_under_test(ctx, case, case_dir)  # e. 跑 under_test
         ended_at = self._now()                # f. 时间窗终点
 
-        # g~k 未实现
+        self._dump_sessions(ctx, case, case_dir)                              # g. session 落盘
+        failure = _under_test_failure(                                        # 运行终态
+            _read_turn_results(case_dir / f"session_{UNDER_TEST}.jsonl")
+        )
+        evidence = self._export_evidence(ctx, case, started_at, ended_at, case_dir)  # h. 证据
+        verdict = (
+            await self._run_judge(ctx, case, evidence, case_dir)              # i. 裁判
+            if failure is None
+            else None
+        )
+        self._run_stats(case, case_dir)                                       # j. 统计
+        # 再落一次 session：judge 的会话在 i 之后才产生，也要进用例目录（复制循环幂等）
+        self._dump_sessions(ctx, case, case_dir)
+
+        if failure is not None:
+            note = _failure_note(failure)
+            return CaseResult(
+                case_id=case.id,
+                case_type=case.type,
+                case_dir=str(case_dir),
+                version=case_set.meta.id,
+                content_summary=_content_summary(case),
+                session_id=session_id,
+                passed=None,
+                reason=note,
+                error=note,
+                multi_turn=case.multi_turn,
+                started_at=started_at,
+                ended_at=ended_at,
+            )
+
+        if verdict is None:
+            passed: bool | None = None
+            reason = f"judge.mode={case.judge.mode}，未判定"
+        else:
+            passed = verdict["pass"]
+            reason = verdict["reason"] or verdict["parse_error"]
+
         return CaseResult(
             case_id=case.id,
             case_type=case.type,
@@ -245,8 +321,8 @@ class EvalRunner:
             version=case_set.meta.id,
             content_summary=_content_summary(case),
             session_id=session_id,
-            passed=None,
-            reason=_PENDING_NOTE,
+            passed=passed,
+            reason=reason,
             multi_turn=case.multi_turn,
             started_at=started_at,
             ended_at=ended_at,
@@ -315,17 +391,28 @@ class EvalRunner:
         if not case.turns:
             logger.warning("用例 %s 没有 turns，未执行任何一轮", case.id)
             return
-        for turn in case.turns:
+        for index, turn in enumerate(case.turns, start=1):
             if turn.trigger:
                 raise NotImplementedError(
                     f"TODO: 带 trigger 的条件注入尚未实现（用例 {case.id}）"
                 )
             await self._send_and_wait(agent, collector, turn.text)
+            # 某轮以非 success 收场就停止后续注入：turn 的异常会击穿 loop，
+            # 此后 send 会重启已终止的循环，把消息灌进已失败的运行。
+            reason = collector.turn_ends[-1] if collector.turn_ends else ""
+            if reason and reason != "success":
+                logger.warning(
+                    "用例 %s 的第 %d 轮以 %s 收场，停止后续轮次注入", case.id, index, reason
+                )
+                break
 
     async def _send_and_wait(
         self, agent: Any, collector: TurnCollector, text: str
     ) -> None:
         """发送一轮用户消息并等待本轮 turn/end。"""
+        # TODO: 超时路径与「运行未正常结束」不一致——这里抛错会直接冒到 `run()` 的兜底，
+        # 该用例只剩 `CaseResult.error`，g~j 不执行（无 evidence / stats）。
+        # 待统一：超时也应走"运行未正常结束"收口，照样落证据与统计。
         collector.expect_turn()
         await agent.send(text)
         try:
@@ -334,37 +421,173 @@ class EvalRunner:
             raise TimeoutError(f"等待 turn/end 超时（{self.turn_timeout}s）") from e
 
     def _dump_sessions(self, ctx: RunContext, case: Case, case_dir: Path) -> None:
-        """g. 先 flush 落盘，再把三个 agent 的 session 按语义名复制进 `case_dir`。
+        """g. 把本次用例涉及的各 agent 的 session 复制进 `case_dir`，按语义名重命名。
 
-        产出（存在才写）：`session_under_test.jsonl` / `session_simulator.jsonl` / `session_judge.jsonl`。
-        注意：session 文件名固定为 `<session_id>.jsonl` 且不支持改名，只能跑完复制改名；
-        `SessionPresist` 每 2s 批量落盘，复制前必须 flush，否则丢最后一批。
+        session 文件名固定为 `<session_id>.jsonl` 且不支持改名，只能跑完复制改名
+        （见 lifeprismevalue/evalue/README.md）。文件不存在（如 agent 未落盘）时跳过并告警。
         """
-        raise NotImplementedError("TODO: 复制改名 session")
+        case_dir.mkdir(parents=True, exist_ok=True)
+        for key, agent in ctx.sessions.items():
+            session_id = _session_id_of(agent)
+            if not session_id:
+                logger.warning("会话 %s 取不到 session_id，跳过落盘", key)
+                continue
+            src = session_file_path(ctx.work_data_path, ctx.session_folder, session_id)
+            if not src.exists():
+                logger.warning("会话文件不存在，跳过落盘: %s", src)
+                continue
+            shutil.copy2(src, case_dir / f"session_{key}.jsonl")
 
     def _export_evidence(
         self, ctx: RunContext, case: Case, t_start: str, t_end: str, case_dir: Path
     ) -> dict:
         """h. 导出 `evidence.json`。
 
-        - `evidence` 取值是数据表：按 `created_at ∈ [t_start, t_end]` 从库中筛出本次写入；
-        - 取值是 `.md` 文件：无时间戳，用运行前/后快照 diff 或取终态（日记路径解析成当天日期）。
-        返回的证据 dict 同时交给 judge 与 stats。
+        - key 用用例 `evidence` 里的原值（表名 / 文件路径模式），便于与 cases.yaml 对照；
+        - 表：按 `created_at ∈ [t_start, t_end]` 捞整行；
+        - 文件：与 base 对比出统一 diff（`.md` 没有时间戳，靠 diff 而非时间窗）；
+        - 额外做一次全树对比，收进"未被声明但确实改了"的文本文件（防漏判）。
         """
-        raise NotImplementedError("TODO: 导出 evidence")
+        targets = {raw: self._collect_target(ctx, raw, t_start, t_end) for raw in case.evidence}
+        evidence = {
+            "case_id": case.id,
+            "time_window": {"start": t_start, "end": t_end},
+            "precondition": {"rules": list(case.precondition.rules)},
+            "targets": targets,
+            "other_changed_files": (
+                self._collect_other_changed_files(ctx, case.evidence)
+                if self.scan_other_changed_files
+                else {}
+            ),
+        }
+        case_dir.mkdir(parents=True, exist_ok=True)
+        (case_dir / "evidence.json").write_text(
+            json.dumps(evidence, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        return evidence
 
-    def _run_judge(self, ctx: RunContext, case: Case, evidence: dict, case_dir: Path) -> dict | None:
-        """i. `judge.mode=model` 时运行裁判 agent，产出 `judge.json`。
+    def _collect_target(self, ctx: RunContext, raw: str, t_start: str, t_end: str) -> dict:
+        """按 evidence 取值分派到「表」或「文件」两类采集。"""
+        if _is_file_target(raw):
+            return self._collect_file(ctx, raw)
+        return self._collect_table(ctx, raw, t_start, t_end)
 
-        输入 = 裁判提示词（agent 内建）+ `case.rubric` + `evidence` + under_test session 的
-        user/assistant/tool_result 文本；输出 `{"pass": bool, "reason": str, ...}`。
-        `judge.mode=none` 返回 None（仅留证据，不判）。
+    def _collect_table(self, ctx: RunContext, table: str, t_start: str, t_end: str) -> dict:
+        """按时间窗捞表内新增行（无 `created_at` 的表退化为全表并注明）。"""
+        db_path = ctx.work_data_path / DB_REL_PATH
+        if not db_path.exists():
+            return _table_result(table, [], error=f"数据库不存在: {DB_REL_PATH}")
+        try:
+            con = sqlite3.connect(db_path)
+            try:
+                cur = con.cursor()
+                columns = [row[1] for row in cur.execute(f"PRAGMA table_info({table})")]
+                if not columns:
+                    return _table_result(table, [], error=f"表不存在: {table}")
+                note = ""
+                if "created_at" in columns:
+                    sql = (
+                        f"SELECT * FROM {table} WHERE created_at >= ? AND created_at <= ? "
+                        "ORDER BY created_at"
+                    )
+                    rows = [
+                        dict(zip(columns, r)) for r in cur.execute(sql, (t_start, t_end))
+                    ]
+                    # SQL 用字符串比较做粗筛（写入方统一用 ISO UTC），这里再按时间解析复核
+                    rows = [r for r in rows if _in_window(r.get("created_at"), t_start, t_end)]
+                else:
+                    rows = [dict(zip(columns, r)) for r in cur.execute(f"SELECT * FROM {table}")]
+                    note = f"该表无 created_at，已退化为全表（{len(rows)} 行）"
+                return _table_result(table, rows, columns=columns, note=note)
+            finally:
+                con.close()
+        except sqlite3.Error as e:
+            return _table_result(table, [], error=f"读取失败: {e}")
+
+    def _collect_file(self, ctx: RunContext, raw: str) -> dict:
+        """采集文本类证据：解析路径占位符，与 base 对比出统一 diff。"""
+        rel = _resolve_path_placeholders(raw)
+        return _file_diff(ctx.base_dir / rel, ctx.work_data_path / rel, rel)
+
+    def _collect_other_changed_files(self, ctx: RunContext, declared: Iterable[str]) -> dict:
+        """全树对比 base 与 work，收集声明之外被改动的文本文件。"""
+        declared_rel = {
+            _resolve_path_placeholders(item) for item in declared if _is_file_target(item)
+        }
+        changed: dict[str, dict] = {}
+        base_files = _iter_candidate_files(ctx.base_dir)
+        work_files = _iter_candidate_files(ctx.work_data_path)
+        for rel in sorted(set(base_files) | set(work_files)):
+            if rel in declared_rel:
+                continue
+            item = _file_diff(ctx.base_dir / rel, ctx.work_data_path / rel, rel)
+            if item["changed"]:
+                changed[rel] = item
+        return changed
+
+    async def _run_judge(
+        self, ctx: RunContext, case: Case, evidence: dict, case_dir: Path
+    ) -> dict | None:
+        """i. `judge.mode=model` 时运行裁判 agent，产出 `judge.json`；`none` 时返回 None。
+
+        输入 = 裁判提示词（agent 内建）+ `case.rubric` + `evidence` + under_test 对话记录
+        （从 g 复制出的 `session_under_test.jsonl` 抽取 user/assistant/tool_result）。
+        输出 `{"pass": bool, "reason": str, ...}`；解析不了则 `pass=None` 并保留原文。
         """
-        raise NotImplementedError("TODO: 运行 judge")
+        if not case.uses_judge:
+            return None
+
+        transcript = _read_transcript(case_dir / f"session_{UNDER_TEST}.jsonl")
+        prompt_text = _build_judge_input(case, evidence, transcript)
+
+        agent = self._judge_factory(
+            data_path=ctx.work_data_path,
+            session_folder=ctx.session_folder,
+        )
+        ctx.sessions[JUDGE] = agent
+        collector = TurnCollector(agent._event_service)
+        try:
+            await self._send_and_wait(agent, collector, prompt_text)
+        finally:
+            agent.persist_session_now()
+            agent.cancel()
+
+        raw = collector.last_assistant_text
+        verdict = {
+            "case_id": case.id,
+            "mode": case.judge.mode,
+            "session_id": _session_id_of(agent),
+            **_parse_verdict(raw),
+            "raw": raw,
+        }
+        case_dir.mkdir(parents=True, exist_ok=True)
+        (case_dir / "judge.json").write_text(
+            json.dumps(verdict, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        return verdict
 
     def _run_stats(self, case: Case, case_dir: Path) -> dict:
-        """j. 对被测评 session 跑通用统计组件，产出 `stats.json`（token / 耗时 / 路径）。"""
-        raise NotImplementedError("TODO: 运行 stats")
+        """j. 对 g 复制出的 `session_under_test.jsonl` 跑通用统计组件，产出 `stats.json`。
+
+        以文件为接口（而非内存里的 agent 对象），使 g~j 可解耦、可单独重跑。
+        统计是辅助信息、不参与判定，故 session 缺失时只记进 `errors`，不抛出。
+        """
+        session_path = case_dir / f"session_{UNDER_TEST}.jsonl"
+        if not session_path.is_file():
+            logger.warning("用例 %s 的 session 文件不存在，跳过统计: %s", case.id, session_path)
+            merged: dict = _stats_error(session_path, f"session 文件不存在: {session_path.name}")
+        else:
+            try:
+                merged = analyze_session(session_path)
+            except Exception as e:  # noqa: BLE001 - 统计是辅助信息，解析失败只记录，不拖垮用例
+                logger.warning("用例 %s 统计失败: %s", case.id, e)
+                merged = _stats_error(session_path, f"{type(e).__name__}: {e}")
+
+        case_dir.mkdir(parents=True, exist_ok=True)
+        (case_dir / "stats.json").write_text(
+            json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        return merged
 
     # ---------- 辅助 ----------
 
@@ -449,6 +672,174 @@ def default_under_test_agent_factory(**kwargs: Any) -> Any:
     return create_old_agent(**kwargs)
 
 
+def default_judge_agent_factory(**kwargs: Any) -> Any:
+    """默认的裁判 agent：judge_agent（延迟导入）。"""
+    from lifeprismevalue.agent.judge_agent import create_judge_agent
+
+    return create_judge_agent(**kwargs)
+
+
+def _stats_error(session_path: Path, message: str) -> dict:
+    """统计无法进行时的占位结果：保持与 StatsRunner 输出同形（components / errors）。"""
+    return {
+        "session_path": str(session_path),
+        "components": {},
+        "errors": {"StatsRunner": message},
+    }
+
+
+def _truncate(text: str, limit: int = TRANSCRIPT_MAX_CHARS) -> str:
+    """超长文本截断并标注（避免把整段长文塞给裁判）。"""
+    return text if len(text) <= limit else text[:limit] + "…（已截断）"
+
+
+def _message_text(message: Any) -> str:
+    """从 session 记录的 `message` 抽正文：`content` 可能是字符串或分段列表。"""
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        return _truncate(content)
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                parts.append(str(part.get("text", "")))
+            elif isinstance(part, str):
+                parts.append(part)
+        return _truncate("".join(parts))
+    return ""
+
+
+def _read_turn_results(session_path: Path) -> list[dict]:
+    """从 session jsonl 读出每一轮的终态（`turn/end`）。
+
+    这是"本轮跑成什么样"的唯一权威来源：`TURN_END` 事件的 payload 不带信息，
+    而 `turn/end` 记录（`TurnEndData`）里有本轮 `FinalResult` 的
+    `reason_type` / `reason_text` / `error_type`——`error_type` 是最外层异常的类名
+    （如 AgentUnclaimedError / RetryExhaustedError / MaxStepsExceededError），
+    `reason_text` 是异常链文本（逐层 `类型: 消息`）。
+
+    字段用 `.get` 读、逐行容错，避免与 myagent 的 schema 演进强耦合。
+    """
+    if not session_path.is_file():
+        return []
+    results: list[dict] = []
+    for raw_line in session_path.read_text(encoding="utf-8").splitlines():
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
+        try:
+            record = json.loads(raw_line)
+        except json.JSONDecodeError:
+            continue
+        if record.get("type") != "turn/end":
+            continue
+        data = record.get("data") or {}
+        results.append(
+            {
+                "turn": record.get("turn"),
+                "reason_type": str(data.get("reason_type") or ""),
+                "reason_text": str(data.get("reason_text") or ""),
+                "error_type": str(data.get("error_type") or ""),
+            }
+        )
+    return results
+
+
+def _under_test_failure(turn_results: list[dict]) -> dict | None:
+    """取第一条非 success 的 turn 终态（error / interrupted）；都正常则返回 None。
+
+    只报告、不重试：运行本身没跑完的用例，其结论不成立，不能当成"agent 记错了"计分。
+    """
+    for item in turn_results:
+        if item["reason_type"] and item["reason_type"] != "success":
+            return item
+    return None
+
+
+def _failure_note(turn: dict) -> str:
+    """把 turn 的异常终态整理成一句可读摘要（写进 summary 的"测试结果摘要"）。
+
+    `error_type` 是异常类别（最外层异常类名），`reason_text` 是异常链文本
+    （逐层 `类型: 消息`，见 loop 的 `_format_error_chain`），两者互补。
+    """
+    head = f"运行未正常结束（turn {turn['turn']} · {turn['reason_type']}）"
+    detail = "｜".join(part for part in (turn["error_type"], turn["reason_text"]) if part)
+    return f"{head}：{_truncate(detail, FAILURE_NOTE_MAX_CHARS)}" if detail else head
+
+
+def _read_transcript(session_path: Path) -> str:
+    """从 session jsonl 抽出 user / assistant / tool_result 三类消息，拼成交给裁判的对话文本。
+
+    直接按 jsonl 的字段解析（不依赖 session 的类型定义），避免 runner 反向依赖 myagent 内部结构。
+    """
+    if not session_path.is_file():
+        return ""
+    lines: list[str] = []
+    for raw_line in session_path.read_text(encoding="utf-8").splitlines():
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
+        try:
+            record = json.loads(raw_line)
+        except json.JSONDecodeError:
+            continue
+        record_type = record.get("type")
+        data = record.get("data") or {}
+        if record_type == "user/message":
+            lines.append(f"[user] {_message_text(data.get('message'))}")
+        elif record_type == "assistant/message":
+            lines.append(f"[assistant] {_message_text(data.get('message'))}")
+        elif record_type == "tool/result":
+            lines.append(
+                f"[tool_result:{data.get('tool_name', '')}] {_message_text(data.get('message'))}"
+            )
+    return "\n".join(lines)
+
+
+def _build_judge_input(case: Case, evidence: dict, transcript: str) -> str:
+    """把「判分要点 + 本次证据 + 对话记录」拼成给裁判的一条 user 消息。"""
+    return "\n\n".join(
+        [
+            "# 判分要点\n" + case.rubric.strip(),
+            "# 本次证据\n" + json.dumps(evidence, ensure_ascii=False, indent=2),
+            "# 对话记录\n" + (transcript or "（无）"),
+        ]
+    )
+
+
+def _parse_verdict(raw: str) -> dict:
+    """从裁判输出里抽出 `{"pass": bool, "reason": str}`。
+
+    容错点（LLM 输出是外部边界）：剥掉 ``` 围栏、只取最外层 JSON、`pass` 允许是
+    "true"/"通过" 这类字符串。确实解析不出时 `pass=None`，把原文留给人工看。
+    """
+    text = raw.strip()
+    fenced = re.search(r"```(?:json)?\s*(.*?)```", text, re.S)
+    if fenced:
+        text = fenced.group(1).strip()
+
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end <= start:
+        return {"pass": None, "reason": "", "parse_error": "裁判输出中未找到 JSON"}
+    try:
+        data = json.loads(text[start : end + 1])
+    except json.JSONDecodeError as e:
+        return {"pass": None, "reason": "", "parse_error": f"JSON 解析失败: {e}"}
+
+    passed = data.get("pass")
+    if isinstance(passed, str):
+        passed = passed.strip().lower() in {"true", "yes", "y", "通过", "达标"}
+    if not isinstance(passed, bool):
+        return {
+            "pass": None,
+            "reason": str(data.get("reason", "")),
+            "parse_error": "缺少布尔字段 pass",
+        }
+    return {"pass": passed, "reason": str(data.get("reason", "")), "parse_error": ""}
+
+
 def _content_summary(case: Case) -> str:
     """测试内容摘要：用例编号 + 类型（多轮再标注）。"""
     suffix = "（多轮）" if case.multi_turn else ""
@@ -505,6 +896,142 @@ def _append_csv(path: Path, rows: list[dict[str, str]]) -> None:
         if write_header:
             writer.writeheader()
         writer.writerows(rows)
+
+
+# ---------------- 证据采集辅助 ----------------
+
+
+def _is_file_target(value: str) -> bool:
+    """evidence 取值是"文件"还是"表"：有路径分隔符或以 .md 结尾的按文件处理。"""
+    return value.endswith(".md") or "/" in value or "\\" in value
+
+
+def _session_id_of(agent: Any) -> str:
+    """从 agent 上取 session_id（agent._session.meta_data.session_id）。"""
+    session = getattr(agent, "_session", None)
+    meta = getattr(session, "meta_data", None)
+    return getattr(meta, "session_id", "") or ""
+
+
+def session_file_path(work_data_path: Path, session_folder: Path, session_id: str) -> Path:
+    """按 session_id + 数据根定位 session 文件（与 SessionStore 的规则一致）。"""
+    return project_path_to_session_folder(work_data_path, session_folder) / f"{session_id}.jsonl"
+
+
+def _resolve_path_placeholders(raw: str) -> str:
+    """把 evidence 里的 `<year>/<month>/<date>` 占位符解析为具体日期（按本地日期）。"""
+    today = datetime.datetime.now()
+    return (
+        raw.replace("<year>", f"{today:%Y}")
+        .replace("<month>", f"{today:%m}")
+        .replace("<date>", f"{today:%Y-%m-%d}")
+    )
+
+
+def _read_text(path: Path) -> str | None:
+    """读取文本文件；不存在或非 UTF-8 文本时返回 None。"""
+    if not path.is_file():
+        return None
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _in_window(value: Any, t_start: str, t_end: str) -> bool:
+    """`created_at` 是否落在时间窗内。
+
+    SQL 已用字符串粗筛（写入方统一 ISO UTC 格式）；这里按时间解析复核。
+    解析失败的保守保留（宁可多给裁判一行，也不静默丢证据）。
+    """
+    if not isinstance(value, str):
+        return True
+    try:
+        moment = datetime.datetime.fromisoformat(value)
+        return datetime.datetime.fromisoformat(t_start) <= moment <= datetime.datetime.fromisoformat(t_end)
+    except ValueError:
+        return True
+
+
+def _table_result(
+    table: str,
+    rows: list[dict],
+    columns: list[str] | None = None,
+    note: str = "",
+    error: str = "",
+) -> dict:
+    """组装一条"表类证据"结果。"""
+    return {
+        "kind": "table",
+        "table": table,
+        "columns": columns or [],
+        "rows": rows,
+        "row_count": len(rows),
+        "note": note,
+        "error": error,
+    }
+
+
+def _file_diff(base_path: Path, current_path: Path, rel: str) -> dict:
+    """对比同一相对路径在 base 与 work 中的文本，产出统一 diff 结构。"""
+    current_text = _read_text(current_path)
+    base_text = _read_text(base_path)
+    exists = current_text is not None
+    new_file = exists and base_text is None
+
+    result = {
+        "kind": "file",
+        "resolved_path": rel,
+        "exists": exists,
+        "changed": False,
+        "new_file": new_file,
+        "diff": "",
+        "added_lines": 0,
+        "removed_lines": 0,
+    }
+    if not exists:
+        return result
+
+    before = base_text if base_text is not None else ""
+    if before == current_text:
+        return result
+
+    diff_lines = list(
+        difflib.unified_diff(
+            before.splitlines(),
+            current_text.splitlines(),
+            fromfile="base",
+            tofile="current",
+            lineterm="",
+            n=DIFF_CONTEXT,
+        )
+    )
+    result["changed"] = True
+    result["diff"] = "\n".join(diff_lines)
+    result["added_lines"] = sum(
+        1 for line in diff_lines if line.startswith("+") and not line.startswith("+++")
+    )
+    result["removed_lines"] = sum(
+        1 for line in diff_lines if line.startswith("-") and not line.startswith("---")
+    )
+    return result
+
+
+def _iter_candidate_files(root: Path) -> set[str]:
+    """遍历目录下的候选文本文件，返回相对 posix 路径集合（跳过二进制/超大文件）。"""
+    if not root.is_dir():
+        return set()
+    found: set[str] = set()
+    for path in root.rglob("*"):
+        if not path.is_file() or path.suffix.lower() in SKIP_SUFFIXES:
+            continue
+        try:
+            if path.stat().st_size > MAX_TEXT_BYTES:
+                continue
+        except OSError:
+            continue
+        found.add(path.relative_to(root).as_posix())
+    return found
 
 
 # ---------------- 便捷入口 ----------------

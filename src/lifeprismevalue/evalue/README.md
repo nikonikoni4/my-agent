@@ -57,7 +57,10 @@ run(cases_path):
                                   handover_after 前 N 轮走脚本，之后交给 simulator
           - 三个 agent 各建自己的 Session（name 分别 under_test / simulator / judge）
 
-       f. 记 t_end（UTC）
+       f. 记 t_end（UTC）；读 turn 终态（`turn/end` 记录，`TurnEndData`）
+          - 全部 success → 继续
+          - 出现 error / interrupted → 该用例不判、不重试、不再注入后续轮次，
+            以「运行未正常结束」收口（证据与统计仍照常落盘，供排查）
 
        g. 落盘 + 复制改名：
           - 先 flush（调 presist() / 等 ≥2s / 停持久化循环），否则丢最后一批
@@ -87,3 +90,4 @@ run(cases_path):
 2. **session 只能"跑完复制改名"（步骤 g）**：`SessionPresist` 的文件名固定为 `<session_id>.jsonl`，运行时 append 到固定路径，**不支持改名**；且后台每 2 秒批量落盘，复制前必须 flush，否则丢最后一批。不改源码。
 3. **evidence 分两类取法（步骤 h）**：DB 表按 `created_at` 时间窗筛（用写入时间而非业务时间 `event_time`，因为可能"记录昨天的事"）；`.md` 文件没有时间戳，只能前后快照 diff 或取终态，日记路径需在运行时解析成当天日期。
 4. **判定以落库 / 落盘为准**：模型口头说"已记录"但未落库，算失败。
+5. **运行终态要单独区分（步骤 f）**：`turn/end` 记录（`TurnEndData`）说明本轮是跑完还是中途失败，带 `reason_type` / `reason_text` / `error_type`——`error_type` 是最外层异常类名（如 `AgentUnclaimedError`、`RetryExhaustedError`、`MaxStepsExceededError`），`reason_text` 是异常链文本（逐层 `类型: 消息`，最多 3 层）。loop 对任何未恢复的异常都以 `error` 收口（含步数上限、重试耗尽），取消为 `interrupted`；据此非 success 就**不判、不重试、停止后续轮次**，否则网络抖动之类会被算成"agent 记错了"，污染结论。`TURN_END` 事件本身不带信息，故只能从 session 读（见 `docs/adr/2026-09-15-session错误信息记录策略.md`）。
