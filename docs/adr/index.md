@@ -1,13 +1,16 @@
 ---
-version: 1.7
+version: 2.0
 created_at: 2026-09-03
-updated_at: 2026-09-11
-last_updated: 反转 2026-09-10 cancel 决策（cancel 取消并结束循环、删除 stop），同步索引条目
+updated_at: 2026-09-15
+last_updated: 新增 2026-09-15 agent loop 错误处理重构条目
 abstract: agent 项目架构决策索引。
 ---
 
 | 日期 | 决策标题 | 状态 | 项目名 | 详情 |
 |------|---------|------|--------|------|
+| 2026-09-15 | agent loop 错误处理重构（2 个 except + finally 三阶段 + 终止统一抛出 + 预算检查并入） | decided | agent | [详情](.\2026-09-15-agent-loop错误处理重构.md) |
+| 2026-09-15 | 异常分类树新增策略域与未知域（AgentPolicyError 窄域 + AgentUnknownError 兜底 + 一级域按"终结路径"划分） | decided | agent | [详情](.\2026-09-15-异常分类树新增策略域与未知域.md) |
+| 2026-09-15 | session 错误信息记录策略（类别 + 异常链文本 + 限深 3 层 + 重试每次失败都落记录） | decided | agent | [详情](.\2026-09-15-session错误信息记录策略.md) |
 | 2026-09-10 | cancel 取消并结束循环（与 asyncio 对齐 + 取消逐层传播到 _loop 消化 + send 按需重启，删除 stop） | decided | agent | [详情](.\2026-09-10-cancel取消并结束循环.md) |
 | 2026-09-10 | LLM 重试延迟退避策略（统一指数退避公式 + 参数放策略注册表 + 优先 Retry-After） | decided | agent | [详情](.\2026-09-10-LLM重试延迟退避策略.md) |
 | 2026-09-10 | LLM 调用失败时的 session 补齐策略（保留已产出 chunk + 补 error finish 块 + 不补 assistant/message） | decided | agent | [详情](.\2026-09-10-LLM调用失败时的session补齐策略.md) |

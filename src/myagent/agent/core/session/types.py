@@ -252,6 +252,12 @@ class TextChunkData:
     
 @dataclass
 class LLMRetryData(SessionData):
-    """llm/retry：一次重试决策记录（第几次重试、因何决策）。"""
-    retry_count : int # 第n次重试
-    reason : str # 重试原因（触发重试的决策，如 backoff_retry）
+    """llm/retry：一次失败的处置记录（第几次重试、因何决策、原始错误）。
+
+    语义已扩展：不只覆盖"决定重试"，也覆盖"无人认领"与"重试耗尽"——每次失败都在
+    发生点留一条，保证最后一次失败不以纯文本形态存在（见 ADR session 错误信息记录策略）。
+    """
+    retry_count : int # 第n次重试；非重试的收尾记 0 或已达上限的次数
+    reason : str # 处置决策（retry / backoff_retry / unclaimed / exhausted）
+    error_type : str = "" # 触发本次处置的错误类名
+    error_message : str = "" # 触发本次处置的错误信息（异常链文本）

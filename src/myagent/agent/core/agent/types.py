@@ -21,8 +21,9 @@ class AgentContext:
     session : Session
 
 @dataclass
-class StepOut:
+class FinalResult:
     reason_type : Literal["success","interrupted","error"]
     reason_text : str  
+    error_type : str = ""
 
 
