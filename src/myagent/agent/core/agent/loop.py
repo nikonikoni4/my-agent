@@ -1,25 +1,22 @@
 from dataclasses import dataclass
 from typing import Literal
 import uuid
-from myagent.agent import execption
 from myagent.agent.core.agent.types import AgentConfig, FinalResult
-from myagent.agent.core.session import session
 from myagent.agent.core.systemprompt import AssemblyPrompt, SystemPrompt
 from myagent.infra.events import EventService
 from myagent.agent.core.tool.register import ToolRegister
 from myagent.agent.execption import AgentUnclaimedError, LLMCallError, MaxStepsExceededError, RetryExhaustedError
-from myagent.agent.core.provider import LLMProvider,ChatParams, LLMResponse,Message, StreamChunk,Usage
+from myagent.agent.core.provider import LLMProvider,LLMResponse,Message
 from myagent.agent.core.session.types import (
-    AssistantChunkData, SessionMetaData,ToolCallChunksData,AssistantMessageData, StepEndData,CompactionStartData,
-    SessionRecordData,ReasoningChunksData,ToolCallData,ToolResultData,TurnEndData,CompactionSummaryData,
-    TurnStartData,StepStartData,UserMessageData,ContentChunksData,RequestHeaderData,CompactionEndData,
+    AssistantChunkData,AssistantMessageData, StepEndData,
+    ToolCallData,ToolResultData,TurnEndData,
+    TurnStartData,StepStartData,UserMessageData,RequestHeaderData,
     LLMRetryData,
 )
 from myagent.agent.core.session.session import Session
 
 import asyncio 
 import logging
-
 from myagent.infra.events.eventspec import (
     TURN_START, STEP_START, REQUEST_HEADER, USER_MESSAGE,
     ASSISTANT_CHUNK, ASSISTANT_MESSAGE, TOOL_CALL, TOOL_RESULT,
@@ -33,7 +30,6 @@ from myagent.infra.events.payload import (
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 LLM_CALL_TIMEOUT = 120
-TOOL_CALL_TIMEOUT = 60
 # 异常链渲染的层数上限：当前错误链最长 3 层（httpx->LLMConnectionError->AgentUnclaimedError）
 ERROR_CHAIN_MAX_DEPTH = 3
 # 需要"继续下一轮"的决策；其余决策一律结束本 turn 的循环
@@ -192,8 +188,9 @@ class ReActAgentLoop:
         # 步骤 1：已有未结束的任务则直接复用
         if self._task is not None and not self._task.done():
             return self._task
-        # 步骤 2：创建循环任务并持有句柄
+        # 步骤 2：创建循环任务并持有句柄，并接线结束回调（取回异常，防止静默失败）
         self._task = asyncio.create_task(self._loop())
+        self._task.add_done_callback(self._on_loop_done)
         return self._task
 
     def cancel(self):
@@ -233,8 +230,9 @@ class ReActAgentLoop:
             不直接触发事件；每条消息经 turn 触发 TURN_START / TURN_END 及其内部各事件。
 
         Raises:
-            仅吞掉 CancelledError；turn 上抛的其它异常不在此捕获，会使循环任务以该
-            异常结束（循环随之停止，需重新 start）。
+            仅吞掉 CancelledError（记一条 warning 后 break）；turn 上抛的其它异常不在此
+            捕获，会使循环任务以该异常结束（循环随之停止，需重新 start），该异常由
+            start() 接线的 _on_loop_done 取回并记 error 日志。
         """
         while True :
             try :
@@ -249,7 +247,46 @@ class ReActAgentLoop:
                     await self .turn( self .inbox[ "next_turn" ].pop( 0 ))
             # 步骤 4：被取消则结束循环任务
             except asyncio.CancelledError:
+                # 取消 = 结束循环。吞掉取消后协程不会被标记为 cancelled，while 也不会
+                # 自己停，所以必须在此显式 break；在途的取消已由 step/turn 记好
+                # interrupted 终态，并原样上抛到这里
+                logger.warning("agent loop 收到取消：打断循环，任务结束")
                 break
+
+    def _on_loop_done(self,task:asyncio.Task):
+        """loop 任务结束回调：取回 task 异常，防止静默失败。
+
+        create_task 产出的 task 若无人 await、也无人取异常，异常会被 asyncio 吞掉
+        （仅在 task 被 GC 时打印 "Task exception was never retrieved"）；start() 的
+        调用方通常也不 await 该 task，本回调是这一异常的唯一出口：
+
+        - 正常结束（含因取消 break）：exc 为 None，无需处理
+        - 有异常：记 error 日志（带堆栈），使失败在日志中可见
+
+        注意：取回异常本身也会抑制 asyncio 的 "never retrieved" 警告，因此这里
+        必须保证异常不被丢弃。
+
+        Args:
+            task: 结束的 _loop 任务。
+
+        Returns:
+            None。
+
+        Events:
+            无。
+
+        Raises:
+            无（task.exception() 在 cancelled 时也会抛，故先判 cancelled）。
+        """
+        # 步骤 1：被取消的任务没有异常可取
+        if task.cancelled():
+            return
+        # 步骤 2：取异常，正常结束则无事
+        exc = task.exception()
+        if exc is None:
+            return
+        # 步骤 3：记 error 日志（带堆栈），让循环的死亡在日志里可见
+        logger.error(f"agent loop 任务异常终止：{exc!r}",exc_info=exc)
 
     async def send(self,user_prompt : str | list,send_type : Literal["next_turn","next_step"]="next_turn"):
         """向 loop 投递一条用户消息并唤醒循环。

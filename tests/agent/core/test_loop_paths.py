@@ -9,10 +9,11 @@
 == 入口 / 调度层 ==
 E1  start() 启动后台循环（整个 loop 一个 task）；send 把消息写入 inbox["next_turn"] 并唤醒
 E2  _loop 被唤醒后按序执行 turn 并消费 inbox（next_step 优先于 next_turn）
-E3  loop 因异常终止 → 异常留在 loop task 上（由调用方取回，不静默丢弃），循环停止
+E3  _on_loop_done：loop 因未归一化异常终止 → 异常留在 loop task 上（可被调用方取回），
+    并由回调 logger.error 留痕（防止静默失败）
 E4  cancel() 打断在途 turn 并结束循环：step/turn 记 interrupted，取消传播到 _loop 后
-    被消化（break），loop task 正常结束
-E5  cancel() 落在空闲等待时：同样 break 结束循环；之后 send() 按需重启循环
+    被消化（记 warning + break），loop task 正常结束、无 error 日志
+E5  cancel() 落在空闲等待时：同样记 warning + break 结束循环；之后 send() 按需重启循环
 
 == 正常收敛（不外抛） ==
 P1  模型不再请求工具 → step/end success，turn/end success
@@ -47,11 +48,12 @@ openai provider 的 mock 数据用例见 test_openai_provider_mock.py。
 """
 
 import asyncio
-from types import SimpleNamespace
+import logging
 
 import pytest
 
 from myagent.agent.core.agent.loop import ReActAgentLoop, _format_error_chain
+from myagent.agent.core.agent.types import AgentConfig
 from myagent.agent.core.provider import (
     LLMProvider,
     LLMResponse,
@@ -78,6 +80,8 @@ from myagent.agent.execption import (
 from myagent.agent.llm.llm_retry import LLMRerty
 from myagent.infra.events.eventspec import REQUEST_ERROR
 from myagent.infra.events.service import EventService
+
+LOOP_LOGGER = "myagent.agent.core.agent.loop"
 
 
 # ---------------------------------------------------------------------------
@@ -186,7 +190,7 @@ def make_loop(script, *, tools=None, step_limit=10, max_retry_count=2, retry_str
     event_service = EventService()
     session = Session(EventService(), SessionMetaData(cwd="."))
     session.presistence = NoopPersistence()
-    config = SimpleNamespace(step_limit=step_limit, max_retry_count=max_retry_count)
+    config = AgentConfig(step_limit=step_limit, max_retry_count=max_retry_count)
     provider = ScriptedProvider(script)
     loop = ReActAgentLoop(
         event_service, session, SystemPrompt(), config, provider,
@@ -301,18 +305,19 @@ async def test_E2_loop优先消费next_step():
 
 
 @pytest.mark.asyncio
-async def test_E3_loop异常终止_异常留在task上不静默():
-    """loop 内的异常不就地吞掉：turn 归一化终态后原样上抛，_loop 只消化取消，
-    故异常留在 loop task 上（调用方取回），循环随之停止、不再消费后续消息"""
+async def test_E3_on_loop_done_异常终止记error日志(caplog):
+    """loop 因未归一化异常终止时 _on_loop_done 取回异常并 logger.error（避免静默失败）；
+    取回不减损可观测性：异常本身仍留在 loop task 上，调用方仍可取到"""
     loop, provider, session = make_loop([RuntimeError("provider boom")])
     loop_task = loop.start()
     try:
-        await loop.send("你好", "next_turn")
-        await wait_until(lambda: loop_task.done())
+        with caplog.at_level(logging.ERROR, logger=LOOP_LOGGER):
+            await loop.send("你好", "next_turn")
+            await wait_until(lambda: "agent loop 任务异常终止" in caplog.text)
         error = loop_task.exception()
         assert isinstance(error, AgentUnclaimedError)
         assert isinstance(error.__cause__, RuntimeError)
-        assert "provider boom" in str(error.__cause__)
+        assert "provider boom" in caplog.text, "日志带上触发它的原错误"
         assert provider.calls == 1, "异常终止后循环停止，不再调模型"
         assert last(session, "turn/end").data.reason_type == "error"
     finally:
@@ -320,33 +325,38 @@ async def test_E3_loop异常终止_异常留在task上不静默():
 
 
 @pytest.mark.asyncio
-async def test_E4_cancel打断在途turn并结束循环():
+async def test_E4_cancel打断在途turn并结束循环(caplog):
     """cancel() 在途取消：step/turn 记 interrupted，取消传播到 _loop 后被消化
-    （break），loop task 正常结束"""
+    （记 warning + break），loop task 正常结束、无 error 日志"""
     loop, provider, session = make_loop(["hang"])
     loop_task = loop.start()
-    await loop.send("取消我", "next_turn")
-    await wait_until(lambda: records(session, "step/start"))
-    loop.cancel()
-    await asyncio.gather(loop_task, return_exceptions=True)
+    with caplog.at_level(logging.WARNING, logger=LOOP_LOGGER):
+        await loop.send("取消我", "next_turn")
+        await wait_until(lambda: records(session, "step/start"))
+        loop.cancel()
+        await asyncio.gather(loop_task, return_exceptions=True)
     assert last(session, "step/end").data.reason_type == "interrupted"
     assert last(session, "turn/end").data.reason_type == "interrupted"
     assert loop_task.done(), "cancel() 应打断循环"
     assert loop_task.cancelled() is False, "取消在 _loop 内被消化，任务应以正常结束收场"
+    assert "打断循环" in caplog.text
+    assert "agent loop 任务异常终止" not in caplog.text, "取消已按 interrupted 收口，不应报异常"
 
 
 @pytest.mark.asyncio
-async def test_E5_空闲态cancel结束循环_可重启():
+async def test_E5_空闲态cancel结束循环_可重启(caplog):
     """loop 空闲（挂在 _wakeup.wait()）时 cancel()：同样打断循环、任务正常结束；
     之后再 send() 会按需重启循环并正常处理消息"""
     loop, provider, session = make_loop([LLMResponse(content="你好", finish_reason="stop")])
     loop_task = loop.start()
     try:
         await asyncio.sleep(0)  # 让 _loop 先启动并挂到等待上（否则取消会落在"未启动"的协程上）
-        loop.cancel()
-        await asyncio.gather(loop_task, return_exceptions=True)
+        with caplog.at_level(logging.WARNING, logger=LOOP_LOGGER):
+            loop.cancel()
+            await asyncio.gather(loop_task, return_exceptions=True)
         assert loop_task.done(), "空闲态 cancel() 也应结束 loop"
         assert loop_task.cancelled() is False, "取消在 _loop 内被消化，任务应以正常结束收场"
+        assert "打断循环" in caplog.text
         assert provider.calls == 0
         # cancel 后 loop 仍可用：send 自动重启循环
         await loop.send("你好", "next_turn")
@@ -878,7 +888,7 @@ async def test_请求组装_自定义提示词与落盘还原(tmp_path):
     system_prompt.register_context("coder", "当前时间: 2026-09-12")
 
     provider = ScriptedProvider([LLMResponse(content="好的", finish_reason="stop")])
-    config = SimpleNamespace(step_limit=10, max_retry_count=2)
+    config = AgentConfig(step_limit=10, max_retry_count=2)
     loop = ReActAgentLoop(event_service, session, system_prompt, config, provider,
                           name="coder", prompt_render_parame={})
 

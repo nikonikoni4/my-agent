@@ -8,11 +8,11 @@
 """
 
 import asyncio
-from types import SimpleNamespace
 
 import pytest
 
 from myagent.agent.core.agent.loop import ReActAgentLoop
+from myagent.agent.core.agent.types import AgentConfig
 from myagent.agent.core.provider import LLMProvider, LLMResponse, Message, Usage
 from myagent.agent.core.session.session import Session
 from myagent.agent.core.session.types import SessionMetaData
@@ -66,7 +66,7 @@ def make_loop(script: list, max_retry_count: int, strategy: LLMRerty):
     event_service = EventService()
     session = Session(EventService(), SessionMetaData(cwd="."))
     session.presistence = NoopPersistence()
-    config = SimpleNamespace(step_limit=10, max_retry_count=max_retry_count)
+    config = AgentConfig(step_limit=10, max_retry_count=max_retry_count)
     provider = ScriptedErrorProvider(script)
     loop = ReActAgentLoop(event_service, session, SystemPrompt(), config, provider)
     event_service.register(REQUEST_ERROR.name, strategy.request_error_event)

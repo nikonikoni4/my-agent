@@ -10,12 +10,12 @@
    reason=change）；turn/end 事件清空熔断状态，工具恢复
 """
 
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from myagent.agent.core.agent.loop import ReActAgentLoop
+from myagent.agent.core.agent.types import AgentConfig
 from myagent.agent.core.provider import (
     LLMProvider,
     LLMResponse,
@@ -85,15 +85,11 @@ class NoopPersistence:
 
 
 def make_loop(tool: Tool, rounds: list[list], step_limit: int):
-    """组装被测 ReActAgentLoop：真实 SystemPrompt + 假 Provider + 熔断工具。
-
-    AgentConfig 的字段仍在重构中（当前定义只有 step_limit，而 loop 还引用
-    prompt_render_parame），故用 SimpleNamespace 同时提供两个字段。
-    """
+    """组装被测 ReActAgentLoop：真实 SystemPrompt + 假 Provider + 熔断工具。"""
     event_service = EventService()
     session = Session(EventService(), SessionMetaData(cwd="."))
     session.presistence = NoopPersistence()
-    config = SimpleNamespace(step_limit=step_limit, prompt_render_parame={})
+    config = AgentConfig(step_limit=step_limit, max_retry_count=2)
     provider = FakeProvider(rounds)
     loop = ReActAgentLoop(event_service, session, SystemPrompt(), config, provider)
     loop.tool_register.register(tool)
