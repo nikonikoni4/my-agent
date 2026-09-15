@@ -5,7 +5,8 @@ from typing import Any
 class MyAgentError(Exception):
     """项目异常基类。
 
-    所有业务异常必须继承此类。通过 code / details / cause 携带结构化上下文。
+    所有业务异常必须继承此类。通过 code / details 携带结构化上下文，
+    原因链由异常链本身（`raise X from e` → __cause__）承载。
 
     注意：
     - to_dict() 用于调试和日志记录，包含完整的异常信息（error_type + cause）
@@ -18,16 +19,12 @@ class MyAgentError(Exception):
         message: str | None = None,
         code: str | None = None,
         details: dict[str, Any] | None = None,
-        cause: Exception | None = None,
     ):
         final_message = message or self.__class__.__name__
         self.code = code
         self.message = final_message
         self.details = details or {}
-        self.cause = cause
         super().__init__(final_message)
-        if cause is not None:
-            self.__cause__ = cause
 
     def to_dict(self) -> dict[str, Any]:
         """将异常序列化为字典（用于调试和日志记录）。
@@ -41,7 +38,7 @@ class MyAgentError(Exception):
             "code": self.code,
             "details": self.details,
         }
-        if self.cause is not None:
-            result["cause"] = str(self.cause)
+        if self.__cause__ is not None:
+            result["cause"] = str(self.__cause__)
         return result
 

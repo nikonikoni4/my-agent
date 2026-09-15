@@ -101,7 +101,6 @@ def _classify_openai_error(e: openai.APIError) -> LLMCallError:
             "error_code": err_code,
             "retry_after": _retry_after(e),
         },
-        cause=e,
     )
 
 
