@@ -152,7 +152,7 @@ class TurnEndData(SessionData):
     """turn/end：一轮结束。"""
     reason_type: Literal["success", "interrupted","error"]
     reason_text : str 
-
+    error_type : str
 
 @dataclass
 class CompactionStartData(SessionData):

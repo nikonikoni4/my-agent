@@ -1,8 +1,8 @@
 ---
-version: 1.1
+version: 1.2
 created_at: 2026-09-15
 updated_at: 2026-09-15
-last_updated: 补记两项未决项的落定：兜底域类名定为 AgentUnclaimedError、dont_retry 档已从策略表移除；同步测试跟进状态
+last_updated: 补记两项未决项的落定：兜底域类名定为 AgentUnclaimedError、dont_retry 档已从策略表移除；FinalResult.error_type 已写入 turn/end；同步测试跟进状态
 abstract: ReActAgentLoop 的错误处理重构为「2 个 except + finally 内三阶段（补全/记账/决策）」；终止统一以抛出表达（turn 由异常得知终态），预算检查并入同一决策路径并以 step_opened 保证 step 配对，每次失败在发生点落 llm/retry
 status: decided
 ---
@@ -15,6 +15,7 @@ status: decided
 | ---- | -------- |
 | 1.0 | 创建文档初稿 |
 | 1.1 | 补记未决项落定（类名 → `AgentUnclaimedError`）、`dont_retry` 移除已落地、测试已按新结构重写 |
+| 1.2 | `FinalResult.error_type` 写入 `turn/end` 并补上断言；两项未决项至此清零 |
 
 ## 问题界定
 
@@ -38,7 +39,7 @@ status: decided
 - 错误类型树的分域——见《异常分类树新增策略域与未知域》。
 - session 错误记录的字段与层级——见《session 错误信息记录策略》。
 - 各错误类别的具体处置策略（人在回路、降级等）——后续独立决策。
-- 未决项：`FinalResult.error_type` 的最终落点（类名已于 1.1 定为 `AgentUnclaimedError`）。
+- 未决项：无（`FinalResult.error_type` 的落点见"后续影响"，类名已于 1.1 定为 `AgentUnclaimedError`）。
 
 ### 模糊信息的明确定义
 
@@ -153,9 +154,9 @@ status: decided
 
 ## 后续影响
 
-- 未决项（本 ADR 不含）：`FinalResult.error_type` 的最终落点（当前算出但未写入 `turn/end`）。
+- `FinalResult.error_type` 的落点已定并落地：写入 `turn/end`（成功为 `""`、取消为 `CancelledError`、其余为终止本 turn 的类别，如 `AgentUnclaimedError` / `RetryExhaustedError`）；原错误不占该字段，只留在 `reason_text` 链里。
 - 兜底域类名落定为 `AgentUnclaimedError`（原 `LLmError` → 中间态 `AgentUnknownError`）；`LLMRerty` 的 `dont_retry` 档已移除，认证 / 模型 / 接入点类错误改走无人认领 → 停止。
-- `LLMRetryData` 语义扩展为"失败处置记录"并新增两个字段；**注意 session 加载边界是"字段不符抛异常"**，历史 session 中只有 2 个字段的 `llm/retry` 记录可能加载失败，待验证。
+- `LLMRetryData` 语义扩展为"失败处置记录"并新增两个字段；`TurnEndData` 新增 `error_type`（必填，无默认值）。**注意 session 加载边界是"字段不符抛异常"**：本次改动之前写出的 `turn/end` / `llm/retry` 记录在 `SessionStore.load` 时会因缺字段抛 `TypeError`（当前仓库内无此格式的存量文件，属前瞻风险）。
 - `llm_retry_count` 的口径随之扩大（`unclaimed`/`exhausted` 也计入）；因二者都是终止、之后不再计算 `attempt`，退避次数不受影响，但**统计 `llm/retry` 条数的地方要同步认知**。
 - `_complete_session` 目前是"扫描全量记录、补齐未配对的 `tool/call`"，实现者已标注需要重做（性能与作用域都需要收窄到本轮）。
 - 测试已按新结构重写：出路穷举（E/P/R 三组）+ 异常链渲染 + `step` 配对 + 消息面补全；断言口径为 `AgentUnclaimedError`（cause 为触发它的原错误）。

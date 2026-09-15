@@ -37,6 +37,9 @@ R1  每次失败都在发生点落 llm/retry（unclaimed / exhausted 也落）�
 R2  异常链文本：逐层缩进、限深 3 层（超出显式标注）、展开 ExceptionGroup
 R3  step_opened：预算在开步前拒绝的那一轮不写 step/end（step/start 与 step/end 严格配对）
 R4  补全：异常打断工具调用时补齐占位 tool/result（is_error=True），避免非法消息面
+R5  turn/end 的 error_type 承载"终止本 turn 的类别"（成功空串 / 耗尽 RetryExhaustedError），
+    原错误只留在 reason_text 链里
+R6  无人认领时类别也可查：error_type=AgentUnclaimedError，cause 在 reason_text 链中
 
 请求组装的用例（System Prompt / System Reminder / runtime context 的落点）见文件末尾"请求组装"一节。
 
@@ -466,6 +469,7 @@ async def test_P5_用户取消_step与turn记interrupted后上抛():
     assert last(session, "step/end").data.reason_type == "interrupted"
     assert last(session, "turn/end").data.reason_type == "interrupted"
     assert last(session, "turn/end").data.reason_text == "用户主动打断"
+    assert last(session, "turn/end").data.error_type == "CancelledError", "终态类别记异常类名"
 
 
 @pytest.mark.asyncio
@@ -723,13 +727,51 @@ async def test_R4_异常打断工具调用_补齐占位tool_result():
     with pytest.raises(AgentUnclaimedError):
         await loop.turn(user_message())
 
-    assert [c.data.call_id for c in records(session, "tool/call")] == ["c1"]
+    calls = records(session, "tool/call")
     results = records(session, "tool/result")
+    assert [c.data.call_id for c in calls] == ["c1"]
     assert [r.data.call_id for r in results] == ["c1"]
     assert results[0].data.is_error is True
     assert "被中断" in results[0].data.message.content
     # 补齐后消息面合法：tool_calls 之后必有 role=tool 的响应
     assert session.derive_messages()[-1].role == "tool"
+
+
+@pytest.mark.asyncio
+async def test_R5_turnend记终态错误类别():
+    """turn/end 的 error_type 承载"终止本 turn 的类别"，不是异常链里的原错误：
+    成功为空串；重试耗尽记 RetryExhaustedError，原错误（429 限流）只留在 reason_text 链里"""
+    strategy = LLMRerty()
+    script = [
+        LLMResponse(content="成功", finish_reason="stop"),
+        LLMRateLimitError("429 限流"),
+        LLMRateLimitError("429 限流"),
+    ]
+    loop, provider, session = make_loop(script, max_retry_count=1, retry_strategy=strategy)
+    install_recording_delay(loop)
+
+    await loop.turn(user_message("第一轮"))
+    with pytest.raises(RetryExhaustedError):
+        await loop.turn(user_message("第二轮"))
+
+    ends = records(session, "turn/end")
+    assert [e.data.reason_type for e in ends] == ["success", "error"]
+    assert [e.data.error_type for e in ends] == ["", "RetryExhaustedError"]
+    assert "LLMRateLimitError" in ends[1].data.reason_text, "原错误只在链文本里，不占类别"
+
+
+@pytest.mark.asyncio
+async def test_R6_无人认领的turnend类别人工可查():
+    """无人认领时 turn/end 记 AgentUnclaimedError（触发它的原错误作为 cause 在链文本里）"""
+    loop, provider, session = make_loop([RuntimeError("provider boom")])
+
+    with pytest.raises(AgentUnclaimedError):
+        await loop.turn(user_message())
+
+    turn_end = last(session, "turn/end")
+    assert turn_end.data.error_type == "AgentUnclaimedError"
+    assert turn_end.data.reason_text.splitlines()[0] == "AgentUnclaimedError: 无错误处理策略的错误"
+    assert "RuntimeError: provider boom" in turn_end.data.reason_text
 
 
 # ===========================================================================

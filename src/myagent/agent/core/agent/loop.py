@@ -336,7 +336,7 @@ class ReActAgentLoop:
                 session.append 的入参校验异常（ValueError / TypeError）同样直接冒出。
         """
         # 步骤 1：预置终态，默认为本轮成功
-        final_result = FinalResult(reason_type="success",reason_text="")
+        final_result = FinalResult(reason_type="success",reason_text="",error_type="")
         try:
             # 步骤 2：写 turn/start 记录并广播
             self._session.append("turn/start",TurnStartData())
@@ -357,7 +357,7 @@ class ReActAgentLoop:
             raise
         finally:
             # 步骤 6：无论成败都写 turn/end 并广播（一并触发工具熔断复位）
-            self._session.append("turn/end",TurnEndData(reason_type=final_result.reason_type,reason_text=final_result.reason_text))
+            self._session.append("turn/end",TurnEndData(reason_type=final_result.reason_type,reason_text=final_result.reason_text,error_type=final_result.error_type))
             self._event_service.trigger(TURN_END,TurnEndPayload())
 
     def _request_header(self,user_message : Message | None) -> list[Message]:
