@@ -4,6 +4,7 @@
 火山方舟只需 base_url 传入 https://ark.cn-beijing.volces.com/api/v3。
 """
 from openai import AsyncOpenAI
+import httpx
 import openai
 import json
 from myagent.agent.core.provider import ChatParams, LLMProvider, LLMResponse, Message, StreamChunk, RawToolCall, Usage
@@ -32,6 +33,18 @@ def _retry_after(e) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _classify_transport_error(e: httpx.TransportError) -> LLMConnectionError:
+    """把 httpx 传输层异常翻译成「连接类」来源（网络断开 / 协议中断 / 超时）。
+
+    为什么需要单独接：流式迭代中冒出的 httpx 异常**不会**被 openai SDK 包装成
+    `openai.APIError`（SDK 仅在 SSE 数据格式错时抛 APIError），所以
+    `except openai.APIError` 接不到它。若不在此归一，它会以裸 httpx 异常冒泡到
+    agent 内核，且不属于任何已登记类型 → 重试策略无人认领 → 直接判失败。
+    归类依据见 ADR: 2026-09-09-LLM错误处理分类策略（连接类 = 网络断开/瞬时不可达）。
+    """
+    return LLMConnectionError(f"{type(e).__name__}: {e}")
 
 
 def _classify_openai_error(e: openai.APIError) -> LLMCallError:
@@ -150,6 +163,10 @@ class OpenAIProvider(LLMProvider):
         except openai.APIError as e :
             logger.debug(f"llm call 错误 {e}")
             raise _classify_openai_error(e) from e
+        except httpx.TransportError as e:
+            # SDK 未包装的传输层异常（如 RemoteProtocolError / ConnectError / 超时）
+            logger.debug(f"llm call 传输错误 {e}")
+            raise _classify_transport_error(e) from e
 
         print(completion)
         return LLMResponse(
@@ -254,6 +271,10 @@ class OpenAIProvider(LLMProvider):
         except openai.APIError as e:
             logger.debug(f"llm stream 错误 {e}")
             raise _classify_openai_error(e) from e
+        except httpx.TransportError as e:
+            # 流式迭代里冒出的传输层异常（SDK 不包装，须在此归一为连接类）
+            logger.debug(f"llm stream 传输错误 {e}")
+            raise _classify_transport_error(e) from e
 
         # 流正常结束才产出 finish 块：中途抛错时不会执行到这里，该块自然缺失，
         # 以此与正常结束区分。（错误发生时如何补/不补该块，后续错误处理再做）
