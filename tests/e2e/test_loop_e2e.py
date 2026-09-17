@@ -35,16 +35,20 @@ from myagent.infra.events.service import EventService
 from myagent.utils.helper import project_path_to_session_folder
 
 load_dotenv()
+# 模型 / 接口地址 / Key 统一来自项目根 .env
 API_KEY = os.getenv("ARK_API_KEY")
+MODEL = os.getenv("MODEL")
+BASE_URL = os.getenv("BASE_URL")
 pytestmark = [
     pytest.mark.e2e,
-    pytest.mark.skipif(API_KEY is None, reason="缺少 ARK_API_KEY（项目根 .env），跳过真实 LLM e2e"),
+    pytest.mark.skipif(
+        not (API_KEY and MODEL and BASE_URL),
+        reason="缺少 ARK_API_KEY / MODEL / BASE_URL（项目根 .env），跳过真实 LLM e2e",
+    ),
 ]
 
 AGENT_NAME = "loop_selftest"
 PROMPT_SECTION_ORDER = 50  # 标号取 50~99 范围内
-MODEL = "doubao-seed-1-6-flash-250828"
-BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 SINGLE_TURN_PROMPT = "请帮我查一下2026-09-08北京的天气，顺便告诉我北京市政府的地址"
 # 多轮轮次设计：工具轮 -> 换一个工具的轮 -> 纯上下文总结轮
 MULTI_TURN_PROMPTS = [

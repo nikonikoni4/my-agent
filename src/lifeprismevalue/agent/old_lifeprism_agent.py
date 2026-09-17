@@ -22,10 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from pathlib import Path
-
-from dotenv import load_dotenv
 
 from myagent.agent.core.agent.loop import ReActAgentLoop
 from myagent.agent.core.agent.types import AgentConfig
@@ -33,14 +30,13 @@ from myagent.agent.core.session import Session, SessionStore
 from myagent.agent.core.systemprompt import PrompSection, SystemPrompt
 from myagent.agent.llm.llm_retry import LLMRerty
 from myagent.agent.llm.openai_provider import OpenAIProvider
+from myagent.config.system_config import get_llm_api_key, get_llm_base_url, get_llm_model
 from myagent.infra.events import EventService
 from myagent.infra.events.eventspec import REQUEST_ERROR
 
 from lifeprismevalue.config import get_lifeprism_data_path
 from lifeprismevalue.prompts import PromptLoader
 from lifeprismevalue.tools import build_lifeprism_tools
-
-load_dotenv()
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -50,9 +46,6 @@ AGENT_NAME = "old_agent"
 SESSION_FOLDER = Path("localData")
 # 文件工具白名单，与旧 lifeprism 的 ALLOWED_DIRS 对齐（identity 末尾的目录说明会用到）
 ALLOWED_DIRS = ["user", "diary", "agent"]
-
-MODEL = os.getenv("LIFEPRISM_MODEL", "doubao-seed-1-6-flash-250828")
-BASE_URL = os.getenv("LIFEPRISM_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3")
 
 
 class _SafeDict(dict):
@@ -272,9 +265,9 @@ def create_old_agent(
         session = store.create(name, data_path)
 
     llm_client = OpenAIProvider(
-        model=MODEL,
-        api_key=os.getenv("ARK_API_KEY", ""),
-        base_url=BASE_URL,
+        model=get_llm_model(),
+        api_key=get_llm_api_key(),
+        base_url=get_llm_base_url(),
     )
     agent_config = AgentConfig(step_limit=step_limit, max_retry_count=max_retry_count)
     agent_loop = ReActAgentLoop(

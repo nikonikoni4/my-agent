@@ -10,10 +10,7 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
-
-from dotenv import load_dotenv
 
 from myagent.agent.core.agent.loop import ReActAgentLoop
 from myagent.agent.core.agent.types import AgentConfig
@@ -21,19 +18,15 @@ from myagent.agent.core.session import Session, SessionStore
 from myagent.agent.core.systemprompt import PrompSection, SystemPrompt
 from myagent.agent.llm.llm_retry import LLMRerty
 from myagent.agent.llm.openai_provider import OpenAIProvider
+from myagent.config.system_config import get_llm_api_key, get_llm_base_url, get_llm_model
 from myagent.infra.events import EventService
 from myagent.infra.events.eventspec import REQUEST_ERROR
 
 from lifeprismevalue.config import get_lifeprism_data_path
 
-load_dotenv()
-
 AGENT_NAME = "judge"
 # 会话落盘根目录（gitignored）；lifeprism 数据目录编码为其下的一层项目子目录
 SESSION_FOLDER = Path("localData")
-
-MODEL = os.getenv("LIFEPRISM_MODEL", "doubao-seed-1-6-flash-250828")
-BASE_URL = os.getenv("LIFEPRISM_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3")
 
 # 裁判提示词（当前简化版：只判"产出是否满足判分要点"）。
 # 输入约定：runner 会把「判分要点 + 本次证据 + 被评估 agent 对话」拼成一条 user 消息发过来，
@@ -147,9 +140,9 @@ def create_judge_agent(
         session = store.create(name, data_path)
 
     llm_client = OpenAIProvider(
-        model=MODEL,
-        api_key=os.getenv("ARK_API_KEY", ""),
-        base_url=BASE_URL,
+        model=get_llm_model(),
+        api_key=get_llm_api_key(),
+        base_url=get_llm_base_url(),
     )
     agent_config = AgentConfig(step_limit=step_limit, max_retry_count=max_retry_count)
     agent_loop = ReActAgentLoop(

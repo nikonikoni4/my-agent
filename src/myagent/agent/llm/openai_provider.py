@@ -290,8 +290,7 @@ class OpenAIProvider(LLMProvider):
 
 if __name__ == "__main__":
     import asyncio
-    import os
-    from dotenv import load_dotenv
+    from myagent.config.system_config import get_llm_api_key, get_llm_base_url, get_llm_model
     from myagent.agent.core.tool.tool import Tool
     from typing import Any
     class WeatherTool(Tool):
@@ -321,9 +320,7 @@ if __name__ == "__main__":
         def execute(self, **kwargs) -> str:
             date = kwargs.get("date", None)
             return f"{date}的天气是晴天"
-    load_dotenv()
-    print(os.getenv("ARK_API_KEY"))
-    llm= OpenAIProvider("doubao-seed-1-6-flash-250828",api_key=os.getenv("ARK_API_KEY"),base_url="https://ark.cn-beijing.volces.com/api/v3")
+    llm= OpenAIProvider(get_llm_model(), api_key=get_llm_api_key(), base_url=get_llm_base_url())
     
     message = Message("user","请查询2026-07-12号的天气")
     llm_response:LLMResponse = asyncio.run(llm.chat([message],[WeatherTool().to_schema()]))
