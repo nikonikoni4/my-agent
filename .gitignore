@@ -9,5 +9,6 @@ __pycache__
 localData/
 .pytest_cache
 lifeprismData
-lifeprismevalue
-lifeprismTestData
+lifeprismTestData/
+src/myagent/agent/core/agent/loopcopy.py
+evaluate
