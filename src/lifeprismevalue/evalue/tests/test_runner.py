@@ -237,6 +237,27 @@ def test_run_环境声明漏了提示词时开跑前就报错(tmp_path) -> None:
         asyncio.run(runner.run(write_cases(tmp_path, body)))
 
 
+def test_run_证据表写错名字时开跑前就报错(tmp_path) -> None:
+    """表名打错不该表现成「agent 没记」：原来只会在判分时显形（该项 0 行）。"""
+    body = fake_cases("ok-1").replace(
+        "evidence: [custom_expense_log]", "evidence: [custom_expence_log]"
+    )
+    runner = EvalRunner(base_dir=make_base(tmp_path), runs_dir=tmp_path / "runs")
+
+    with pytest.raises(ValueError, match="custom_expence_log"):
+        asyncio.run(runner.run(write_cases(tmp_path, body)))
+
+
+def test_run_按表取证据却没声明库时开跑前就报错(tmp_path) -> None:
+    body = fake_cases("ok-1").replace(
+        "    db: {path: dataset/lifewatch_ai.db, mode: copy}\n", ""
+    )
+    runner = EvalRunner(base_dir=make_base(tmp_path), runs_dir=tmp_path / "runs")
+
+    with pytest.raises(ValueError, match="没声明 db"):
+        asyncio.run(runner.run(write_cases(tmp_path, body)))
+
+
 # ---------------- summary 落盘 ----------------
 
 

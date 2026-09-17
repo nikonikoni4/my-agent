@@ -24,12 +24,29 @@ BASE_CP_TEXT = "# 自定义记录规则\n\n### 支出记录规则\n- 支出类�
 # ---------------- base / 用例 ----------------
 
 
+def init_base_db(root: Path) -> None:
+    """在底座里造一个真 sqlite（两张空表）。
+
+    刻意不是占位字节：开跑前的自检要读库的表结构（用例声明的证据表得真在），
+    假字节会让这一步在测试里被绕过去——而它正是要锁住的行为之一。
+    表名与下面用例里声明的证据目标保持一致。
+    """
+    db = root / DB_REL
+    db.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(db)
+    with con:
+        con.execute("CREATE TABLE custom_expense_log (id TEXT, amount REAL, content TEXT)")
+        con.execute(
+            "CREATE TABLE custom_exercise_log (id TEXT, duration_min INTEGER, content TEXT)"
+        )
+    con.close()
+
+
 def make_base(root: Path) -> Path:
-    """造一个极小的 base 底座（可变路径 + 一点只读内容 + 提示词版本库）。"""
+    """造一个极小的 base 底座（真库 + 提示词版本库 + 一点只读内容）。"""
     base = root / "base"
     (base / "dataset").mkdir(parents=True)
     (base / "agent" / "chat").mkdir(parents=True)
-    (base / DB_REL).write_bytes(b"DB-BASELINE")
     (base / CP_REL).write_text(BASE_CP_TEXT, encoding="utf-8")
     (base / "prompts").mkdir()
     (base / "prompts" / "agent_prompts.yaml").write_text(
@@ -37,6 +54,7 @@ def make_base(root: Path) -> Path:
     )
     (base / "user").mkdir(parents=True)
     (base / "user" / "user.md").write_text("只读内容", encoding="utf-8")
+    init_base_db(base)
     return base
 
 
@@ -254,7 +272,7 @@ def fake_cases(*ids: str, meta_id: str = "假用例-01") -> str:
     body = "".join(
         f"  - id: {cid}\n"
         f"    type: 假类型\n"
-        f"    evidence: [fake_target]\n"
+        f"    evidence: [custom_expense_log]\n"
         f"    turns:\n"
         f"      - {{role: user, text: \"第 {i} 条\"}}\n"
         f"    rubric: 应通过\n"

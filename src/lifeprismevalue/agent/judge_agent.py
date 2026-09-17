@@ -53,26 +53,40 @@ Judge_prompt = """
 """
 
 # 输入说明：单独一段，专门讲清"发过来的东西是什么"（尤其 evidence.json 的结构）。
-# 结构定义与 runner 的 `_export_evidence` 保持一致，两者改动需同步。
+# 结构定义与 case.py 的 `_export_evidence`（`evidence.collect_evidence`）保持一致，
+# 两者改动需同步——注意归因方式已从「时间窗」改为「与本用例的环境初始态对比」。
 Evidence_prompt = """
 # 输入说明
 你会收到三段内容：
 
 1. **判分要点（rubric）**：本次用例的判定标准，逐条核对它。
-2. **本次证据（evidence）**：JSON，本次运行时间窗内的落库 / 落盘结果，结构为：
-   - `time_window`：本次运行的时间窗（start / end）。
+2. **本次证据（evidence）**：JSON，来自「本用例跑完后的环境」与「它跑之前的环境初始态」的对比——
+   凡是两者不同之处，就是本次运行写下的东西。结构为：
    - `targets`：按用例声明的证据位置；键是声明原值（如 `custom_expense_log`、
      `diary/<year>/<month>/<date>.md`），值是下面两类之一：
-     - `kind = "table"`：数据表。`columns` 为列名，`rows` 为时间窗内的行，
-       `row_count` 为行数（**0 表示该表在时间窗内没有任何新增**）；`error` 非空表示读取失败。
-     - `kind = "file"`：文本文件。`changed` 表示是否被改动，`new_file` 表示是否新增，
-       `diff` 是统一 diff（`--- base` / `+++ current`；`+` 开头为新增行，`-` 开头为删除行）；
-       `exists` 为 false 表示该文件不存在。
-   - `other_changed_files`：**未被用例声明、但确实被改动**的文本文件（结构同 `kind="file"`），
-     用于发现"顺手改了别的文件"（如改动提示词、日记等）。
+     - `kind = "table"`：数据表。
+       - `key`：按哪一列对齐；为空表示该表没有主键列，只能整行比对（改动会表现为一删一增）。
+       - `rows` / `row_count`：**本次新增的行**（0 = 与初始态一致，即没有新增）。
+       - `changed`：同一主键上被改动的行，`changes` 逐列给出 `baseline`（初始态）与 `current`（现在）。
+       - `removed`：初始态里有、现在没了的行（本次被删掉的记录）。
+       - `columns`：列名；`note` 是判读提示（如"该表无 id 列"）；`error` 非空表示读不到，
+         此时该表各项都不可信。
+     - `kind = "file"`：文本文件。
+       - `changed` 是否被改动，`new_file` 是否本次新建，`deleted` 是否被删掉（初始态有、现在没了）；
+       - `diff` 是统一 diff（`--- baseline` / `+++ current`；`+` 开头为新增行，`-` 开头为删除行）；
+       - `exists` 为 false 表示该文件现在不存在。
+   - `other_changed_files`：**未被用例声明、但确实被改动**的文本文件（结构同 `kind="file"`，
+     含被删的），用于发现"顺手改了别的文件"（如改动提示词、日记等）。
    - `precondition`：本次运行前写入的预置规则。
+
 3. **对话记录**：被评估 agent 的 user / assistant / tool_result 消息，**仅作参考**；
    判定以证据为准，不以它的自述为准。
+
+# 判读提醒
+- 证据是**与初始态的差异**，不是"环境里现在有什么"：初始态就存在的内容不会出现在 `rows` 里。
+- 要点说"应新增"→ 看 `rows` / `row_count` / `new_file`；说"应改动 / 应更新"→ 看 `changed` / `diff`；
+  说"不得改动 / 不得删除"→ 看 `removed`、`changed` 与 `other_changed_files`。
+- `error` 非空、或某项 `note` 说不可信时，不要把它当成"agent 没做"，理由里要写明证据不可用。
 """
 
 

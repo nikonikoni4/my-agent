@@ -325,7 +325,7 @@ def check_env_inputs(template: Path, config: EnvConfig) -> None:
     if config.db.mode != DB_MODE_EMPTY or not config.db.keep_tables:
         # 整库复制、或空库但一张表都不回填：都不必读底座库的结构
         return
-    known = _table_names(db_path)
+    known = db_table_names(db_path)
     missing = [table for table in config.db.keep_tables if table not in known]
     if missing:
         raise ValueError(
@@ -339,9 +339,13 @@ def _covers(paths: Iterable[str], rel: str) -> bool:
     return any(target == Path(raw) or Path(raw) in target.parents for raw in paths)
 
 
-def _table_names(db_path: Path) -> set[str]:
-    """读库里的表名集合。"""
-    con = sqlite3.connect(db_path)
+def db_table_names(db_path: Path) -> set[str]:
+    """读一个 sqlite 文件里有哪些表（自检用：底座库 / 环境库都可）。
+
+    走只读连接：底座是只读的，普通连接在 WAL 库或带热日志的库上会顺带写它
+    （建 `-wal`/`-shm`，或做一次回滚恢复）。
+    """
+    con = _open_readonly(db_path)
     try:
         return {
             name for (name,) in con.execute("select name from sqlite_master where type='table'")

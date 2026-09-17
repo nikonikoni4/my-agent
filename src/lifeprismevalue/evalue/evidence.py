@@ -93,7 +93,7 @@ def collect_evidence(
     targets = {
         raw: (
             _collect_file(baseline_dir, env_root, raw, now)
-            if _is_file_target(raw)
+            if is_file_target(raw)
             else _collect_table(baseline_dir, env_root, raw, db_rel_path)
         )
         for raw in case.evidence
@@ -257,7 +257,7 @@ def _collect_other_changed_files(
 ) -> dict:
     """全树对比基线与环境，收集声明之外被改动的文本文件（含被删的）。"""
     declared_rel = {
-        _resolve_path_placeholders(item, now) for item in declared if _is_file_target(item)
+        _resolve_path_placeholders(item, now) for item in declared if is_file_target(item)
     }
     changed: dict[str, dict] = {}
     baseline_files = _iter_candidate_files(baseline_dir)
@@ -327,8 +327,12 @@ def _file_diff(baseline_path: Path, current_path: Path, rel: str) -> dict:
     return result
 
 
-def _is_file_target(value: str) -> bool:
-    """evidence 取值是「文件」还是「表」：带路径分隔符或以 .md 结尾的按文件处理。"""
+def is_file_target(value: str) -> bool:
+    """evidence 取值是「文件」还是「表」：带路径分隔符或以 .md 结尾的按文件处理。
+
+    公开出去是因为"装配层开跑前的自检"也要按同一条规则分流（表类目标必须落在库里），
+    两处各写一份就会漂移，漂移了不报错。
+    """
     return value.endswith(".md") or "/" in value or "\\" in value
 
 

@@ -37,7 +37,8 @@ from lifeprismevalue.evalue.case import (
     UNDER_TEST,
     content_summary,
 )
-from lifeprismevalue.evalue.env import LifeprismEnvProvider, check_env_inputs
+from lifeprismevalue.evalue.env import LifeprismEnvProvider, check_env_inputs, db_table_names
+from lifeprismevalue.evalue.evidence import is_file_target
 from lifeprismevalue.evalue.types import Case, CaseSet, EnvConfig
 from lifeprismevalue.versions import (
     AXIS_PROMPT,
@@ -296,6 +297,7 @@ class EvalRunner:
         # 开槽前先自检：配置里的路径 / 库 / 表在底座里都得在。放在这里而不是等建环境，
         # 是为了「整个 run 不启动、原因直白」，而不是留下几条「某条任务失败」
         check_env_inputs(self.base_dir, env_config)
+        check_evidence_targets(case_set, env_config, base_dir=self.base_dir)
 
         run_id = self._make_run_id()
         run_dir = self.runs_dir / run_id
@@ -364,6 +366,31 @@ class EvalRunner:
     def _make_run_id() -> str:
         """run_id：UTC 时间戳 `YYYYmmdd-HHMMSS`。"""
         return datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
+
+
+# ---------------- 开跑前的自检 ----------------
+
+
+def check_evidence_targets(case_set: CaseSet, config: EnvConfig, *, base_dir: Path) -> None:
+    """核一遍用例声明的取证目标与环境是否自洽（开跑前，而不是等判分时才发现）。
+
+    只核**表类**目标：它们必然落在环境声明的那个库里，所以「按表取证却没声明库」和
+    「表名打错」都是必然读不到的证据——但处理方式原来是**照常跑完、判分时才显形**
+    （裁判看到「该项 0 行」，于是把「配置打错字」记成「agent 没记」）。放在这里拦。
+
+    文件类目标不核：`diary/<date>.md` 这类本来就该是本次新建的文件，环境里没有是对的。
+    """
+    tables = sorted(
+        {raw for case in case_set.cases for raw in case.evidence if not is_file_target(raw)}
+    )
+    if not tables:
+        return
+    if config.db is None:
+        raise ValueError(f"用例按表取证据，但 meta.env 没声明 db：{tables}")
+    known = db_table_names(base_dir / config.db.path)
+    missing = [table for table in tables if table not in known]
+    if missing:
+        raise ValueError(f"用例声明的证据表在底座里不存在: {missing}（底座库 {config.db.path}）")
 
 
 # ---------------- summary 落盘 ----------------
