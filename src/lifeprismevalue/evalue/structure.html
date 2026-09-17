@@ -162,8 +162,8 @@
   <!-- 产物 -->
   <rect x="24" y="778" width="912" height="76" rx="8" fill="#f6f5f2" stroke="#8a8578" stroke-width="1.4"/>
   <text x="44" y="800" font-weight="bold" font-size="11.5" fill="#5a564d">产物</text>
-  <text x="44" y="820" font-size="10.5">每条用例：&lt;meta.id&gt;/&lt;NNN&gt;_&lt;case.id&gt;/ —— baseline/ · case.yaml · session_*.jsonl · evidence.json · judge.json · stats.json</text>
-  <text x="44" y="840" font-size="10.5">每次 run：run.json · summary.csv　｜　失败现场：envs/&lt;key&gt;/（不销毁）· ipc/*.json（不清理）· logs/&lt;用例目录名&gt;.log</text>
+  <text x="44" y="820" font-size="10.5">每条用例：&lt;meta.id&gt;/&lt;NNN&gt;_&lt;case.id&gt;/ —— baseline/ · env/（失败时） · case.yaml · session_*.jsonl · evidence.json · judge.json · stats.json</text>
+  <text x="44" y="840" font-size="10.5">每次 run：run.json · summary.csv　｜　失败现场：envs/&lt;key&gt;/（通道失败，不销毁）· &lt;用例目录&gt;/env/（运行异常 / 判不通过）· ipc/*.json · logs/&lt;用例目录名&gt;.log</text>
 </svg>
 <p class="cap">图 1：评估结构。上半是父进程（装配 + 调度 + 机制），下半是子进程（领域流程）。红色虚线是进程边界——所有跨过去的东西都必须是可序列化的事实。</p>
 </div>

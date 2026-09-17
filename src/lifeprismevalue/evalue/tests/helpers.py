@@ -65,13 +65,13 @@ def make_env_copy(base: Path, root: Path) -> Path:
     return env_root
 
 
-def make_baseline(base: Path, root: Path) -> Path:
+def make_baseline(base: Path, case_dir: Path) -> Path:
     """造一份「环境初始态快照」（= 环境本来的样子，真跑时由 case.py 的 a 步打）。
 
-    刻意与 base 分开放：快照是独立目录，快照动作会整份覆盖它——若指向 base，
-    就把底座也给覆盖了。
+    落在 `<用例目录>/baseline`，与真跑一致；刻意与 base 分开放：快照是独立目录，
+    快照动作会整份覆盖它——若指向 base，就把底座也给覆盖了。
     """
-    baseline = root / "baseline"
+    baseline = case_dir / "baseline"
     shutil.copytree(base, baseline)
     return baseline
 
@@ -103,15 +103,20 @@ def make_context(
     turn_timeout: float = 5.0,
     scan_other_changed_files: bool = True,
 ) -> tuple[CaseContext, Path]:
-    """造 base + 环境副本 + 环境基线 + 用例，返回 (ctx, case_dir)。"""
+    """造 base + 环境副本 + 环境基线 + 用例，返回 (ctx, case_dir)。
+
+    基线放在 `<用例目录>/baseline`，与真跑一致（runner 的 `_baseline_dir`）；否则
+    测试里"跑前 / 跑后"两份环境的位置关系跟线上不一样，会掩盖路径相关的错。
+    """
     base = base_dir or make_base(tmp_path)
     case_set = load_cases(tmp_path, body)
+    case_dir = case_dir or tmp_path / "case"
     ctx = CaseContext(
         case=case_set.cases[index],
         meta_id=case_set.meta.id,
-        case_dir=case_dir or tmp_path / "case",
+        case_dir=case_dir,
         env_root=env_root or make_env_copy(base, tmp_path),
-        baseline_dir=baseline_dir or make_baseline(base, tmp_path),
+        baseline_dir=baseline_dir or make_baseline(base, case_dir),
         db_rel_path=db_rel_path,
         session_folder=tmp_path / "sessions",
         turn_timeout=turn_timeout,

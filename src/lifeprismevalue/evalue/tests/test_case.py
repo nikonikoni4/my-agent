@@ -317,6 +317,64 @@ def test_基线快照打在_precondition_之前(tmp_path) -> None:
     assert "+1. 锻炼->每日锻炼" in item["diff"]
 
 
+# ---------------- 失败现场：跑完后的环境 ----------------
+# core 的 keep_env_on_failure 只看「执行通道失败」（子进程起不来/崩了/没产出结果）；
+# 「运行未正常结束」与「判定不通过」在 core 眼里是成功，环境会被 reset/dispose 掉。
+# 这两类现场只能由领域层在返回前自己留。
+
+
+def test_判定不通过时留下跑完后的环境(tmp_path) -> None:
+    ctx, result = run_case(
+        tmp_path, CASES_WITH_RULES, judge=FakeAgent(reply='{"pass": false, "reason": "规则没写对"}')
+    )
+
+    assert result["passed"] is False
+    kept = ctx.case_dir / "env"
+    assert kept.is_dir(), "判定不通过时必须留下现场"
+    assert (kept / CP_REL).is_file(), "留下的应该是整份数据根"
+
+
+def test_运行未正常结束时留下跑完后的环境(short_tmp) -> None:
+    agent = TurnEndAgent(session_id="sid-err", reason_type="error", reason_text="boom")
+
+    ctx, result = run_case(short_tmp, agent=agent)
+
+    assert result["passed"] is None and "运行未正常结束" in result["error"]
+    assert (ctx.case_dir / "env").is_dir()
+
+
+def test_留下的副本是跑完之后的状态(tmp_path) -> None:
+    """与 `baseline/` 成对：baseline 是跑前，env/ 是跑后。
+
+    判据取 precondition 写进去的规则——它只可能出现在"跑之后"那一份里。
+    """
+    ctx, _ = run_case(
+        tmp_path, CASES_WITH_RULES, judge=FakeAgent(reply='{"pass": false, "reason": "x"}')
+    )
+
+    kept = (ctx.case_dir / "env" / CP_REL).read_text(encoding="utf-8")
+    before = (ctx.case_dir / "baseline" / CP_REL).read_text(encoding="utf-8")
+    assert "1. 锻炼->每日锻炼" in kept, "跑之后的副本应该含 precondition 写入"
+    assert "1. 锻炼->每日锻炼" not in before, "跑之前的快照不该含 precondition 写入"
+
+
+def test_通过时不留副本(tmp_path) -> None:
+    """没出事就不占磁盘：通过时用例目录里只有 baseline/。"""
+    ctx, result = run_case(tmp_path)
+
+    assert result["passed"] is True
+    assert (ctx.case_dir / "baseline").is_dir()
+    assert not (ctx.case_dir / "env").exists()
+
+
+def test_未判定时不误留副本(tmp_path) -> None:
+    """judge.mode=none 时 passed 是 None（不是"不通过"），不该留现场。"""
+    ctx, result = run_case(tmp_path, CASES_JUDGE_NONE)
+
+    assert result["passed"] is None
+    assert not (ctx.case_dir / "env").exists()
+
+
 # ---------------- i：裁判 ----------------
 
 
@@ -623,6 +681,8 @@ def test_用例级异常被兜住并记进结果(tmp_path) -> None:
     assert result["error"] == "RuntimeError: factory 挂了"
     assert result["passed"] is None
     assert result["case_id"] == "T-1"     # 结果行仍然完整，便于归因
+    # 异常逃到 run() 兜底这一层，同样要留现场（agent 工厂挂掉是最该看环境的一类）
+    assert (ctx.case_dir / "env").is_dir()
 
 
 # ---------------- TurnCollector ----------------

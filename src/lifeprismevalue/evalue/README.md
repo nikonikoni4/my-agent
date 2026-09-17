@@ -77,6 +77,8 @@ EvalRunner.run(cases_path):
 
 > **a 步的打点位置很关键**：必须在 precondition **之前**。precondition 写进 `custom_prompt.md` 的规则本身也是证据（有用例要判「规则文件终态」），打在它之后就把这一步藏起来了。
 >
+> **失败现场**：「运行未正常结束」或「判定不通过」时，跑完后的环境会整份留到 `<用例目录>/env/`，与 `baseline/`（跑之前）成对——`diff -r` 一下就是本次改动。core 的 `keep_env_on_failure` 只管「执行通道失败」，这两类在 core 眼里是**成功**（子进程 exit 0），靠它留不下来。
+>
 > 另外「重置可变状态」仍然不在这里：环境是用例独占的，槽位复用前由 core 的 `reset_env` 整份回滚，不必再维护「哪些文件会变」的清单。
 
 ---
@@ -91,9 +93,11 @@ EvalRunner.run(cases_path):
 5. **session 只能「跑完复制改名」**：`SessionPresist` 的文件名固定为 `<session_id>.jsonl`，运行时 append 到固定路径，**不支持改名**；且后台每 2 秒批量落盘，复制前必须 flush（`persist_session_now`），否则丢最后一批。不改源码。
 6. **判定以落库 / 落盘为准**：模型口头说「已记录」但未落库，算失败。
 7. **运行终态要单独区分**：`turn/end` 记录（`TurnEndData`）说明本轮是跑完还是中途失败，带 `reason_type` / `reason_text` / `error_type`——`error_type` 是最外层异常类名（如 `AgentUnclaimedError`、`RetryExhaustedError`、`MaxStepsExceededError`），`reason_text` 是异常链文本（逐层 `类型: 消息`，最多 3 层）。loop 对任何未恢复的异常都以 `error` 收口（含步数上限、重试耗尽），取消为 `interrupted`；据此非 success 就**不判、不重试、停止后续轮次**，否则网络抖动之类会被算成「agent 记错了」，污染结论。`TURN_END` 事件本身不带信息，故只能从 session 读（见 `docs/adr/2026-09-15-session错误信息记录策略.md`）。
-8. **失败分两层，别混**：
-   - **用例级失败**（运行未正常结束、agent 工厂抛错、超时）→ 由 `case.py` 收进 `CaseResult.error`，产物目录里跑到哪算哪（证据 / 统计仍落盘），整次 run 继续；
-   - **执行通道失败**（子进程起不来、崩了、没产出结果）→ 由 `EvalCore` 收成 `WorkerOutcome.ok=False`，runner 落一条只剩错误信息的 `CaseResult`，**失败现场留在 `envs/<key>/`**（`keep_env_on_failure=False` 则照常回收）。
+8. **失败分三类，现场位置别记混**：
+   - **用例级失败**（运行未正常结束、agent 工厂抛错、超时）→ 由 `case.py` 收进 `CaseResult.error`，产物目录里跑到哪算哪（证据 / 统计仍落盘），整次 run 继续；跑完后的环境留在 `<用例目录>/env/`；
+   - **执行通道失败**（子进程起不来、崩了、没产出结果）→ 由 `EvalCore` 收成 `WorkerOutcome.ok=False`，runner 落一条只剩错误信息的 `CaseResult`，**现场留在 `envs/<key>/`**（`keep_env_on_failure=False` 则照常回收）；这时用例目录里几乎没有产物（子进程没跑起来）；
+   - **判定不通过**（judge 判 `pass=false`）→ 运行本身正常，但结论是"没达标"：跑完后的环境同样留在 `<用例目录>/env/`。
+   > 前两类与「判定不通过」的环境现场都在 `<用例目录>/env/`，与 `<用例目录>/baseline/`（跑之前）成对。**注意**：「用例级失败」在 core 眼里是成功（`case.py` 自己兜住了异常、子进程 exit 0），所以 core 的 `keep_env_on_failure` 对它无效——那两类现场只能由领域层自己留（`case.py:_keep_env`）。
 9. **子进程日志在 `runs/<run_id>/logs/<用例目录名>.log`**。用例怎么跑的、异常链是什么，先看这个文件；失败时 `worker.py` 会把日志尾部摘进错误信息。
 10. **`base/` 只读**：谁都不许写底座，一切写入落在环境里。读底座库也走只读连接（`env._open_readonly`）：读 WAL 库会顺带建 `-wal` / `-shm`，那也是写。
 

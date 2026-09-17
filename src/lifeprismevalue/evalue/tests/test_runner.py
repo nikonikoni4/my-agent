@@ -321,5 +321,8 @@ def test_用真执行实体跑一条用例_不调LLM(tmp_path) -> None:
     case_dir = Path(result.case_dir)
     assert (case_dir / "case.yaml").exists()          # c 步产物（真 entrypoint 写的）
     assert (case_dir / "baseline").is_dir()            # a 步产物：环境初始态快照
+    # 失败现场：跑完后的环境副本（跨进程也要留得下来）——NotImplementedError 属
+    # 「运行未正常结束」，core 那边看不到，只能由 case.py 自己留
+    assert (case_dir / "env").is_dir()
     assert not (case_dir / "judge.json").exists()      # 未判定
     assert (run_dir / "logs" / f"{case_dir.name}.log").is_file()

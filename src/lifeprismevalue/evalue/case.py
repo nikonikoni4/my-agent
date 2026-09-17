@@ -25,6 +25,11 @@ entrypoint。它做的第一件事是把数据根切到 `env.root`——工具�
 
 「重置可变状态」不在本模块：环境每用例独占，槽位复用前由 core 的 `reset_env` 整份回滚。
 
+**失败现场**：「运行未正常结束」或「判定不通过」时，跑完后的环境会整份留到
+`<用例目录>/env/`，与 a 步的 `baseline/`（跑之前）成对——`diff -r` 一下就是本次改动。
+core 的 `keep_env_on_failure` 只管「执行通道失败」（子进程起不来/崩了/没产出结果），
+这两类在 core 眼里是**成功**（子进程 exit 0），靠它留不下来；而恰恰是这两类最需要现场。
+
 **运行终态**：每一轮的最终结果落在 `turn/end` 记录里（`TurnEndData`，含
 `reason_type` / `reason_text` / `error_type`）。loop 对任何未恢复的异常都以 `error` 收口
 （含步数上限、重试耗尽），取消为 `interrupted`。某轮非 success 时该用例**不判、不重试、
@@ -71,6 +76,11 @@ RULE_SECTION_TITLE = "## 关联记录规则"
 UNDER_TEST = "under_test"
 SIMULATOR = "simulator"
 JUDGE = "judge"
+
+# 跑**之后**的环境副本放在用例目录下的这个子目录（只在失败时留，见 `_keep_env`）。
+# 与 runner 放进 payload 的"跑**之前**"快照（`baseline/`）成对，一比就是本次改动。
+# 基线目录名由 runner 定（它算路径），这里只声明本模块自己写的那个，免得两处各写一份。
+ENV_DIR_NAME = "env"
 
 # 模型名的两个缺省取值：本次没用该 agent / 用了但 session 里取不到
 MODEL_NOT_USED = "none"
@@ -172,12 +182,14 @@ class CaseExecutor:
 
         收口的意义：一条用例崩了不该让整个 run 失去它的结果行，也不该丢掉已经落盘的
         证据——异常记进 `CaseResult.error`，产物目录里跑到哪算哪（与「运行未正常结束」
-        同一套收口思路）。
+        同一套收口思路）。异常逃到这一层时也把环境留下（`_keep_env`）：这正是最该看
+        现场的一类（agent 工厂挂了、超时、走到未实现的路径）。
         """
         try:
             return asyncio.run(self._run_async(ctx))
         except Exception as e:  # noqa: BLE001 - 有意兜底：单条用例失败不影响其它用例
             logger.exception("用例 %s 执行失败", ctx.case.id)
+            self._keep_env(ctx)
             return self._result(
                 ctx,
                 session_id=_session_id_of(ctx.sessions.get(UNDER_TEST)),
@@ -218,6 +230,7 @@ class CaseExecutor:
         agents, models = _collect_agent_info(case, ctx.case_dir)
         if failure is not None:
             note = _failure_note(failure)
+            self._keep_env(ctx)                          # 现场：跑完后的环境整份留下
             return self._result(
                 ctx, session_id=session_id, passed=None, reason=note, error=note,
                 agents=agents, models=models,
@@ -230,10 +243,37 @@ class CaseExecutor:
             passed = verdict["pass"]
             reason = verdict["reason"] or verdict["parse_error"]
 
+        if passed is False:
+            self._keep_env(ctx)                          # 判不通过也留（结论站的依据就是环境）
+
         return self._result(
             ctx, session_id=session_id, passed=passed, reason=reason, error="",
             agents=agents, models=models,
         )
+
+    def _keep_env(self, ctx: CaseContext) -> None:
+        """把跑完后的环境整份留进用例目录（`<用例目录>/env/`）。
+
+        **为什么不靠 core 的 `keep_env_on_failure`**：那个判据是 `WorkerOutcome.ok`，
+        只覆盖「执行通道失败」（子进程起不来 / 崩了 / 没产出结果）。而「运行未正常结束」
+        与「判定不通过」在 `run()` 里就被收成了正常返回，子进程 exit 0——core 看到的是
+        **成功**，既不会退役槽位、也不会保留环境。偏偏这两类是排查时最需要现场的。
+
+        此时环境还在（槽位复用前的 `reset_env` 会把它冲掉），所以现场只能在这一层留。
+        留的是整份数据根：与 `baseline/` 一对照就是本次改动，还能看见**未被声明为
+        evidence 的表**有没有被写脏——那种"写错地方"在 `evidence.json` 里是看不见的。
+
+        尽力而为：拷贝失败只告警，不往上抛——留现场不该把用例的结论也一起弄丢。
+        """
+        target = ctx.case_dir / ENV_DIR_NAME
+        try:
+            if target.exists():
+                shutil.rmtree(target)
+            shutil.copytree(ctx.env_root, target)
+        except OSError as e:
+            logger.warning("保留现场失败：%s（%s: %s）", target, type(e).__name__, e)
+            return
+        logger.info("保留现场：%s（跑完后的环境副本，与 baseline/ 对照）", target)
 
     def _result(
         self,
