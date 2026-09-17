@@ -1,8 +1,13 @@
-"""证据采集：把「本次写入」从环境里捞出来，与只读底座对比。
+"""证据采集：把「本次写入」从环境里捞出来，与**基线**对比。
 
-**归因方式：与底座对比，不再用时间窗。** 环境是每条用例独占的，凡是与 `base/` 不同之处
+**基线 = 这条用例环境的初始态快照**，由 `snapshot_baseline` 在跑用例之前打下（见
+`case.py`）。不再拿 `base/` 当基线：环境是按声明拼的（只复制提示词、库只留几张表），
+底座里那些没进环境的东西（几百篇历史日记、二十万行事件日志）会被全量 diff 判成
+「本次删掉了」，裁判看到的证据就是一堆噪声。
+
+**归因方式：与基线对比，不再用时间窗。** 环境是每条用例独占的，凡是与基线不同之处
 就是本次写入——不必再依赖写入时间戳。时间窗只能看见「新写的行」，看不见「被改掉、被删掉
-的东西」，也看不见「没有时间列的表」；对比底座三类都看得见。
+的东西」，也看不见「没有时间列的表」；对比基线三类都看得见。
 
 两类目标（取值见 `lifeprismTestData/README.md` 的 `evidence`）：
 
@@ -19,15 +24,13 @@ from __future__ import annotations
 
 import datetime
 import difflib
+import shutil
 import sqlite3
 from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable
 
 from lifeprismevalue.evalue.types import Case
-
-# 数据库相对数据根的路径（lifeprism 的结构化存储）
-DB_REL_PATH = "dataset/lifewatch_ai.db"
 
 # 全树对比时跳过的大文件 / 二进制后缀（避免把 DB、会话、图片当文本比）
 SKIP_SUFFIXES = frozenset(
@@ -47,11 +50,28 @@ DIFF_CONTEXT = 1
 KEY_COLUMN = "id"
 
 
+def snapshot_baseline(env_root: str | Path, baseline_dir: str | Path) -> None:
+    """把环境当下的样子整份存成基线：之后一切归因都对着它比。
+
+    调用时机是「环境造好、`precondition` 之前」（见 `case.py`）：precondition 往
+    `custom_prompt.md` 写的规则本身也是证据（有用例要判「规则文件终态」），打在其后
+    就把这一步藏起来了。
+
+    环境现在是「提示词 + 几张表」的量级（几十 KB ~ 几 MB），整份存远比维护一张
+    「哪些东西算初始状态」的清单划算——那张清单会漏，漏了不报错。
+    """
+    baseline = Path(baseline_dir)
+    if baseline.exists():
+        shutil.rmtree(baseline)
+    shutil.copytree(env_root, baseline)
+
+
 def collect_evidence(
     *,
     case: Case,
     env_root: str | Path,
-    base_dir: str | Path,
+    baseline_dir: str | Path,
+    db_rel_path: str,
     scan_other_changed_files: bool = True,
     now: datetime.datetime | None = None,
 ) -> dict:
@@ -60,19 +80,21 @@ def collect_evidence(
     Args:
         case: 当前用例（决定去哪些位置取证）。
         env_root: 本次用例的环境数据根（写过的）。
-        base_dir: 只读底座（基线）。
+        baseline_dir: 这条用例环境的初始态快照（基线，见 `snapshot_baseline`）。
+        db_rel_path: 库在数据根里的相对路径；空串 = 本环境没声明库（表类证据会报错，
+            而不是悄悄去猜一个路径）。
         scan_other_changed_files: 是否额外全树对比，收进「未声明但确实改了」的文本文件。
         now: 解析路径占位符用的「今天」，默认取当前本地时间（测试可注入）。
 
     Returns:
         {"case_id", "precondition", "targets", "other_changed_files"}
     """
-    env_root, base_dir = Path(env_root), Path(base_dir)
+    env_root, baseline_dir = Path(env_root), Path(baseline_dir)
     targets = {
         raw: (
-            _collect_file(base_dir, env_root, raw, now)
+            _collect_file(baseline_dir, env_root, raw, now)
             if _is_file_target(raw)
-            else _collect_table(base_dir, env_root, raw)
+            else _collect_table(baseline_dir, env_root, raw, db_rel_path)
         )
         for raw in case.evidence
     }
@@ -81,7 +103,7 @@ def collect_evidence(
         "precondition": {"rules": list(case.precondition.rules)},
         "targets": targets,
         "other_changed_files": (
-            _collect_other_changed_files(base_dir, env_root, case.evidence, now)
+            _collect_other_changed_files(baseline_dir, env_root, case.evidence, now)
             if scan_other_changed_files
             else {}
         ),
@@ -91,27 +113,30 @@ def collect_evidence(
 # ---------------- 表类证据 ----------------
 
 
-def _collect_table(base_dir: Path, env_root: Path, table: str) -> dict:
-    """按主键（若有）比出环境相对底座的新增 / 改动 / 删除。"""
-    env_db = env_root / DB_REL_PATH
+def _collect_table(baseline_dir: Path, env_root: Path, table: str, db_rel_path: str) -> dict:
+    """按主键（若有）比出环境相对基线的新增 / 改动 / 删除。"""
+    if not db_rel_path:
+        return _table_result(table, error="本环境未声明数据库（meta.env.db）")
+
+    env_db = env_root / db_rel_path
     if not env_db.exists():
-        return _table_result(table, error=f"数据库不存在: {DB_REL_PATH}")
+        return _table_result(table, error=f"数据库不存在: {db_rel_path}")
 
     env_rows, columns, error = _read_table(env_db, table)
     if error:
         return _table_result(table, error=error)
 
-    base_db = base_dir / DB_REL_PATH
-    base_rows: list[list] = []
+    baseline_db = baseline_dir / db_rel_path
+    baseline_rows: list[list] = []
     note = ""
-    if not base_db.exists():
-        note = "底座没有数据库，全部行按新增处理"
+    if not baseline_db.exists():
+        note = "基线没有数据库，全部行按新增处理"
     else:
-        base_rows, _base_columns, base_error = _read_table(base_db, table)
-        if base_error:
-            note = f"底座里读不到该表（按空表处理）：{base_error}"
+        baseline_rows, _baseline_columns, baseline_error = _read_table(baseline_db, table)
+        if baseline_error:
+            note = f"基线里读不到该表（按空表处理）：{baseline_error}"
 
-    added, changed, removed, diff_note = _diff_rows(env_rows, base_rows, columns)
+    added, changed, removed, diff_note = _diff_rows(env_rows, baseline_rows, columns)
     return _table_result(
         table,
         rows=added,
@@ -123,41 +148,41 @@ def _collect_table(base_dir: Path, env_root: Path, table: str) -> dict:
 
 
 def _diff_rows(
-    env_rows: list[list], base_rows: list[list], columns: list[str]
+    env_rows: list[list], baseline_rows: list[list], columns: list[str]
 ) -> tuple[list[dict], list[dict], list[dict], str]:
     """比出新增 / 改动 / 删除三份结果。
 
-    有 id 列：按 id 对齐，同 id 的列值不同即「改动」（逐列给 base / current）。
+    有 id 列：按 id 对齐，同 id 的列值不同即「改动」（逐列给 baseline / current）。
     无 id 列：整行做多重集合差，只能分新增 / 删除，改动会表现为「一删一增」。
     """
     if KEY_COLUMN in columns:
         key_at = columns.index(KEY_COLUMN)
-        base_map = {row[key_at]: row for row in base_rows}
+        baseline_map = {row[key_at]: row for row in baseline_rows}
         added, changed, removed = [], [], []
         seen: set[Any] = set()
         for row in env_rows:
             key = row[key_at]
             seen.add(key)
-            counterpart = base_map.get(key)
+            counterpart = baseline_map.get(key)
             if counterpart is None:
                 added.append(dict(zip(columns, row)))
                 continue
             differences = {
-                column: {"base": old, "current": new}
+                column: {"baseline": old, "current": new}
                 for column, old, new in zip(columns, counterpart, row)
                 if old != new
             }
             if differences:
                 changed.append({KEY_COLUMN: key, "changes": differences})
         removed = [
-            dict(zip(columns, row)) for key, row in base_map.items() if key not in seen
+            dict(zip(columns, row)) for key, row in baseline_map.items() if key not in seen
         ]
         return added, changed, removed, ""
 
-    base_counter = Counter(tuple(row) for row in base_rows)
+    baseline_counter = Counter(tuple(row) for row in baseline_rows)
     env_counter = Counter(tuple(row) for row in env_rows)
-    added_counter = env_counter - base_counter
-    removed_counter = base_counter - env_counter
+    added_counter = env_counter - baseline_counter
+    removed_counter = baseline_counter - env_counter
     added = [
         dict(zip(columns, row))
         for row, times in added_counter.items()
@@ -220,34 +245,34 @@ def _table_result(
 
 
 def _collect_file(
-    base_dir: Path, env_root: Path, raw: str, now: datetime.datetime | None
+    baseline_dir: Path, env_root: Path, raw: str, now: datetime.datetime | None
 ) -> dict:
-    """采集文本类证据：解析路径占位符，与底座对比出统一 diff。"""
+    """采集文本类证据：解析路径占位符，与基线对比出统一 diff。"""
     rel = _resolve_path_placeholders(raw, now)
-    return _file_diff(base_dir / rel, env_root / rel, rel)
+    return _file_diff(baseline_dir / rel, env_root / rel, rel)
 
 
 def _collect_other_changed_files(
-    base_dir: Path, env_root: Path, declared: Iterable[str], now: datetime.datetime | None
+    baseline_dir: Path, env_root: Path, declared: Iterable[str], now: datetime.datetime | None
 ) -> dict:
-    """全树对比底座与环境，收集声明之外被改动的文本文件（含被删的）。"""
+    """全树对比基线与环境，收集声明之外被改动的文本文件（含被删的）。"""
     declared_rel = {
         _resolve_path_placeholders(item, now) for item in declared if _is_file_target(item)
     }
     changed: dict[str, dict] = {}
-    base_files = _iter_candidate_files(base_dir)
+    baseline_files = _iter_candidate_files(baseline_dir)
     env_files = _iter_candidate_files(env_root)
-    for rel in sorted(set(base_files) | set(env_files)):
+    for rel in sorted(set(baseline_files) | set(env_files)):
         if rel in declared_rel:
             continue
-        item = _file_diff(base_dir / rel, env_root / rel, rel)
+        item = _file_diff(baseline_dir / rel, env_root / rel, rel)
         if item["changed"]:
             changed[rel] = item
     return changed
 
 
-def _file_diff(base_path: Path, current_path: Path, rel: str) -> dict:
-    """对比同一相对路径在底座与当前环境中的文本，产出统一 diff 结构。"""
+def _file_diff(baseline_path: Path, current_path: Path, rel: str) -> dict:
+    """对比同一相对路径在基线与环境中的文本，产出统一 diff 结构。"""
     exists = current_path.is_file()
     result = {
         "kind": "file",
@@ -263,21 +288,21 @@ def _file_diff(base_path: Path, current_path: Path, rel: str) -> dict:
     }
 
     current_text = _read_text(current_path) if exists else None
-    base_text = _read_text(base_path)
+    baseline_text = _read_text(baseline_path)
     if exists and current_text is None:
         result["note"] = "非文本文件，未比对"
         return result
 
     if not exists:
-        # 底座里有、现在没了 = 本次删掉了（也算改动，否则「删了不该删的」会被漏判）
-        if base_text is not None:
+        # 基线里有、现在没了 = 本次删掉了（也算改动，否则「删了不该删的」会被漏判）
+        if baseline_text is not None:
             result["changed"] = True
             result["deleted"] = True
-            result["removed_lines"] = len(base_text.splitlines())
+            result["removed_lines"] = len(baseline_text.splitlines())
         return result
 
-    result["new_file"] = base_text is None
-    before = base_text if base_text is not None else ""
+    result["new_file"] = baseline_text is None
+    before = baseline_text if baseline_text is not None else ""
     if before == current_text:
         return result
 
@@ -285,7 +310,7 @@ def _file_diff(base_path: Path, current_path: Path, rel: str) -> dict:
         difflib.unified_diff(
             before.splitlines(),
             current_text.splitlines(),
-            fromfile="base",
+            fromfile="baseline",
             tofile="current",
             lineterm="",
             n=DIFF_CONTEXT,

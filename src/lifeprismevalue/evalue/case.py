@@ -14,14 +14,16 @@ entrypoint。它做的第一件事是把数据根切到 `env.root`——工具�
 
 | 步 | 做什么 | 谁做 |
 | --- | --- | --- |
-| a | 重置可变状态 | **不再是本模块的事**：环境每用例独占，槽位复用前由 core 的 `reset_env` 整份回滚 |
+| a | 打基线快照（环境初始态，**在 precondition 之前**） | `_snapshot_baseline` |
 | b | 应用 precondition（规则写进 `custom_prompt.md`） | `_apply_precondition` |
 | c | 用例快照 → `case.yaml` | `_snapshot_case` |
 | d~f | 跑 under_test（scripted 注入），取 turn 终态 | `_run_under_test` / `_run_turn` |
 | g | session 复制改名进用例目录 | `_dump_sessions` |
-| h | 导出 `evidence.json`（与底座对比） | `evidence.collect_evidence` |
+| h | 导出 `evidence.json`（与环境基线对比） | `evidence.collect_evidence` |
 | i | 裁判 → `judge.json` | `_run_judge` |
 | j | 统计 → `stats.json` | `_run_stats` |
+
+「重置可变状态」不在本模块：环境每用例独占，槽位复用前由 core 的 `reset_env` 整份回滚。
 
 **运行终态**：每一轮的最终结果落在 `turn/end` 记录里（`TurnEndData`，含
 `reason_type` / `reason_text` / `error_type`）。loop 对任何未恢复的异常都以 `error` 收口
@@ -47,7 +49,7 @@ from myagent.utils.helper import project_path_to_session_folder
 
 from lifeprismevalue import config
 from lifeprismevalue.evalue.caseload import load_case_set
-from lifeprismevalue.evalue.evidence import collect_evidence
+from lifeprismevalue.evalue.evidence import collect_evidence, snapshot_baseline
 from lifeprismevalue.evalue.types import Case
 from lifeprismevalue.stats import analyze_session
 
@@ -90,13 +92,14 @@ class CaseContext:
     meta_id: str               # 大类 id（CaseResult.version）
     case_dir: Path             # runs/<run_id>/<meta.id>/<NNN>_<case.id>/
     env_root: Path             # 本次用例的环境数据根（= 数据根，子进程已切到此）
-    base_dir: Path             # 只读底座（取证时对比用）
+    baseline_dir: Path         # 本用例环境的初始态快照（取证时对比用）
+    db_rel_path: str           # 库在数据根里的相对路径；空串 = 本环境没声明库
     session_folder: Path       # 会话落盘根（runs/<run_id>/sessions/）
     turn_timeout: float = DEFAULT_TURN_TIMEOUT
     scan_other_changed_files: bool = True
     sessions: dict[str, Any] = field(default_factory=dict)  # 本用例用到的各角色 agent
-    started_at: str = ""       # 时间窗起点（d）
-    ended_at: str = ""         # 时间窗终点（f）
+    started_at: str = ""       # 会话开始时间（d）
+    ended_at: str = ""         # 会话结束时间（f）
 
 
 class TurnCollector:
@@ -192,6 +195,7 @@ class CaseExecutor:
         case = ctx.case
         ctx.case_dir.mkdir(parents=True, exist_ok=True)
 
+        self._snapshot_baseline(ctx)                     # a
         self._apply_precondition(ctx)                    # b
         self._snapshot_case(ctx)                         # c
         ctx.started_at = _now()                          # d
@@ -260,7 +264,15 @@ class CaseExecutor:
             "models": models,
         }
 
-    # ---------- b / c ----------
+    # ---------- a / b / c ----------
+
+    def _snapshot_baseline(self, ctx: CaseContext) -> None:
+        """a. 把环境当下的样子存成基线（取证时对比用）。
+
+        必须在 precondition **之前**：precondition 写进 `custom_prompt.md` 的规则本身
+        也是证据（有用例判「规则文件终态」），打在其后就把这一步藏起来了。
+        """
+        snapshot_baseline(ctx.env_root, ctx.baseline_dir)
 
     def _apply_precondition(self, ctx: CaseContext) -> None:
         """b. 把 `case.precondition.rules` 写入 `custom_prompt.md`（无规则则不动）。"""
@@ -369,11 +381,12 @@ class CaseExecutor:
     # ---------- h：证据 ----------
 
     def _export_evidence(self, ctx: CaseContext) -> dict:
-        """h. 导出 `evidence.json`：与只读底座对比，捞「本次写入」。"""
+        """h. 导出 `evidence.json`：与环境基线对比，捞「本次写入」。"""
         evidence = collect_evidence(
             case=ctx.case,
             env_root=ctx.env_root,
-            base_dir=ctx.base_dir,
+            baseline_dir=ctx.baseline_dir,
+            db_rel_path=ctx.db_rel_path,
             scan_other_changed_files=ctx.scan_other_changed_files,
         )
         ctx.case_dir.mkdir(parents=True, exist_ok=True)
@@ -461,19 +474,23 @@ def execute_case(payload: dict, env: Any) -> dict:
     它把「子进程」与「领域流程」接上：切数据根 → 读用例 → 交给 `CaseExecutor`。
 
     payload 的字段（由 runner 组装，见 runner.py）：
-        cases_path / index / case_dir / base_dir / session_folder /
+        cases_path / index / case_dir / baseline_dir / session_folder /
         turn_timeout / scan_other_changed_files
     """
     # 切数据根必须早于创建任何 agent：工具只经 config.get_db_path() 取库
     config.use_data_path(env.root)
 
     case_set = load_case_set(payload["cases_path"])
+    # 库在哪：读用例文件自己的声明（子进程本来就加载了它）——不猜一个路径，
+    # 也不从环境句柄绕（句柄只认数据根，不认识存储细节）
+    db = case_set.meta.env.db
     ctx = CaseContext(
         case=case_set.cases[int(payload["index"])],
         meta_id=case_set.meta.id,
         case_dir=Path(payload["case_dir"]),
         env_root=Path(env.root),
-        base_dir=Path(payload["base_dir"]),
+        baseline_dir=Path(payload["baseline_dir"]),
+        db_rel_path=db.path if db is not None else "",
         session_folder=Path(payload["session_folder"]),
         turn_timeout=float(payload.get("turn_timeout", DEFAULT_TURN_TIMEOUT)),
         scan_other_changed_files=bool(payload.get("scan_other_changed_files", True)),
@@ -506,7 +523,7 @@ def _session_event_name() -> str:
 
 
 def _now() -> str:
-    """当前 UTC 时间（ISO 8601），用于时间窗。"""
+    """当前 UTC 时间（ISO 8601），用于会话起止时间（归因不靠时间）。"""
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 

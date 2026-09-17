@@ -2,7 +2,8 @@
 
 `FakeAgent` 只暴露 driver 真正用到的那几样（`_event_service` / `_session` / `send` /
 `persist_session_now` / `cancel`）；`FileFakeAgent` 额外把 session 落成真文件，用来验
-「跑完复制改名」；`TurnEndAgent` 可以让某一轮以 error / interrupted 收场。
+「跑完复制改名」；`WriteFakeAgent` 在 send 时按回调往数据根写东西（模拟落库 / 落盘）；
+`TurnEndAgent` 可以让某一轮以 error / interrupted 收场。
 """
 
 from __future__ import annotations
@@ -10,6 +11,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Callable
 
 from myagent.agent.core.provider import Message
 from myagent.agent.core.session.types import (
@@ -77,6 +79,23 @@ class FileFakeAgent(FakeAgent):
         )
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("session-line\n", encoding="utf-8")
+
+
+class WriteFakeAgent(FileFakeAgent):
+    """在 send 时按回调往数据根写东西：模拟「被测 agent 真的落库 / 落盘」。
+
+    为什么要它：基线是在跑用例**之前**打的（case.py 的 a 步），所以测试里的写入必须
+    发生在跑的过程中，而不是跑之前就把环境改好——那是「先改好再打基线」，改动会被
+    快照一起吞掉，测试就永远看不到差异了。
+    """
+
+    def __init__(self, write: Callable[[Path], None], **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.write = write
+
+    async def send(self, text: str) -> None:
+        await super().send(text)
+        self.write(self.data_path)
 
 
 class TurnEndAgent(FileFakeAgent):

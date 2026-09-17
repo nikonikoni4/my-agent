@@ -74,10 +74,10 @@
   <tr><th>文件</th><th>层</th><th>它负责什么</th><th>它不知道什么</th></tr>
   <tr><td><code>caseload.py</code> / <code>types.py</code></td><td>输入</td><td>读 <code>cases.yaml</code> → 校验 → 用例对象</td><td>怎么跑、跑在哪</td></tr>
   <tr><td><code>runner.py</code></td><td>装配 / 调度调用方</td><td>建 <code>runs/&lt;run_id&gt;/</code>、组任务、调 <code>EvalCore</code>、把产出映射成结果、写 summary</td><td>用例内部怎么跑、子进程里发生什么</td></tr>
-  <tr><td><code>env.py</code></td><td>机制（provider）</td><td>造环境（复制底座）/ 整份回滚 / 销毁 / 提供执行通道</td><td>任务内容、开几个槽位</td></tr>
+  <tr><td><code>env.py</code></td><td>机制（provider）</td><td>造环境（按 <code>meta.env</code> 从底座拼）/ 整份回滚 / 销毁 / 提供执行通道 / 开槽前自检</td><td>任务内容、开几个槽位</td></tr>
   <tr><td><code>worker.py</code></td><td>执行通道</td><td>写请求文件 → 起子进程 → 读结果文件；子进程侧的 <code>main()</code> 也在这里</td><td>payload 的含义、结果好不好</td></tr>
   <tr><td><code>case.py</code></td><td>领域流程</td><td><code>execute_case(payload, env)</code>：切数据根 → 跑 under_test → 造证据 → 裁判 → 统计</td><td>自己被谁调度、有几个兄弟任务</td></tr>
-  <tr><td><code>evidence.py</code></td><td>领域流程</td><td>拿当前环境与只读底座对比，捞"本次写入"（表按 <code>id</code> 比新增/改动/删除；文件比 diff）</td><td>谁调用它、结论怎么用</td></tr>
+  <tr><td><code>evidence.py</code></td><td>领域流程</td><td>给环境拍基线快照，再拿当前环境与它对比，捞"本次写入"（表按 <code>id</code> 比新增/改动/删除；文件比 diff）</td><td>谁调用它、结论怎么用</td></tr>
 </table>
 
 <div class="diagram">
@@ -121,8 +121,8 @@
 
   <rect x="44" y="302" width="420" height="88" rx="6" fill="#fdfcf9" stroke="#b8a67a" stroke-width="1.4"/>
   <text x="60" y="324" font-weight="bold" font-size="11.5" fill="#7a5c1e">env.py · 机制层</text>
-  <text x="60" y="344" font-size="10.5">create_env：从 base/ 整棵复制 → envs/env01</text>
-  <text x="60" y="362" font-size="10.5">reset_env：删掉环境目录、照 base 重复制</text>
+  <text x="60" y="344" font-size="10.5">create_env：按 meta.env 从 base/ 拼 → envs/env01</text>
+  <text x="60" y="362" font-size="10.5">reset_env：删掉环境目录、按同一份配置重拼</text>
   <text x="60" y="380" font-size="10.5">dispose_env：删掉　create_worker：给一条通道</text>
 
   <line x1="468" y1="346" x2="492" y2="346" stroke="#b8a67a" stroke-width="1.5" marker-end="url(#e1g)"/>
@@ -135,7 +135,7 @@
   <text x="512" y="380" font-size="10.5">读 ipc/&lt;token&gt;.result.json → dict / 抛错</text>
 
   <text x="60" y="410" font-size="10" fill="#8a8578">注：reset 与 dispose 是两件事——reset 是「留着再用」（每条任务一次），dispose 是「不要了」（run 结束一次）</text>
-  <text x="60" y="430" font-size="10" fill="#8a8578">底座实测 122MB / 393 文件：开槽与回滚都不便宜，所以槽位要循环复用，而不是每条任务重建</text>
+  <text x="60" y="430" font-size="10" fill="#8a8578">环境按 meta.env 配置从底座拼（实测 1.6MB / 34 文件，底座整份是 122MB / 393 文件）：开槽与回滚都便宜，槽位仍循环复用</text>
   <text x="60" y="452" font-size="10" fill="#a04b3a">本进程从头到尾不调 config.use_data_path()：切数据根只发生在子进程里（见下）</text>
 
   <!-- 进程边界 -->
@@ -154,15 +154,15 @@
   <rect x="44" y="604" width="872" height="146" rx="6" fill="#fff" stroke="#b8a67a" stroke-width="1.4"/>
   <text x="60" y="626" font-weight="bold" font-size="11.5" fill="#7a5c1e">case.py · execute_case(payload, env)</text>
   <text x="60" y="646" font-size="10.5"><tspan font-weight="bold" fill="#a04b3a">0　config.use_data_path(env.root)</tspan>　—— 切数据根，必须早于创建任何 agent</text>
-  <text x="60" y="666" font-size="10.5">b/c　把用例规则写进 custom_prompt.md；用例快照写进 case.yaml</text>
+  <text x="60" y="666" font-size="10.5">a/b/c　拍环境基线快照（baseline/）→ 把用例规则写进 custom_prompt.md → 用例快照写进 case.yaml</text>
   <text x="60" y="686" font-size="10.5">d~f　跑 under_test：按 turns 逐轮注入，每轮等 turn/end 并读本轮终态（success / error / interrupted）</text>
   <text x="60" y="706" font-size="10.5">g　　session 复制改名进用例目录（跑完先 flush，后台每 2 秒才落一批）</text>
-  <text x="60" y="726" font-size="10.5">h~j　与 base 对比取证 → 裁判 → 统计（与 base 对比，不再靠时间窗）</text>
+  <text x="60" y="726" font-size="10.5">h~j　与基线快照取证 → 裁判 → 统计（与基线对比，不再靠时间窗）</text>
 
   <!-- 产物 -->
   <rect x="24" y="778" width="912" height="76" rx="8" fill="#f6f5f2" stroke="#8a8578" stroke-width="1.4"/>
   <text x="44" y="800" font-weight="bold" font-size="11.5" fill="#5a564d">产物</text>
-  <text x="44" y="820" font-size="10.5">每条用例：&lt;meta.id&gt;/&lt;NNN&gt;_&lt;case.id&gt;/ —— case.yaml · session_*.jsonl · evidence.json · judge.json · stats.json</text>
+  <text x="44" y="820" font-size="10.5">每条用例：&lt;meta.id&gt;/&lt;NNN&gt;_&lt;case.id&gt;/ —— baseline/ · case.yaml · session_*.jsonl · evidence.json · judge.json · stats.json</text>
   <text x="44" y="840" font-size="10.5">每次 run：run.json · summary.csv　｜　失败现场：envs/&lt;key&gt;/（不销毁）· ipc/*.json（不清理）· logs/&lt;用例目录名&gt;.log</text>
 </svg>
 <p class="cap">图 1：评估结构。上半是父进程（装配 + 调度 + 机制），下半是子进程（领域流程）。红色虚线是进程边界——所有跨过去的东西都必须是可序列化的事实。</p>
@@ -170,9 +170,9 @@
 
 <h2>2. 一次 run 的流转</h2>
 <pre><code>EvalRunner.run(cases_path)
-  1. load_case_set(cases.yaml) → meta + cases[]
-  2. _prepare_run：建 runs/&lt;run_id&gt;/{envs, ipc, logs, sessions}；写 run.json
-  3. 组任务：用例 i → WorkerTask(entrypoint, payload={cases_path, index, case_dir, base_dir,
+  1. load_case_set(cases.yaml) → meta + meta.env + cases[]
+  2. _prepare_run：核一遍 meta.env（路径 / 库 / keep_tables 都在？）；建 runs/&lt;run_id&gt;/{envs, ipc, logs, sessions}；写 run.json
+  3. 组任务：用例 i → WorkerTask(entrypoint, payload={cases_path, index, case_dir, baseline_dir,
                                               session_folder, turn_timeout, scan_other_changed_files})
   4. EvalCore.run(tasks)：开 max_workers 个槽位 → 逐条派发 → 复用前 reset_env → 收尾回收
   5. 产出按入参同序映射成 CaseResult → 写 runs/&lt;run_id&gt;/summary.csv，并追加 runs/summary.csv</code></pre>
@@ -258,11 +258,11 @@
   "entrypoint": "lifeprismevalue.evalue.case:execute_case",   // 要调哪个函数（字符串）
   "payload": {                                                // 领域层载荷，core 不解释
     "cases_path": "…/cases.yaml", "index": 3,                 // 第 index 条用例
-    "case_dir": "…/003_1.2-a", "base_dir": "…/lifeprismTestData/base",
+    "case_dir": "…/003_1.2-a", "baseline_dir": "…/003_1.2-a/baseline",
     "session_folder": "…/runs/&lt;run_id&gt;/sessions",
     "turn_timeout": 300.0, "scan_other_changed_files": true
   },
-  "env": { "root": "…/envs/env01", "key": "env01", "template": "…/base" }   // 子进程据此重建 Env 句柄
+  "env": { "root": "…/envs/env01", "key": "env01", "template": "…/base" }   // core 只认这三样：复制清单与库配方留在机制层
 }
 
 结果.json = {"ok": true, "output": {…}}          // 成功：output 就是 execute_case 的返回
@@ -504,7 +504,7 @@
   <text x="516" y="392" font-size="10.5">代价：地址空间不共享，所以</text>
   <text x="516" y="410" font-size="10.5">· 输入输出要序列化（ipc 文件 + entrypoint 字符串）</text>
   <text x="516" y="428" font-size="10.5">· 日志要另开通道（stdout/stderr 重定向到文件）</text>
-  <text x="516" y="446" font-size="10.5">· 每条用例一份环境复制（122MB）+ 一次进程启动</text>
+  <text x="516" y="446" font-size="10.5">· 每条用例一份环境（按 meta.env 拼，~1.6MB）+ 一次进程启动</text>
   <text x="516" y="470" font-size="10" fill="#555">这些代价都是"隔离单位是进程"的直接后果</text>
 
   <text x="480" y="520" text-anchor="middle" font-size="11" font-weight="bold">一句话：<tspan fill="#3a5f8a">互斥</tspan>解决"别交错"，<tspan fill="#0f6b5c">复制</tspan>解决"同时要两份"——你要的是后者，而锁永远做不到后者</text>
@@ -550,7 +550,7 @@
 <h2>8. 两条推论（用来检验有没有理解）</h2>
 <div class="def">
 <b>推论一：约束消失，子进程就该消失。</b> 如果哪天被测侧把数据根改成显式参数或 <code>ContextVar</code>，不再依赖模块全局，那么进程内线程 worker 就能同时跑 N 份数据根——那时<b>只需要换掉 <code>provider.create_worker</code> 一处</b>（<code>worker.py</code> 整条跨进程通道都可以删掉），<code>EvalCore</code>、<code>runner</code>、<code>case.py</code>、<code>evidence.py</code> 一行都不用改。这也是 <code>evaluate</code> 把"造通道"归给 provider、把 entrypoint 设计成字符串的原因：执行方式是被测系统的属性，不是调度内核的属性。<br>
-<b>推论二：代价记在谁的账上很清楚。</b> 每用例一份 122MB 环境复制 + 一次进程启动，本质都是在为"被测代码使用进程级全局状态"买单。要降本，方向是让被测侧的状态可传入（参数化 / contextvar），而不是在评测侧抠复制与进程开销。
+<b>推论二：代价记在谁的账上很清楚。</b> 每用例一次进程启动（外加一份环境），本质都是在为"被测代码把数据根放在进程级全局里"买单。其中环境那部分的账已经用「按配置拼」压下去了——只拼本次要用的东西（底座整份 122MB → 环境 ~1.6MB），剩下的主要是进程开销。要接着降本，方向同样是让被测侧的状态可传入（参数化 / contextvar），而不是在评测侧抠进程开销。
 </div>
 
 <footer>

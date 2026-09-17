@@ -1,7 +1,10 @@
-"""证据采集：与底座对比（表按主键比新增 / 改动 / 删除，文件比文本 diff）。
+"""证据采集：与基线对比（表按主键比新增 / 改动 / 删除，文件比文本 diff）。
 
-归因方式从「时间窗」换成「与 base 对比」后的核心价值就在这些用例里：时间窗只能看见
+归因方式从「时间窗」换成「与基线对比」后的核心价值就在这些用例里：时间窗只能看见
 新写的行，看不到被改掉的、被删掉的，也看不到没有时间列的表。
+
+基线（`baseline` 目录）在真跑时由 `case.py` 的 a 步从环境打；这里的测试直接造一份
+与环境初始态相同的基线。
 """
 
 from __future__ import annotations
@@ -10,13 +13,16 @@ import datetime
 import sqlite3
 from pathlib import Path
 
-from lifeprismevalue.evalue.evidence import DB_REL_PATH, collect_evidence
+from lifeprismevalue.evalue.evidence import collect_evidence, snapshot_baseline
 from lifeprismevalue.evalue.types import Case, Precondition
+
+# 库在数据根里的相对路径（真跑时来自 cases.yaml 的 meta.env.db.path）
+DB_REL = "dataset/lifewatch_ai.db"
 
 
 def make_dirs(tmp_path: Path) -> tuple[Path, Path]:
-    """造一对目录：底座（基线）与环境（跑过用例的）。"""
-    base = tmp_path / "base"
+    """造一对目录：基线（环境初始态）与环境（跑过用例的）。"""
+    base = tmp_path / "baseline"
     env = tmp_path / "env"
     (base / "dataset").mkdir(parents=True)
     (env / "dataset").mkdir(parents=True)
@@ -25,7 +31,7 @@ def make_dirs(tmp_path: Path) -> tuple[Path, Path]:
 
 def init_db(root: Path, tables: dict[str, tuple[list[str], list[tuple]]]) -> None:
     """在 root 下造库：表名 -> (列名, 行)。"""
-    db = root / DB_REL_PATH
+    db = root / DB_REL
     db.parent.mkdir(parents=True, exist_ok=True)
     db.unlink(missing_ok=True)
     con = sqlite3.connect(db)
@@ -50,8 +56,10 @@ def make_case(*evidence: str, rules: list[str] | None = None) -> Case:
     )
 
 
-def collect(case: Case, base: Path, env: Path, **kwargs) -> dict:
-    return collect_evidence(case=case, base_dir=base, env_root=env, **kwargs)
+def collect(case: Case, baseline: Path, env: Path, **kwargs) -> dict:
+    return collect_evidence(
+        case=case, baseline_dir=baseline, env_root=env, db_rel_path=DB_REL, **kwargs
+    )
 
 
 EXPENSE_COLUMNS = [
@@ -83,13 +91,13 @@ def test_表_新增改动删除都能看出来(tmp_path) -> None:
     # 改动（同 id 但列值不同）
     assert len(item["changed"]) == 1
     assert item["changed"][0]["id"] == "a"
-    assert item["changed"][0]["changes"]["amount"] == {"base": 15.3, "current": 99.0}
+    assert item["changed"][0]["changes"]["amount"] == {"baseline": 15.3, "current": 99.0}
     # 删除
     assert [row["id"] for row in item["removed"]] == ["b"]
     assert "expense_category" in item["columns"]
 
 
-def test_表_底座没有该表时按全部新增(tmp_path) -> None:
+def test_表_基线没有该表时按全部新增(tmp_path) -> None:
     base, env = make_dirs(tmp_path)
     init_db(base, {"other_table": (["id"], [("x",)])})
     init_db(env, {"custom_expense_log": (EXPENSE_COLUMNS, [expense_row("a"), expense_row("b")])})
@@ -97,17 +105,31 @@ def test_表_底座没有该表时按全部新增(tmp_path) -> None:
     item = collect(make_case("custom_expense_log"), base, env)["targets"]["custom_expense_log"]
 
     assert item["row_count"] == 2
-    assert "底座里读不到该表" in item["note"]
+    assert "基线里读不到该表" in item["note"]
 
 
 def test_表_环境没有数据库时报错(tmp_path) -> None:
     base, env = make_dirs(tmp_path)
-    (env / DB_REL_PATH).unlink(missing_ok=True)
+    (env / DB_REL).unlink(missing_ok=True)
 
     item = collect(make_case("custom_expense_log"), base, env)["targets"]["custom_expense_log"]
 
     assert item["row_count"] == 0
     assert "数据库不存在" in item["error"]
+
+
+def test_表_环境没声明库时报错(tmp_path) -> None:
+    """环境配置里没写 db：表类证据要明说「没声明」，不能去猜一个路径。"""
+    base, env = make_dirs(tmp_path)
+
+    evidence = collect_evidence(
+        case=make_case("custom_expense_log"),
+        baseline_dir=base,
+        env_root=env,
+        db_rel_path="",
+    )
+
+    assert "未声明数据库" in evidence["targets"]["custom_expense_log"]["error"]
 
 
 def test_表_表不存在时报错(tmp_path) -> None:
@@ -185,7 +207,7 @@ def test_文件_改动给出_git_风格_diff(tmp_path) -> None:
 
     assert item["changed"] is True
     assert item["new_file"] is False
-    assert item["diff"].startswith("--- base\n+++ current")
+    assert item["diff"].startswith("--- baseline\n+++ current")
     assert "+1. 锻炼->打卡" in item["diff"]
 
 
@@ -296,3 +318,55 @@ def test_顶层字段(tmp_path) -> None:
     assert evidence["case_id"] == "E-1"
     assert evidence["precondition"] == {"rules": ["锻炼->每日锻炼"]}
     assert set(evidence["targets"]) == {"custom_expense_log"}
+
+
+# ---------------- 基线快照 ----------------
+
+def test_snapshot_baseline_整份存下环境当前的样子(tmp_path) -> None:
+    env = tmp_path / "env"
+    (env / "agent").mkdir(parents=True)
+    (env / "agent" / "custom_prompt.md").write_text("# 规则\n", encoding="utf-8")
+    init_db(env, {"custom_expense_log": (EXPENSE_COLUMNS, [expense_row("a")])})
+
+    baseline = tmp_path / "case" / "baseline"
+    snapshot_baseline(env, baseline)
+
+    assert (baseline / "agent" / "custom_prompt.md").exists()
+    assert (baseline / DB_REL).is_file()
+
+
+def test_snapshot_baseline_重建时不留上一次的残留(tmp_path) -> None:
+    """同一个目录被重复使用时（重跑一条用例）：旧快照不能被留下来混进对比。"""
+    env = tmp_path / "env"
+    env.mkdir()
+    (env / "今天的.md").write_text("现在的样子\n", encoding="utf-8")
+    baseline = tmp_path / "baseline"
+    baseline.mkdir()
+    (baseline / "上一次的.md").write_text("旧快照\n", encoding="utf-8")
+
+    snapshot_baseline(env, baseline)
+
+    assert (baseline / "今天的.md").exists()
+    assert not (baseline / "上一次的.md").exists()
+
+
+def test_快照之后与基线对比_只看见快照之后写的东西(tmp_path) -> None:
+    """这一版归因的全貌：基线 = 环境初始态，改动 = 只有环境侧多出来的那部分。"""
+    env = tmp_path / "env"
+    (env / "agent" / "chat").mkdir(parents=True)
+    (env / "agent" / "chat" / "custom_prompt.md").write_text("# 规则\n", encoding="utf-8")
+    init_db(env, {"custom_expense_log": (EXPENSE_COLUMNS, [expense_row("旧")])})
+    baseline = tmp_path / "baseline"
+
+    snapshot_baseline(env, baseline)                      # a 步：先打基线
+    init_db(env, {"custom_expense_log": (EXPENSE_COLUMNS, [expense_row("旧"), expense_row("新")])})
+    (env / "agent" / "chat" / "custom_prompt.md").write_text(
+        "# 规则\n1. 锻炼->打卡\n", encoding="utf-8"
+    )
+
+    evidence = collect(
+        make_case("custom_expense_log", "agent/chat/custom_prompt.md"), baseline, env
+    )
+
+    assert [row["id"] for row in evidence["targets"]["custom_expense_log"]["rows"]] == ["新"]
+    assert evidence["targets"]["agent/chat/custom_prompt.md"]["changed"] is True

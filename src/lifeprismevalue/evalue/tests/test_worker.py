@@ -35,7 +35,7 @@ def make_task(
             "cases_path": str(write_cases(tmp_path, body)),
             "index": index,
             "case_dir": str(tmp_path / f"000_case{index}"),
-            "base_dir": str(tmp_path / "base"),
+            "baseline_dir": str(tmp_path / f"000_case{index}" / "baseline"),
             "session_folder": str(tmp_path / "sessions"),
             "turn_timeout": 5.0,
             "scan_other_changed_files": True,

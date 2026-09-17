@@ -45,6 +45,7 @@ from fakes import (
     FakeAgent,
     FileFakeAgent,
     TurnEndAgent,
+    WriteFakeAgent,
     write_session,
     write_turn_session,
 )
@@ -62,7 +63,6 @@ from helpers import (
     load_case,
     make_base,
     make_context,
-    make_env_copy,
     today_diary_rel,
 )
 
@@ -267,13 +267,18 @@ def test_裁判的session也会被落盘(short_tmp) -> None:
 
 
 def test_导出evidence_json(tmp_path) -> None:
-    """证据 = 与环境底座对比出来的差异（表按 id 比出新增行）。"""
-    base = make_base(tmp_path)
-    env = make_env_copy(base, tmp_path)
-    init_expense_db(base, [{"id": "old"}])
-    init_expense_db(env, [{"id": "old"}, {"id": "new"}])
+    """证据 = 与环境基线（a 步快照）对比出来的差异（表按 id 比出新增行）。
 
-    ctx, _ = run_case(tmp_path, CASES_EVIDENCE, base_dir=base, env_root=env)
+    写入必须发生在跑的过程中（假 agent 在 send 时落库）：基线打在跑之前，
+    跑之前就把环境改好等于让快照把改动一起吞掉。
+    """
+    base = make_base(tmp_path)
+    init_expense_db(base, [{"id": "old"}])          # 底座里已有历史基线
+
+    def write(data_path: Path) -> None:
+        init_expense_db(data_path, [{"id": "old"}, {"id": "new"}])
+
+    ctx, _ = run_case(tmp_path, CASES_EVIDENCE, base_dir=base, agent=WriteFakeAgent(write))
 
     evidence = json.loads((ctx.case_dir / "evidence.json").read_text(encoding="utf-8"))
     assert evidence["case_id"] == "E-1"
@@ -285,16 +290,31 @@ def test_导出evidence_json(tmp_path) -> None:
 
 def test_证据_日记新增文件被标成_new_file(tmp_path) -> None:
     base = make_base(tmp_path)
-    env = make_env_copy(base, tmp_path)
-    diary = env / today_diary_rel()
-    diary.parent.mkdir(parents=True, exist_ok=True)
-    diary.write_text("上午写代码\n", encoding="utf-8")
 
-    ctx, _ = run_case(tmp_path, CASES_EVIDENCE, base_dir=base, env_root=env)
+    def write(data_path: Path) -> None:
+        diary = data_path / today_diary_rel()
+        diary.parent.mkdir(parents=True, exist_ok=True)
+        diary.write_text("上午写代码\n", encoding="utf-8")
+
+    ctx, _ = run_case(tmp_path, CASES_EVIDENCE, base_dir=base, agent=WriteFakeAgent(write))
 
     evidence = json.loads((ctx.case_dir / "evidence.json").read_text(encoding="utf-8"))
     item = evidence["targets"]["diary/<year>/<month>/<date>.md"]
     assert item["new_file"] is True and item["changed"] is True
+
+
+def test_基线快照打在_precondition_之前(tmp_path) -> None:
+    """precondition 写进 custom_prompt.md 的规则本身也是证据。
+
+    有用例把规则文件当证据（判「规则文件终态」）。快照若打在 precondition 之后，
+    这一步就被藏起来了：规则写没写对，`evidence` 里看不见。
+    """
+    ctx, _ = run_case(tmp_path, CASES_WITH_RULES)
+
+    evidence = json.loads((ctx.case_dir / "evidence.json").read_text(encoding="utf-8"))
+    item = evidence["other_changed_files"][CP_REL]
+    assert item["changed"] is True
+    assert "+1. 锻炼->每日锻炼" in item["diff"]
 
 
 # ---------------- i：裁判 ----------------

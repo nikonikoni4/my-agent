@@ -25,12 +25,16 @@ BASE_CP_TEXT = "# 自定义记录规则\n\n### 支出记录规则\n- 支出类�
 
 
 def make_base(root: Path) -> Path:
-    """造一个极小的 base 底座（可变路径 + 一点只读内容）。"""
+    """造一个极小的 base 底座（可变路径 + 一点只读内容 + 提示词版本库）。"""
     base = root / "base"
     (base / "dataset").mkdir(parents=True)
     (base / "agent" / "chat").mkdir(parents=True)
     (base / DB_REL).write_bytes(b"DB-BASELINE")
     (base / CP_REL).write_text(BASE_CP_TEXT, encoding="utf-8")
+    (base / "prompts").mkdir()
+    (base / "prompts" / "agent_prompts.yaml").write_text(
+        "active_version: v1\n", encoding="utf-8"
+    )
     (base / "user").mkdir(parents=True)
     (base / "user" / "user.md").write_text("只读内容", encoding="utf-8")
     return base
@@ -41,6 +45,17 @@ def make_env_copy(base: Path, root: Path) -> Path:
     env_root = root / "env"
     shutil.copytree(base, env_root)
     return env_root
+
+
+def make_baseline(base: Path, root: Path) -> Path:
+    """造一份「环境初始态快照」（= 环境本来的样子，真跑时由 case.py 的 a 步打）。
+
+    刻意与 base 分开放：快照是独立目录，快照动作会整份覆盖它——若指向 base，
+    就把底座也给覆盖了。
+    """
+    baseline = root / "baseline"
+    shutil.copytree(base, baseline)
+    return baseline
 
 
 def write_cases(tmp_path: Path, body: str, name: str = "cases.yaml") -> Path:
@@ -63,12 +78,14 @@ def make_context(
     *,
     index: int = 0,
     env_root: Path | None = None,
+    baseline_dir: Path | None = None,
     base_dir: Path | None = None,
     case_dir: Path | None = None,
+    db_rel_path: str = DB_REL,
     turn_timeout: float = 5.0,
     scan_other_changed_files: bool = True,
 ) -> tuple[CaseContext, Path]:
-    """造 base + 环境副本 + 用例，返回 (ctx, case_dir)。"""
+    """造 base + 环境副本 + 环境基线 + 用例，返回 (ctx, case_dir)。"""
     base = base_dir or make_base(tmp_path)
     case_set = load_cases(tmp_path, body)
     ctx = CaseContext(
@@ -76,7 +93,8 @@ def make_context(
         meta_id=case_set.meta.id,
         case_dir=case_dir or tmp_path / "case",
         env_root=env_root or make_env_copy(base, tmp_path),
-        base_dir=base,
+        baseline_dir=baseline_dir or make_baseline(base, tmp_path),
+        db_rel_path=db_rel_path,
         session_folder=tmp_path / "sessions",
         turn_timeout=turn_timeout,
         scan_other_changed_files=scan_other_changed_files,
@@ -86,11 +104,16 @@ def make_context(
 
 # ---------------- 用例集（cases.yaml） ----------------
 
-
+# 测试用例的 meta.env：一份用例文件一份环境声明。
+# 只复制提示词目录（agent/chat/），库走整库复制——测试底座里那个「库」是占位字节，
+# 不是真 sqlite，故不能走 empty 模式（那要读 schema）。
 CASES_MIN = """
 meta:
   id: 记录任务-99
   dataset_version: 3
+  env:
+    copy: [agent/, prompts/]
+    db: {path: dataset/lifewatch_ai.db, mode: copy}
 cases:
   - id: T-1
     type: 支出记录
@@ -104,6 +127,9 @@ cases:
 CASES_WITH_RULES = """
 meta:
   id: 记录任务-98
+  env:
+    copy: [agent/, prompts/]
+    db: {path: dataset/lifewatch_ai.db, mode: copy}
 cases:
   - id: R-1
     type: 锻炼记录
@@ -119,6 +145,9 @@ CASES_TWO_TURNS = """
 meta:
   id: 记录任务-97
   multi_turn: true
+  env:
+    copy: [agent/, prompts/]
+    db: {path: dataset/lifewatch_ai.db, mode: copy}
 cases:
   - id: M-1
     type: 支出记录
@@ -135,6 +164,9 @@ CASES_AGENT_MODE = """
 meta:
   id: 记录任务-96
   multi_turn: true
+  env:
+    copy: [agent/, prompts/]
+    db: {path: dataset/lifewatch_ai.db, mode: copy}
 cases:
   - id: A-1
     type: 锻炼记录
@@ -148,6 +180,9 @@ CASES_TRIGGER = """
 meta:
   id: 记录任务-95
   multi_turn: true
+  env:
+    copy: [agent/, prompts/]
+    db: {path: dataset/lifewatch_ai.db, mode: copy}
 cases:
   - id: G-1
     type: 支出记录
@@ -164,6 +199,9 @@ cases:
 CASES_JUDGE_NONE = """
 meta:
   id: 记录任务-90
+  env:
+    copy: [agent/, prompts/]
+    db: {path: dataset/lifewatch_ai.db, mode: copy}
 cases:
   - id: J-0
     type: 支出记录
@@ -178,6 +216,9 @@ cases:
 CASES_EVIDENCE = """
 meta:
   id: 记录任务-92
+  env:
+    copy: [agent/, prompts/]
+    db: {path: dataset/lifewatch_ai.db, mode: copy}
 cases:
   - id: E-1
     type: 支出记录
@@ -193,6 +234,9 @@ cases:
 CASES_FILE_EVIDENCE = """
 meta:
   id: 记录任务-91
+  env:
+    copy: [agent/, prompts/]
+    db: {path: dataset/lifewatch_ai.db, mode: copy}
 cases:
   - id: F-1
     type: 规则变更
@@ -216,7 +260,13 @@ def fake_cases(*ids: str, meta_id: str = "假用例-01") -> str:
         f"    rubric: 应通过\n"
         for i, cid in enumerate(ids)
     )
-    return f"meta:\n  id: {meta_id}\ncases:\n{body}"
+    return (
+        f"meta:\n  id: {meta_id}\n"
+        "  env:\n"
+        "    copy: [agent/, prompts/]\n"
+        "    db: {path: dataset/lifewatch_ai.db, mode: copy}\n"
+        f"cases:\n{body}"
+    )
 
 
 # ---------------- 数据库 / 文件 ----------------

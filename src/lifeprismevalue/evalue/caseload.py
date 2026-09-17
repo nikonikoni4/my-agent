@@ -12,6 +12,8 @@ from typing import Any
 import yaml
 
 from lifeprismevalue.evalue.types import (
+    DB_MODE_EMPTY,
+    DB_MODES,
     INPUT_MODE_AGENT,
     INPUT_MODE_SCRIPTED,
     INPUT_MODES,
@@ -19,6 +21,8 @@ from lifeprismevalue.evalue.types import (
     JUDGE_MODES,
     Case,
     CaseSet,
+    DbConfig,
+    EnvConfig,
     Judge,
     Meta,
     Precondition,
@@ -77,6 +81,7 @@ def _build_meta(raw: Any) -> Meta:
         raise CaseLoadError("meta.id 必填")
     return Meta(
         id=str(meta_id),
+        env=_build_env_config(raw.get("env")),
         name=str(raw.get("name") or ""),
         dataset_version=int(raw.get("dataset_version") or 1),
         premise=str(raw.get("premise") or ""),
@@ -85,6 +90,66 @@ def _build_meta(raw: Any) -> Meta:
         data=str(raw.get("data") or ""),
         grading=str(raw.get("grading") or ""),
         source=str(raw.get("source") or ""),
+    )
+
+
+def _build_env_config(raw: Any) -> EnvConfig:
+    """解析 `meta.env`：这份用例文件的初始状态声明（必填）。
+
+    这里只校验「本层能校验的」：结构、取值、非空。至于「声明的路径 / 表在底座里
+    是否真的存在」，要看底座才知道，由 runner 开槽前用 `env.check_env_inputs` 校验。
+    两层都不省：本层拦住写法错误，那一层拦住「底座变了 / 名字打错」。
+    """
+    if raw is None:
+        raise CaseLoadError(
+            "meta.env 必填：声明本次环境从底座复制什么、库怎么来（见 README 的 env 一节）"
+        )
+    if not isinstance(raw, dict):
+        raise CaseLoadError("meta.env 必须是 mapping")
+
+    copy = raw.get("copy")
+    if not isinstance(copy, list) or not copy:
+        raise CaseLoadError(
+            "meta.env.copy 必须是非空列表：环境要有初始状态的必需来源（提示词等），"
+            "空清单会造出一个没有提示词的环境"
+        )
+    extra = raw.get("extra") or []
+    if not isinstance(extra, list):
+        raise CaseLoadError("meta.env.extra 必须是列表")
+    return EnvConfig(
+        copy=[_rel_path(item, "meta.env.copy") for item in copy],
+        extra=[_rel_path(item, "meta.env.extra") for item in extra],
+        db=_build_db_config(raw.get("db")),
+    )
+
+
+def _rel_path(item: Any, where: str) -> str:
+    """路径项必须是相对底座的路径（绝对路径会指到环境之外，等于把环境当成宿主机用）。"""
+    text = str(item or "").strip()
+    if not text:
+        raise CaseLoadError(f"{where} 里有空路径")
+    if Path(text).is_absolute():
+        raise CaseLoadError(f"{where} 必须是相对底座的路径: {text}")
+    return text
+
+
+def _build_db_config(raw: Any) -> DbConfig | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise CaseLoadError("meta.env.db 必须是 mapping")
+    if not raw.get("path"):
+        raise CaseLoadError("meta.env.db.path 必填（相对底座的数据根路径）")
+    mode = str(raw.get("mode") or DB_MODE_EMPTY)
+    if mode not in DB_MODES:
+        raise CaseLoadError(f"meta.env.db.mode 非法: {mode}（应为 {DB_MODES}）")
+    keep = raw.get("keep_tables") or []
+    if not isinstance(keep, list):
+        raise CaseLoadError("meta.env.db.keep_tables 必须是列表")
+    return DbConfig(
+        path=_rel_path(raw["path"], "meta.env.db.path"),
+        mode=mode,
+        keep_tables=[str(t).strip() for t in keep if str(t).strip()],
     )
 
 

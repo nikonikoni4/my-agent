@@ -23,7 +23,7 @@ import csv
 import datetime
 import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -37,8 +37,8 @@ from lifeprismevalue.evalue.case import (
     UNDER_TEST,
     content_summary,
 )
-from lifeprismevalue.evalue.env import LifeprismEnvProvider
-from lifeprismevalue.evalue.types import Case, CaseSet
+from lifeprismevalue.evalue.env import LifeprismEnvProvider, check_env_inputs
+from lifeprismevalue.evalue.types import Case, CaseSet, EnvConfig
 from lifeprismevalue.versions import (
     AXIS_PROMPT,
     AXIS_REACT,
@@ -56,7 +56,7 @@ DEFAULT_MAX_WORKERS = 4
 
 # summary.csv 的列（见 lifeprismTestData/README.md「summary.csv 字段」）。
 # 顺序：标识信息（版本 + 本次用了哪些 agent + 各 agent 的模型）排在前面，便于扫表；
-# 后面是本次运行的结果与时间窗。
+# 后面是本次运行的结果与起止时间。
 SUMMARY_COLUMNS = [
     "时间",
     "提示词版本",
@@ -84,6 +84,9 @@ IPC_DIR_NAME = "ipc"
 LOGS_DIR_NAME = "logs"
 SESSIONS_DIR_NAME = "sessions"
 
+# 用例目录下存放「环境初始态快照」的子目录名（取证时与它对比）
+BASELINE_DIR_NAME = "baseline"
+
 
 # ---------------- 运行时数据结构 ----------------
 
@@ -94,13 +97,14 @@ class RunContext:
 
     run_id: str
     cases_path: Path
-    base_dir: Path          # 共用只读底座（= EnvSpec.template）
+    base_dir: Path          # 环境材料的来源（= EnvSpec.template）：环境按 meta.env 从它拼
     runs_dir: Path          # runs/
     run_dir: Path           # runs/<run_id>/
     envs_dir: Path          # runs/<run_id>/envs/：每槽一个环境目录
     ipc_dir: Path           # runs/<run_id>/ipc/：子进程请求 / 结果文件
     log_dir: Path           # runs/<run_id>/logs/：子进程 stdout/stderr
     session_folder: Path    # runs/<run_id>/sessions/：本次 run 的 session 落盘根
+    env_config: EnvConfig   # 本次 run 的环境配置（cases.yaml 的 meta.env）
     versions: dict[str, Any] = field(default_factory=dict)  # 三个版本轴的快照（VersionBook）
 
 
@@ -144,7 +148,8 @@ class EvalRunner:
     ) -> None:
         """
         Args:
-            base_dir: 共用只读底座（`EnvSpec.template`）——每条用例的环境都从它复制。
+            base_dir: 环境材料的来源（`EnvSpec.template`）：环境按 cases.yaml 的
+                `meta.env` 从它拼出来（复制哪些路径、库怎么来，都由那份配置决定）。
             runs_dir: 结果根目录；每次 run 在其下新建 `<run_id>/`。
             case_entrypoint: 用例执行入口（`"module.path:function"`），默认
                 `case.py:execute_case`；测试可指向假实现，不必真调 LLM。
@@ -194,6 +199,7 @@ class EvalRunner:
         provider = LifeprismEnvProvider(
             envs_root=ctx.envs_dir,
             ipc_dir=ctx.ipc_dir,
+            env_config=ctx.env_config,   # 「怎么造」是本机制的构造参数，不进 EnvSpec
             log_dir=ctx.log_dir,
         )
         core = EvalCore(
@@ -214,7 +220,7 @@ class EvalRunner:
                 "cases_path": str(ctx.cases_path),
                 "index": index,
                 "case_dir": str(self._case_dir(ctx, case_set, index, case)),
-                "base_dir": str(ctx.base_dir),
+                "baseline_dir": str(self._baseline_dir(ctx, case_set, index, case)),
                 "session_folder": str(ctx.session_folder),
                 "turn_timeout": self.turn_timeout,
                 "scan_other_changed_files": self.scan_other_changed_files,
@@ -277,14 +283,19 @@ class EvalRunner:
     # ---------- 辅助 ----------
 
     def _prepare_run(self, cases_path: Path, case_set: CaseSet) -> RunContext:
-        """建 `runs/<run_id>/` 骨架并写 `run.json`。
+        """建 `runs/<run_id>/` 骨架、核一遍 `meta.env` 并写 `run.json`。
 
-        这里**不复制底座**：底座是只读模板，环境由 provider 按槽位复制（见 env.py）。
-        也不切 `config` 的数据根——本进程不碰数据根，切根发生在子进程里
+        这里**不复制底座**：底座是只读材料来源，环境由 provider 按环境配置、按槽位拼
+        （见 env.py）。也不切 `config` 的数据根——本进程不碰数据根，切根发生在子进程里
         （`case.execute_case` 的第一件事，见那边的说明）。
         """
         if not self.base_dir.is_dir():
             raise FileNotFoundError(f"base 目录不存在: {self.base_dir}")
+
+        env_config = case_set.meta.env
+        # 开槽前先自检：配置里的路径 / 库 / 表在底座里都得在。放在这里而不是等建环境，
+        # 是为了「整个 run 不启动、原因直白」，而不是留下几条「某条任务失败」
+        check_env_inputs(self.base_dir, env_config)
 
         run_id = self._make_run_id()
         run_dir = self.runs_dir / run_id
@@ -298,6 +309,7 @@ class EvalRunner:
             ipc_dir=run_dir / IPC_DIR_NAME,
             log_dir=run_dir / LOGS_DIR_NAME,
             session_folder=run_dir / SESSIONS_DIR_NAME,
+            env_config=env_config,
         )
         for path in (ctx.envs_dir, ctx.ipc_dir, ctx.log_dir, ctx.session_folder):
             path.mkdir(parents=True, exist_ok=True)
@@ -316,6 +328,8 @@ class EvalRunner:
             "case_count": len(case_set.cases),
             # 并行度是结果可比性的一部分（并发高会撞限流），一并记下来
             "max_workers": self.max_workers,
+            # 环境配置同样是结果可比性的一部分：换了初始状态，结果就不能与旧 run 比
+            "env": asdict(env_config),
             # 三个版本轴（prompt / tools / react）：提示词取版本库，代码用 rev 反查
             "versions": ctx.versions,
         }
@@ -329,6 +343,12 @@ class EvalRunner:
         """用例目录：`runs/<run_id>/<meta.id>/<index:03d>_<case.id>/`。"""
         return ctx.run_dir / case_set.meta.id / f"{index:03d}_{case.id}"
 
+    def _baseline_dir(
+        self, ctx: RunContext, case_set: CaseSet, index: int, case: Case
+    ) -> Path:
+        """基线目录：`<用例目录>/baseline/`（环境初始态快照，取证时与它对比）。"""
+        return self._case_dir(ctx, case_set, index, case) / BASELINE_DIR_NAME
+
     def _write_summary(self, ctx: RunContext, results: list[CaseResult]) -> None:
         """写本次 run 的 `summary.csv`，并追加到全局 `runs/summary.csv`。"""
         rows = [_summary_row(r) for r in results]
@@ -337,7 +357,7 @@ class EvalRunner:
 
     @staticmethod
     def _now() -> str:
-        """当前 UTC 时间（ISO 8601），用于时间窗。"""
+        """当前 UTC 时间（ISO 8601），用于会话起止时间（归因不靠时间）。"""
         return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
     @staticmethod

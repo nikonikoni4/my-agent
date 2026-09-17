@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 from evaluate.core import WorkerTask
 
-from lifeprismevalue.evalue.caseload import load_case_set
+from lifeprismevalue.evalue.caseload import CaseLoadError, load_case_set
 from lifeprismevalue.evalue.runner import (
     DEFAULT_CASE_ENTRYPOINT,
     SUMMARY_COLUMNS,
@@ -88,6 +88,13 @@ def test_run_写run_json(tmp_path) -> None:
     assert meta["max_workers"] == 3          # 并发度影响可比性，必须留痕
     assert set(meta["versions"]) == {"prompt", "tools", "react"}
     assert meta["started_at"]
+    # 环境配置也留痕：换了初始状态，结果就不能跟旧 run 相提并论
+    assert meta["env"]["copy"] == ["agent/", "prompts/"]
+    assert meta["env"]["db"] == {
+        "path": "dataset/lifewatch_ai.db",
+        "mode": "copy",
+        "keep_tables": [],
+    }
 
 
 def test_run_建好环境与通信目录(tmp_path) -> None:
@@ -187,6 +194,49 @@ def test_run_base_不存在时报错(tmp_path) -> None:
         asyncio.run(runner.run(write_cases(tmp_path, fake_cases("ok-1"))))
 
 
+# ---------------- 环境声明 ----------------
+
+CASES_NO_ENV = """
+meta:
+  id: 假用例-02
+cases:
+  - id: ok-1
+    type: 假类型
+    evidence: [fake_target]
+    turns:
+      - {role: user, text: "第 1 条"}
+    rubric: 应通过
+"""
+
+
+def test_run_缺环境声明时开跑前就报错(tmp_path) -> None:
+    """`meta.env` 必填：不写就要报错，不能让「忘写」退化成「整份复制底座」。"""
+    runner = EvalRunner(base_dir=make_base(tmp_path), runs_dir=tmp_path / "runs")
+
+    with pytest.raises(CaseLoadError, match="meta.env"):
+        asyncio.run(runner.run(write_cases(tmp_path, CASES_NO_ENV)))
+
+
+def test_run_声明路径不在底座里时开跑前就报错(tmp_path) -> None:
+    """路径写错不该表现成「某条用例莫名失败」，而是整个 run 不启动。"""
+    body = fake_cases("ok-1").replace("copy: [agent/, prompts/]", "copy: [没有的目录/]")
+    runner = EvalRunner(base_dir=make_base(tmp_path), runs_dir=tmp_path / "runs")
+
+    with pytest.raises(FileNotFoundError, match="没有的目录/"):
+        asyncio.run(runner.run(write_cases(tmp_path, body)))
+
+    assert not (tmp_path / "runs").exists()      # 没建 run 目录
+
+
+def test_run_环境声明漏了提示词时开跑前就报错(tmp_path) -> None:
+    """提示词是环境的必需项：漏了它 agent 起不来，整个 run 也不该启动。"""
+    body = fake_cases("ok-1").replace("copy: [agent/, prompts/]", "copy: [agent/]")
+    runner = EvalRunner(base_dir=make_base(tmp_path), runs_dir=tmp_path / "runs")
+
+    with pytest.raises(ValueError, match="prompts/agent_prompts.yaml"):
+        asyncio.run(runner.run(write_cases(tmp_path, body)))
+
+
 # ---------------- summary 落盘 ----------------
 
 
@@ -249,5 +299,6 @@ def test_用真执行实体跑一条用例_不调LLM(tmp_path) -> None:
     assert result.passed is None
     case_dir = Path(result.case_dir)
     assert (case_dir / "case.yaml").exists()          # c 步产物（真 entrypoint 写的）
+    assert (case_dir / "baseline").is_dir()            # a 步产物：环境初始态快照
     assert not (case_dir / "judge.json").exists()      # 未判定
     assert (run_dir / "logs" / f"{case_dir.name}.log").is_file()
