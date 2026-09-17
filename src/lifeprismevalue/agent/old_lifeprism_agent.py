@@ -4,12 +4,16 @@
 （_process_msg -> Context.build_system_prompt），提示词拆成两部分：
 
 1. System Prompt（按 order 升序拼接，order 从 0 开始）
-   identity.md -> soul.md -> agent.md -> tool.md -> skill-list -> user/user.md -> recent_state.md
+   identity -> soul -> agent -> tool                        ← 来自提示词版本库
+   -> skill-list -> user/user.md -> recent_state.md          ← 运行时扫描 / 用户数据
 2. System Reminder（Message List 第二位，System Prompt 之后）
    custom_prompt.md
 
-其中 agent.md 含 {agent_path} 等参数，注册为 callback section，由
-SystemPrompt.render 在组装请求时通过 prompt_render_parame 注入。
+前四段（identity / soul / agent / tool）从 `lifeprismData/prompts/agent_prompts.yaml`
+按版本取（见 lifeprismevalue.prompts）：**切换提示词版本就是改该文件的
+active_version**，不需要动代码。后三段（skill-list / user / recent_state）是运行时
+扫描与用户数据，不进版本库。其中 agent 段含 {agent_path} 等参数，注册为 callback
+section，由 SystemPrompt.render 在组装请求时通过 prompt_render_parame 注入。
 
 create_old_agent() 返回组装好的 ReActAgentLoop（提示词、工具、会话、重试策略均已接线）。
 """
@@ -33,6 +37,7 @@ from myagent.infra.events import EventService
 from myagent.infra.events.eventspec import REQUEST_ERROR
 
 from lifeprismevalue.config import get_lifeprism_data_path
+from lifeprismevalue.prompts import PromptLoader
 from lifeprismevalue.tools import build_lifeprism_tools
 
 load_dotenv()
@@ -55,6 +60,19 @@ class _SafeDict(dict):
 
     def __missing__(self, key):
         return "{" + key + "}"
+
+
+def _placeholder_section(content: str):
+    """把含 {占位符} 的段包成 callback section：渲染时注入参数，缺参数则原样保留。
+
+    用 _SafeDict 而不是 str.format：正文里可能含并非占位符的花括号（如
+    `{skill同名文件.md}`），缺参数时原样保留，不会抛 KeyError。
+    """
+
+    def render(**params) -> str:
+        return content.format_map(_SafeDict(params))
+
+    return render
 
 
 def _read_prompt_file(path: Path) -> str | None:
@@ -133,57 +151,86 @@ def _build_skill_list(data_path: Path) -> str:
     return "# skill-list\n\n" + "\n\n".join(entries)
 
 
-def build_chat_system_prompt(data_path: Path | None = None) -> SystemPrompt:
+def build_chat_system_prompt(
+    data_path: Path | None = None, prompt_version: str | None = None
+) -> SystemPrompt:
     """复刻旧 chat 模式的提示词组装，返回注册完成的 SystemPrompt。
 
-    - System Prompt 分段：order 从 0 开始逐个加载，顺序与旧 chat 模式一致
-    - agent.md：含占位符，注册为 callback section，参数由 SystemPrompt.render 注入
-    - custom_prompt.md：注册为 System Reminder，不进 System Prompt
+    分段顺序与旧 chat 模式一致（order 从 0 开始），来源分两类：
 
-    注意：渲染 agent.md 需要给 ReActAgentLoop 传 prompt_render_parame
+    - **版本库段**：identity / soul / agent / tool 从
+      `<data_path>/prompts/agent_prompts.yaml` 按版本取。`prompt_version` 为空时
+      取该文件的 `active_version`——**切换提示词版本即改它**。
+    - **运行时段**：skill_list（扫描 agent/skills）与 user / recent_state（用户数据）
+      仍按原方式加载，不进版本库。
+
+    - agent 段：含占位符，注册为 callback section，参数由 SystemPrompt.render 注入
+    - custom_prompt.md：注册为 System Reminder，不进 System Prompt（评测时是变量）
+
+    注意：渲染 agent 段需要给 ReActAgentLoop 传 prompt_render_parame
     （见 create_old_agent），否则 render 会因缺少参数而跳过该段。
+
+    Args:
+        data_path: lifeprism 数据根目录，默认取 lifeprismevalue.config 的配置。
+        prompt_version: 提示词版本名；为空取版本库的 active_version。
+
+    Raises:
+        FileNotFoundError: 版本库文件不存在。
+        ValueError: 版本名不存在，或正文不符合「段从一级标题开始」等格式约定。
     """
     data_path = (data_path or get_lifeprism_data_path()).resolve()
     chat_dir = data_path / "agent" / "chat"
 
     system_prompt = SystemPrompt()
 
-    # 静态分段：(section 名, order, 文件路径)
-    static_sections: list[tuple[str, int, Path]] = [
-        ("identity", 0, chat_dir / "identity.md"),
-        ("soul", 1, chat_dir / "soul.md"),
-        ("tool", 3, chat_dir / "tool.md"),
-        ("user", 5, data_path / "user" / "user.md"),
-        ("recent_state", 6, data_path / "user" / "daily_data" / "recent_state.md"),
+    # ---- 版本库段：(section 名, order, 版本库里的段名) ----
+    loader = PromptLoader.for_data_path(data_path)
+    version = prompt_version or loader.active_version
+    versioned_sections: list[tuple[str, int, str]] = [
+        ("identity", 0, "identity"),
+        ("soul", 1, "soul"),
+        ("agent", 2, "agent"),
+        ("tool", 3, "tool"),
     ]
-    for name, order, path in static_sections:
-        content = _read_prompt_file(path)
+    segments = loader.load_segments(version)
+    for section_name, order, segment_name in versioned_sections:
+        content = segments.get(segment_name)
         if content is None:
+            logger.warning("提示词版本 %s 缺少段 %s，跳过该段", version, segment_name)
             continue
-        if name == "identity":
+        if section_name == "identity":
             # 旧实现会在 identity 末尾追加工作目录与可操作目录说明
             content += (
                 f"\n你当前工作目录是：{data_path}，"
                 f"你能够阅读和操作的目录是：{data_path}/{ALLOWED_DIRS}"
             )
-        system_prompt.register_section(AGENT_NAME, PrompSection(name=name, order=order, text=content))
+        # agent 段含 {agent_path}/{user_path}/{diary_path}/{expand_dir} 占位符：
+        # 注册为 callback，参数由 SystemPrompt.render 注入（见 create_old_agent）
+        text = _placeholder_section(content) if section_name == "agent" else content
+        system_prompt.register_section(
+            AGENT_NAME, PrompSection(name=section_name, order=order, text=text)
+        )
 
-    # skill-list：列出 agent/skills 下各 skill 的名称与描述，紧随 tool.md 之后
+    # ---- 运行时段 ----
+    # skill-list：列出 agent/skills 下各 skill 的名称与描述，紧随 tool 之后
     skill_list = _build_skill_list(data_path)
     if skill_list:
         system_prompt.register_section(
             AGENT_NAME, PrompSection(name="skill_list", order=4, text=skill_list)
         )
 
-    # agent.md 含 {agent_path}/{user_path}/{diary_path}/{expand_dir} 占位符：
-    # 文本注册为 callback，参数由 SystemPrompt.render 注入（见 create_old_agent）
-    def _agent_md(**params) -> str:
-        content = _read_prompt_file(chat_dir / "agent.md")
+    # user / recent_state 是用户数据，按原方式从文件读取
+    runtime_sections: list[tuple[str, int, Path]] = [
+        ("user", 5, data_path / "user" / "user.md"),
+        ("recent_state", 6, data_path / "user" / "daily_data" / "recent_state.md"),
+    ]
+    for name, order, path in runtime_sections:
+        content = _read_prompt_file(path)
         if content is None:
-            return ""
-        return content.format_map(_SafeDict(params))
-
-    system_prompt.register_section(AGENT_NAME, PrompSection(name="agent", order=2, text=_agent_md))
+            continue
+        system_prompt.register_section(
+            AGENT_NAME, PrompSection(name=name, order=order, text=content)
+        )
 
     # System Reminder：作为 Message List 第二位注入（System Prompt 之后、正常对话之前）
     custom_prompt = _read_prompt_file(chat_dir / "custom_prompt.md")
