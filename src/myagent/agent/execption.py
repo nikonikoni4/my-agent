@@ -136,8 +136,9 @@ class RetryExhaustedError(AgentPolicyError):
     典型场景：同一 LLM 调用连续失败，重试次数超过 agent_config.max_retry_count。
     由 loop 的重试处理器产出，并以 `from` 挂上最后一次失败的错误。
 
-    注意：单次失败的原因不在本类型上体现，而在 llm/retry 记录（发生点）与
-    __cause__ 链中；本类型只表达"重试策略已耗尽"这一终态。
+    注意：单次失败的原因不在本类型上体现，而在 __cause__ 链中（耗尽那次未重试，故不落
+    llm/retry 记录；其错误另由 step/end 与 turn/end 的 reason_text 承载）；本类型只表达
+    "重试策略已耗尽"这一终态。
     """
 
 # ---------------- 域：无人认领（兜底） ----------------

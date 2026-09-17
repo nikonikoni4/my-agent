@@ -116,9 +116,10 @@ async def test_两个错误_仅走重试的那个记记录并等待():
     assert provider.calls == 2, "限流重试后第二次调用认证失败，随即终止"
     assert isinstance(excinfo.value.__cause__, LLMAuthError)
     records = retry_records(session)
-    assert [r.data.reason for r in records] == ["backoff_retry", "unclaimed"], \
-        "走重试的那次记 backoff_retry，无人认领的那次也落记录（原因为 unclaimed）"
+    assert [r.data.reason for r in records] == ["backoff_retry"], \
+        "只有走重试的那次落 llm/retry；无人认领未重试，不落记录，也不计入重试次数"
     assert records[0].data.retry_count == 1
+    assert session.llm_retry_count(session.turn) == 1, "llm/retry 条数 = 实际重试次数"
     assert len(waits) == 1, "只有走重试的错误才退避等待"
     assert waits[0][2] == 1, "第 1 次重试"
     assert waits[0][1].base_delay == 1.0, "取 backoff 档的退避参数"
@@ -141,8 +142,9 @@ async def test_连续重试达上限_上抛并记error():
     assert provider.calls == 3, "上限 2 次重试后第 3 次调用失败即耗尽"
     assert isinstance(excinfo.value.__cause__, LLMRateLimitError)
     assert [r.data.reason for r in retry_records(session)] == [
-        "backoff_retry", "backoff_retry", "exhausted"
-    ], "两次重试 + 一次耗尽（决定终止的那次同样落记录）"
+        "backoff_retry", "backoff_retry"
+    ], "两次重试各记一条；耗尽的第三次未重试，不落记录（否则虚增重试次数）"
+    assert session.llm_retry_count(session.turn) == 2
     step_ends = [r for r in session.record_list if r.type == "step/end"]
     assert [r.data.reason_type for r in step_ends] == ["error"] * 3, "每次失败的尝试各占一步"
     assert "429 限流" in step_ends[-1].data.reason_text, "step/end 记本步自己的错误"

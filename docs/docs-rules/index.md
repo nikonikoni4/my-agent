@@ -43,7 +43,14 @@
 
 ## known-limitations-and-debt-rules
 
-- updated_at: 2026-07-15
+- updated_at : 2026-07-15
 - path: `docs/docs-rules/known-limitations-and-debt-rules.md`
 - 触发规则：写入 `docs/known-limitations/`、`docs/technical-debt/`、`docs/progress/` 任一目录的文档前阅读
 - 内容摘要：定义已知限制、技术债、待办调研三类文档的判定标准、消费场景、写作视角、重叠处理规则和 progress 的生命周期
+
+## adr-write-rules
+
+- updated_at : 2026-09-17
+- path: `docs/docs-rules/adr-write-rules.md`
+- 触发规则：写入或修改 `docs/adr/` 下的 ADR（含修订已有 ADR）前阅读
+- 内容摘要：ADR 决策的依据规则——决策逐条列出、每条必须附用户原话作为依据；工具询问得到的选项、AI 推理、代码现状均只能作参考不能作依据；不确定必须问用户，宁缺勿错

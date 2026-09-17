@@ -1,9 +1,9 @@
 ---
-version: 1.2
+version: 1.3
 created_at: 2026-09-15
-updated_at: 2026-09-15
-last_updated: 补记两项未决项的落定：兜底域类名定为 AgentUnclaimedError、dont_retry 档已从策略表移除；FinalResult.error_type 已写入 turn/end；同步测试跟进状态
-abstract: ReActAgentLoop 的错误处理重构为「2 个 except + finally 内三阶段（补全/记账/决策）」；终止统一以抛出表达（turn 由异常得知终态），预算检查并入同一决策路径并以 step_opened 保证 step 配对，每次失败在发生点落 llm/retry
+updated_at: 2026-09-17
+last_updated: 撤回"每次失败（含 unclaimed / exhausted）都落 llm/retry"这一写法：它是重构落地时自行写入的越界条款，会让 llm_retry_count 被非重试的失败虚增；本 ADR 只管错误处理结构，llm/retry 的写入范围见《session 错误信息记录策略》ADR v2.0
+abstract: ReActAgentLoop 的错误处理重构为「2 个 except + finally 内三阶段（补全/记账/决策）」；终止统一以抛出表达（turn 由异常得知终态），预算检查并入同一决策路径并以 step_opened 保证 step 配对；llm/retry 只在决定重试时落一条
 status: decided
 ---
 
@@ -16,6 +16,7 @@ status: decided
 | 1.0 | 创建文档初稿 |
 | 1.1 | 补记未决项落定（类名 → `AgentUnclaimedError`）、`dont_retry` 移除已落地、测试已按新结构重写 |
 | 1.2 | `FinalResult.error_type` 写入 `turn/end` 并补上断言；两项未决项至此清零 |
+| 1.3 | 撤回越界条款："每次失败（含 `unclaimed` / `exhausted`）都落 `llm/retry`"→ 只有决定重试时落一条（`llm_retry_count` 的计数口径恢复为"只数重试"） |
 
 ## 问题界定
 
@@ -32,7 +33,7 @@ status: decided
 - 捕获与决策的结构形态（几个 `except`、决策点放哪）。
 - 终止的表达方式（抛出 vs 返回值）。
 - 记账内容（`step/end`、`turn/end`）与错误信息形态。
-- 重试退避、发生点记录（`llm/retry`）的职责归属。
+- 重试退避、发生点记录（`llm/retry`）的职责归属与**写入范围**（何时算一次重试）。
 
 ### 非讨论范围
 
@@ -77,7 +78,7 @@ status: decided
 - `finally` 按序做三件事：① `_complete_session` 补全 session；② 写 `step/end`；③ `await _handle_error` 决策。
 - 终止统一以**抛出**表达：取消原样上抛、无人认领抛 `AgentUnclaimedError`、重试耗尽抛 `RetryExhaustedError`；`turn` 用 `except` 得知终态并在 `finally` 写 `turn/end`。
 - 预算检查挪进 `try`（从而进入同一决策路径），并用 `step_opened` 保证 `step/start`↔`step/end` 配对。
-- 每次失败（含 `unclaimed` / `exhausted`）都在发生点落一条 `llm/retry`。
+- 只有决定重试的那次在发生点落一条 `llm/retry`（它是"第几次重试"的事实，也是下轮 attempt 的计数来源）；`unclaimed` / `exhausted` 都未重试，不落该记录。
 
 **优势**
 
@@ -138,7 +139,7 @@ status: decided
 - 终止统一抛出；`turn` 用 `except` 收终态并在 `finally` 写 `turn/end`，不再依赖返回值。
 - 预算检查在 `try` 内、`step/start` 之前；`step_opened` 保证不写无配对的 `step/end`。
 - `_handle_error` 为 async：取消上抛；无人认领抛 `AgentUnclaimedError`；`retry`/`backoff_retry` 退避后返回；耗尽抛 `RetryExhaustedError`。
-- 每次失败（含两种收尾）先落一条 `llm/retry`，携带 `error_type` + `error_message`。
+- 只有决定重试的那次先落一条 `llm/retry`，携带 `error_type` + `error_message`；`unclaimed` / `exhausted` 不落记录（该记录的条数是重试次数的计数口径）。
 - `reason_text` 用异常链文本（限深 3、展开 `ExceptionGroup`、截断显式标注）。
 - 恢复 `RetryPolicy` + `retry_delay(error, policy, attempt)`（沿用旧名与签名），退避取本地计算与服务端 `Retry-After` 的较大值。
 
@@ -156,8 +157,8 @@ status: decided
 
 - `FinalResult.error_type` 的落点已定并落地：写入 `turn/end`（成功为 `""`、取消为 `CancelledError`、其余为终止本 turn 的类别，如 `AgentUnclaimedError` / `RetryExhaustedError`）；原错误不占该字段，只留在 `reason_text` 链里。
 - 兜底域类名落定为 `AgentUnclaimedError`（原 `LLmError` → 中间态 `AgentUnknownError`）；`LLMRerty` 的 `dont_retry` 档已移除，认证 / 模型 / 接入点类错误改走无人认领 → 停止。
-- `LLMRetryData` 语义扩展为"失败处置记录"并新增两个字段；`TurnEndData` 新增 `error_type`（必填，无默认值）。**注意 session 加载边界是"字段不符抛异常"**：本次改动之前写出的 `turn/end` / `llm/retry` 记录在 `SessionStore.load` 时会因缺字段抛 `TypeError`（当前仓库内无此格式的存量文件，属前瞻风险）。
-- `llm_retry_count` 的口径随之扩大（`unclaimed`/`exhausted` 也计入）；因二者都是终止、之后不再计算 `attempt`，退避次数不受影响，但**统计 `llm/retry` 条数的地方要同步认知**。
+- `LLMRetryData` 新增两个字段（`error_type` / `error_message`），语义仍为"一次重试的记录"；`TurnEndData` 新增 `error_type`（必填，无默认值）。**注意 session 加载边界是"字段不符抛异常"**：本次改动之前写出的 `turn/end` / `llm/retry` 记录在 `SessionStore.load` 时会因缺字段抛 `TypeError`（当前仓库内无此格式的存量文件，属前瞻风险）。
+- `llm_retry_count` 的口径是"只数真正重试的 `llm/retry` 记录"（loop 的 `attempt` 也取自它）。2026-09-15 落地时曾把 `unclaimed` / `exhausted` 也计入该通道，2026-09-17 已撤回——非重试记录会虚增重试次数，写入范围见《session 错误信息记录策略》ADR v2.0。
 - `_complete_session` 目前是"扫描全量记录、补齐未配对的 `tool/call`"，实现者已标注需要重做（性能与作用域都需要收窄到本轮）。
 - 测试已按新结构重写：出路穷举（E/P/R 三组）+ 异常链渲染 + `step` 配对 + 消息面补全；断言口径为 `AgentUnclaimedError`（cause 为触发它的原错误）。
 - `break` 作为"终止但不抛"的出口语义未定且当前不可达（`dont_retry` 移除后策略表只剩重试档），另行记录于 known-limitations。

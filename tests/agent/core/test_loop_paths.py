@@ -34,7 +34,8 @@ P13 provider 内部 bug（RuntimeError）→ 无人认领 → AgentUnclaimedErro
 P14 流中途失败：不补 finish 块（provider 只在正常结束产 finish），异常上抛
 
 == 记录形态 ==
-R1  每次失败都在发生点落 llm/retry（unclaimed / exhausted 也落），含 error_type + 异常链文本
+R1  llm/retry 只在真正重试时落（含 error_type + 异常链文本）；条数即本 turn 重试次数，
+    unclaimed / exhausted 不落记录、不虚增计数
 R2  异常链文本：逐层缩进、限深 3 层（超出显式标注）、展开 ExceptionGroup
 R3  step_opened：预算在开步前拒绝的那一轮不写 step/end（step/start 与 step/end 严格配对）
 R4  补全：异常打断工具调用时补齐占位 tool/result（is_error=True），避免非法消息面
@@ -525,8 +526,8 @@ async def test_P7_LLM调用超时_无人认领上抛且stepend记error():
 
 @pytest.mark.asyncio
 async def test_P8_认证失败无人认领_不等待直接终止():
-    """401 认证失败属配置类错误：策略表已无对应档 → waterfall 无决策 → 记一条
-    llm/retry(unclaimed) 后抛 AgentUnclaimedError；不重试、不退避，模型只调一次"""
+    """401 认证失败属配置类错误：策略表已无对应档 → waterfall 无决策 → 抛
+    AgentUnclaimedError；不重试、不退避（模型只调一次），也不落 llm/retry 记录"""
     strategy = LLMRerty()  # 强引用，保证弱引用注册有效
     script = [LLMAuthError("401 认证失败") for _ in range(3)]
     loop, provider, session = make_loop(script, step_limit=2, retry_strategy=strategy)
@@ -538,16 +539,16 @@ async def test_P8_认证失败无人认领_不等待直接终止():
     assert provider.calls == 1, "配置类错误不再继续下一次调用"
     assert isinstance(excinfo.value.__cause__, LLMAuthError)
     assert waits == [], "不重试就不退避"
-    retry_records = records(session, "llm/retry")
-    assert [r.data.reason for r in retry_records] == ["unclaimed"]
-    assert retry_records[0].data.error_type == "LLMAuthError"
+    assert records(session, "llm/retry") == [], "未重试就不落 llm/retry（否则虚增重试次数）"
+    assert session.llm_retry_count(session.turn) == 0
     assert last(session, "turn/end").data.reason_type == "error"
 
 
 @pytest.mark.asyncio
 async def test_P9_backoff_retry_记记录并退避_超限上抛error():
-    """429 限流属 backoff_retry：每次决策记 llm/retry 并退避；超过上限后抛
-    RetryExhaustedError（cause 为限流），turn/end 的 reason_text 保留重试档位与原始错误"""
+    """429 限流属 backoff_retry：每次决定重试记一条 llm/retry 并退避；超过上限后抛
+    RetryExhaustedError（cause 为限流）——耗尽那次未重试，不落记录，
+    turn/end 的 reason_text 保留重试档位与原始错误"""
     strategy = LLMRerty()
     script = [LLMRateLimitError("429 限流") for _ in range(3)]
     loop, provider, session = make_loop(script, max_retry_count=2, retry_strategy=strategy)
@@ -560,9 +561,10 @@ async def test_P9_backoff_retry_记记录并退避_超限上抛error():
     assert isinstance(excinfo.value.__cause__, LLMRateLimitError)
     retry_records = records(session, "llm/retry")
     assert [r.data.reason for r in retry_records] == [
-        "backoff_retry", "backoff_retry", "exhausted"
-    ], "两次重试 + 一次耗尽，都在发生点落记录"
-    assert [r.data.retry_count for r in retry_records] == [1, 2, 2]
+        "backoff_retry", "backoff_retry"
+    ], "只记真正重试的两次，耗尽的第三次不落记录"
+    assert [r.data.retry_count for r in retry_records] == [1, 2]
+    assert session.llm_retry_count(session.turn) == 2, "llm/retry 条数 = 实际重试次数"
     assert len(waits) == 2, "两次重试各退避一次（耗尽不再等待）"
     assert [r.data.reason_type for r in records(session, "step/end")] == ["error"] * 3, \
         "每次失败的尝试各占一步，各记 error"
@@ -667,20 +669,27 @@ async def test_P14_流中途失败_不补finish块():
 
 
 @pytest.mark.asyncio
-async def test_R1_耗尽也在发生点落llm_retry():
-    """决定终止的那一次失败同样可结构化查询：llm/retry 记下 reason、error_type 与异常链文本"""
+async def test_R1_llm_retry只记真正重试_条数即重试次数():
+    """llm/retry 是"第几次重试"的记录：两次限流重试后成功 → 2 条，各带 reason /
+    error_type / 异常链文本，且 llm_retry_count（loop 的 attempt 计数口径）与实际重试次数一致"""
     strategy = LLMRerty()
-    script = [LLMRateLimitError("429 限流") for _ in range(3)]
-    loop, provider, session = make_loop(script, max_retry_count=1, retry_strategy=strategy)
+    script = [
+        LLMRateLimitError("429 限流"),
+        LLMRateLimitError("429 限流"),
+        LLMResponse(content="最终回复", usage=Usage()),
+    ]
+    loop, provider, session = make_loop(script, max_retry_count=3, retry_strategy=strategy)
     install_recording_delay(loop)
 
-    with pytest.raises(RetryExhaustedError):
-        await loop.turn(user_message())
+    await loop.turn(user_message())
 
+    assert provider.calls == 3, "初始 1 次 + 重试 2 次"
     retry_records = records(session, "llm/retry")
-    assert [r.data.reason for r in retry_records] == ["backoff_retry", "exhausted"]
+    assert [r.data.reason for r in retry_records] == ["backoff_retry", "backoff_retry"]
+    assert [r.data.retry_count for r in retry_records] == [1, 2]
     assert all(r.data.error_type == "LLMRateLimitError" for r in retry_records)
     assert all("429 限流" in r.data.error_message for r in retry_records)
+    assert session.llm_retry_count(session.turn) == 2 == len(retry_records)
 
 
 def test_R2_异常链文本_逐层缩进_限深3层_展开group():

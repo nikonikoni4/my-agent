@@ -1,8 +1,8 @@
 ---
-version: 1.5
+version: 1.6
 created_at: 2026-04-09
-updated_at: 2026-04-14
-last_updated: 迁移文档规则到 docs/docs-rules 与 docs/coding-rules 双目录
+updated_at: 2026-09-17
+last_updated: 按需加载规则新增 ADR（写或修改 docs/adr/ 前读取 adr-write-rules.md）
 abstract: docs 总写作规则，先定义文档类型，再按类型约束正式文档、导航文档、规则文档和临时文档。
 ---
 
@@ -115,6 +115,7 @@ abstract: docs 总写作规则，先定义文档类型，再按类型约束正�
 2. 写正式 `plan` 前，读取 `docs/docs-rules/plan-write-rules.md`
 3. 写正式 `flow` 前，读取 `docs/docs-rules/flow-write-guide.md`
 4. 修改或编写 `docs/ARCHITECTURE.md` 时，读取 `docs/docs-rules/architecture-write-rules.md`
+5. 写或修改 `docs/adr/` 下的 ADR 前，读取 `docs/docs-rules/adr-write-rules.md`
 
 </rules>
 

@@ -708,8 +708,9 @@ class ReActAgentLoop:
         - 重试次数耗尽：抛 RetryExhaustedError（from 最后一次错误）
         - 其它决策：原样返回（循环走 break；语义未定，见 docs/known-limitations）
 
-        除取消外，每次失败都先在发生点落一条 llm/retry —— 含无人认领与耗尽，使"决定
-        终止的那一次"同样可结构化查询，而不是只剩终态里的一句文本。
+        只有"决定重试"的那次在发生点落一条 llm/retry：它既是"第几次重试"的事实，也是
+        下轮 attempt 的计数来源（llm_retry_count 按该记录条数统计）。无人认领与耗尽都不
+        重试，故不落该记录——它们的错误信息由 step/end 与 turn/end 的 reason_text 承载。
 
         Args:
             step_error: 本步异常；None 表示本轮无错。
@@ -719,7 +720,7 @@ class ReActAgentLoop:
 
         Events:
             触发 REQUEST_ERROR（waterfall，向策略注册表取 decision / policy）；
-            经 _record_llm_failure 写 llm/retry 记录（另触发 session/event）。
+            决定重试时经 _record_llm_retry 写 llm/retry 记录（另触发 session/event）。
 
         Raises:
             asyncio.CancelledError: 原样上抛，不进入决策链。
@@ -735,11 +736,8 @@ class ReActAgentLoop:
         # 步骤 3：触发 request/error waterfall，取决策与退避策略
         request_error_result = self._event_service.trigger(REQUEST_ERROR,RequestErrorPayLoad(error_type=step_error))
         decision = (request_error_result or {}).get("decision",None)
-        # 步骤 4：无人认领——先记账，再抛 AgentUnclaimedError
+        # 步骤 4：无人认领——直接抛 AgentUnclaimedError（未重试，不落 llm/retry）
         if decision is None:
-            # 必记：本分支直接上抛，不会走到下面"决定重试"的那条记录；漏记则这次
-            # 失败只剩终态 reason_text 里的文本形态，无法结构化查询。
-            self._record_llm_failure(step_error,"unclaimed")
             raise AgentUnclaimedError("无错误处理策略的错误") from step_error
         # 步骤 5：非重试决策原样返回（调用方据此 break）
         if decision not in RETRY_DECISIONS:
@@ -747,25 +745,25 @@ class ReActAgentLoop:
         # 步骤 6：算本次重试序号 = 本轮已记录的 llm/retry 条数 + 1
         attempt = self._session.llm_retry_count(self._session.turn) + 1
         max_retry_count = self.agent_config.max_retry_count
-        # 步骤 7：超出上限——先记账，再抛 RetryExhaustedError
+        # 步骤 7：超出上限——直接抛 RetryExhaustedError（未重试，不落 llm/retry）
         if attempt > max_retry_count:
-            # 必记：同上——耗尽也是直接上抛，且不会再有第二次 trigger(REQUEST_ERROR)，
-            # 这里的记录是这次失败唯一的结构化落点。
-            self._record_llm_failure(step_error,"exhausted",retry_count=max_retry_count)
             raise RetryExhaustedError(f"{max_retry_count}/{max_retry_count} 达到最大重试错误") from step_error
         # 步骤 8：记账本次重试，按策略退避等待后返回决策（循环继续）
-        self._record_llm_failure(step_error,decision,retry_count=attempt)
+        self._record_llm_retry(step_error,decision,attempt)
         policy = RetryPolicy(**(request_error_result.get("policy") or {}))
         await self.retry_delay(step_error,policy,attempt)
         return decision
 
-    def _record_llm_failure(self,error,reason:str,retry_count:int = 0) -> None:
-        """在发生点记录一次失败的处置（llm/retry），携带触发它的错误本身。
+    def _record_llm_retry(self,error,decision:str,attempt:int) -> None:
+        """落一条 llm/retry 记录：第几次重试、因何决策、触发它的错误本身。
+
+        只在真正决定重试时调用——该记录的条数是本 turn 重试次数的唯一口径
+        （`Session.llm_retry_count`），非重试的失败不得写入。
 
         Args:
-            error: 触发本次处置的异常，用于记录类型与异常链文本。
-            reason: 处置原因，取值 unclaimed / exhausted / retry / backoff_retry。
-            retry_count: 本次重试序号；unclaimed 时为 0。
+            error: 触发本次重试的异常，用于记录类型与异常链文本。
+            decision: 触发本次重试的决策，取值 retry / backoff_retry。
+            attempt: 本次重试序号，从 1 开始。
 
         Returns:
             None。
@@ -776,10 +774,10 @@ class ReActAgentLoop:
         Raises:
             ValueError / TypeError: session.append 的入参校验失败。
         """
-        # 步骤 1：把本次处置落成一条可结构化查询的 llm/retry 记录
+        # 步骤 1：把本次重试落成一条可结构化查询的 llm/retry 记录
         self._session.append("llm/retry",LLMRetryData(
-            retry_count=retry_count,
-            reason=reason,
+            retry_count=attempt,
+            reason=decision,
             error_type=type(error).__name__,
             error_message=_format_error_chain(error),
         ))
