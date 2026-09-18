@@ -733,8 +733,8 @@ class ReActAgentLoop:
         # 步骤 2：取消不进决策链，原样上抛
         if isinstance(step_error,asyncio.CancelledError):
             raise step_error
-        # 步骤 3：触发 request/error waterfall，取决策与退避策略
-        request_error_result = self._event_service.trigger(REQUEST_ERROR,RequestErrorPayLoad(error_type=step_error))
+        # 步骤 3：触发 request/error waterfall（异步入口），取决策与退避策略
+        request_error_result = await self._event_service.trigger_waterfall(REQUEST_ERROR,RequestErrorPayLoad(error_type=step_error))
         decision = (request_error_result or {}).get("decision",None)
         # 步骤 4：无人认领——直接抛 AgentUnclaimedError（未重试，不落 llm/retry）
         if decision is None:

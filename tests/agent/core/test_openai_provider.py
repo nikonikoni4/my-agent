@@ -117,13 +117,17 @@ async def test_HTTP状态错误不被误判为连接类(provider):
         await provider.chat([Message(role="user", content="测试")])
 
 
-def test_连接类错误进入退避重试档():
+@pytest.mark.asyncio
+async def test_连接类错误进入退避重试档():
     """闭环：归一后的 LLMConnectionError 被重试策略识别为 backoff_retry（延迟重试）"""
     from myagent.agent.llm.llm_retry import LLMRerty
     from myagent.infra.events.payload import RequestErrorPayLoad
 
-    decision = LLMRerty().request_error_event(
+    async def _next():
+        return "NEXT"
+
+    decision = await LLMRerty().request_error_event(
         RequestErrorPayLoad(error_type=LLMConnectionError("RemoteProtocolError: peer closed")),
-        lambda: "NEXT",
+        _next,
     )
     assert decision["decision"] == "backoff_retry"

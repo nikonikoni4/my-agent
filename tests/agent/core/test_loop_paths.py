@@ -593,7 +593,7 @@ async def test_P11_工具熔断抛错_经ExceptionGroup上抛():
     loop 触发一次 request/error；订阅方不给出决策 → AgentUnclaimedError 上抛（cause 为 group）"""
     errors = []
 
-    def on_error(payload, nxt):
+    async def on_error(payload, nxt):
         errors.append(payload.error_type)
         return None  # 无人认领
 

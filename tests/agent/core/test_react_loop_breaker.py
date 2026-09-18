@@ -127,9 +127,10 @@ async def test_熔断抛错_无人认领上抛():
 
     errors = []
     # REQUEST_ERROR 是 waterfall 语义事件，回调需接受 (payload, next) 两个参数，
-    # 并按契约返回决策（loop 消费 {"decision": ...} 控制信号）；返回 None 表示无人认领
+    # 并按契约返回决策（loop 消费 {"decision": ...} 控制信号）；返回 None 表示无人认领。
+    # waterfall 订阅方必须是 async（契约见 docs/coding-rules/2026-09-18-waterfall订阅契约.md）
     # 必须用具名局部函数注册（EventService 弱引用 lambda 会立即失效）
-    def on_error(payload, nxt):
+    async def on_error(payload, nxt):
         errors.append(payload.error_type)
         return None
 
@@ -157,7 +158,7 @@ async def test_步数兜底_未配置熔断时达到上限上抛():
 
     errors = []
 
-    def on_error(payload, nxt):
+    async def on_error(payload, nxt):
         errors.append(payload.error_type)
         return None
 
