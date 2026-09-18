@@ -37,8 +37,9 @@ from lifeprismevalue.evalue.case import (
     UNDER_TEST,
     content_summary,
 )
-from lifeprismevalue.evalue.env import LifeprismEnvProvider, check_env_inputs, db_table_names
+from lifeprismevalue.evalue.env import LifeprismEnvProvider, check_env_inputs
 from lifeprismevalue.evalue.evidence import is_file_target
+from lifeprismevalue.evalue.sqlite_read import table_names
 from lifeprismevalue.evalue.types import Case, CaseSet, EnvConfig
 from lifeprismevalue.versions import (
     AXIS_PROMPT,
@@ -387,7 +388,7 @@ def check_evidence_targets(case_set: CaseSet, config: EnvConfig, *, base_dir: Pa
         return
     if config.db is None:
         raise ValueError(f"用例按表取证据，但 meta.env 没声明 db：{tables}")
-    known = db_table_names(base_dir / config.db.path)
+    known = table_names(base_dir / config.db.path)
     missing = [table for table in tables if table not in known]
     if missing:
         raise ValueError(f"用例声明的证据表在底座里不存在: {missing}（底座库 {config.db.path}）")

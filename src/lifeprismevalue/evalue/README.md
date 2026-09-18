@@ -14,7 +14,7 @@
 | `env.py` | **机制层**：环境 = 按环境配置（`meta.env`，provider 的构造参数）从只读底座拼的一份数据根（造 / 整份回滚 / 销毁 / 开槽前自检） |
 | `worker.py` | **执行通道**：一条任务 = 一条子进程（跨进程协议） |
 | `case.py` | **领域层**：单条用例的执行实体（a~j）与子进程入口 `execute_case` |
-| `evidence.py` | 取证：与环境基线对比捞「本次写入」（表 / 文件 / 全树扫描），并负责打基线快照 |
+| `evidence.py` | 取证：与环境基线对比捞「本次写入」（表 / 文件 / 文件与表的全量扫描），并负责打基线快照 |
 | `runner.py` | **调度装配**：读 `meta.env` → 组任务 → 交给 `EvalCore` → 收结果写 summary |
 
 ---
@@ -90,16 +90,17 @@ EvalRunner.run(cases_path):
    开跑前还有一道自检（`env.check_env_inputs`）：配置里的路径 / 库 / `keep_tables` 在底座里都得在，`copy` 非空且必须覆盖 `prompts/agent_prompts.yaml`；不满足就整个 run 不启动——名字打错、底座换代这类问题不该表现成「某条用例莫名失败」。
 3. **重置是整份回滚**（`env.py`）：删掉环境目录、按同一份配置重新拼一遍（与 `create_env` 共用 `_build`，两条路径不许分叉）。不做「哪些会变」的清单——清单永远会漏，漏了还不报错（下一条用例会继承上一条的写入，表现为结果不对但没异常）。
 4. **归因靠与环境基线对比**（`evidence.py`），不再用 `created_at` 时间窗，也不再拿 `base/` 当基线。基线 = 跑用例之前那份环境的初始态快照（`case_dir/baseline/`，`case.py` 的 a 步打）。为什么不能拿 `base/` 当基线：环境只是底座的一个子集，底座里没进环境的东西（几百篇日记、二十万行事件日志）会被全量 diff 判成「本次删掉了」，裁判看到的全是一堆噪声。时间窗的问题则在于只能看见「新写的行」，看不见被改掉、被删掉的东西，也看不见没有时间列的表；对比基线三类都看得见。表有 `id` 列就按 id 对齐比出新增 / 改动 / 删除，没有 id 则退化为整行集合差（`note` 里注明）。
-5. **session 只能「跑完复制改名」**：`SessionPresist` 的文件名固定为 `<session_id>.jsonl`，运行时 append 到固定路径，**不支持改名**；且后台每 2 秒批量落盘，复制前必须 flush（`persist_session_now`），否则丢最后一批。不改源码。
-6. **判定以落库 / 落盘为准**：模型口头说「已记录」但未落库，算失败。
-7. **运行终态要单独区分**：`turn/end` 记录（`TurnEndData`）说明本轮是跑完还是中途失败，带 `reason_type` / `reason_text` / `error_type`——`error_type` 是最外层异常类名（如 `AgentUnclaimedError`、`RetryExhaustedError`、`MaxStepsExceededError`），`reason_text` 是异常链文本（逐层 `类型: 消息`，最多 3 层）。loop 对任何未恢复的异常都以 `error` 收口（含步数上限、重试耗尽），取消为 `interrupted`；据此非 success 就**不判、不重试、停止后续轮次**，否则网络抖动之类会被算成「agent 记错了」，污染结论。`TURN_END` 事件本身不带信息，故只能从 session 读（见 `docs/adr/2026-09-15-session错误信息记录策略.md`）。
-8. **失败分三类，现场位置别记混**：
+5. **"没写在声明的位置"要专门扫**：表类证据只按用例声明的表取，于是**写到别的表去了**在判分时完全看不见；文本文件同理。所以证据里另有两块全量扫描：`other_changed_files`（未被声明的文本文件）与 `other_changed_tables`（未被声明的表，含"只在一侧存在"的新建 / 删表；行数相等时按逐行指纹判"内容被改过"）。真实教训：一条「时间块备注」用例被 agent 写进了锻炼记录表还顺手打了卡，裁判只看到"声明的那张表 0 行"，于是判成"没做"——而真相是"写错地方"，两者处置完全不同。表扫描刻意不给开关：缺了它会误判归因，而成本有上限（`MAX_SCAN_ROWS`）。
+6. **session 只能「跑完复制改名」**：`SessionPresist` 的文件名固定为 `<session_id>.jsonl`，运行时 append 到固定路径，**不支持改名**；且后台每 2 秒批量落盘，复制前必须 flush（`persist_session_now`），否则丢最后一批。不改源码。
+7. **判定以落库 / 落盘为准**：模型口头说「已记录」但未落库，算失败。
+8. **运行终态要单独区分**：`turn/end` 记录（`TurnEndData`）说明本轮是跑完还是中途失败，带 `reason_type` / `reason_text` / `error_type`——`error_type` 是最外层异常类名（如 `AgentUnclaimedError`、`RetryExhaustedError`、`MaxStepsExceededError`），`reason_text` 是异常链文本（逐层 `类型: 消息`，最多 3 层）。loop 对任何未恢复的异常都以 `error` 收口（含步数上限、重试耗尽），取消为 `interrupted`；据此非 success 就**不判、不重试、停止后续轮次**，否则网络抖动之类会被算成「agent 记错了」，污染结论。`TURN_END` 事件本身不带信息，故只能从 session 读（见 `docs/adr/2026-09-15-session错误信息记录策略.md`）。
+9. **失败分三类，现场位置别记混**：
    - **用例级失败**（运行未正常结束、agent 工厂抛错、超时）→ 由 `case.py` 收进 `CaseResult.error`，产物目录里跑到哪算哪（证据 / 统计仍落盘），整次 run 继续；跑完后的环境留在 `<用例目录>/env/`；
    - **执行通道失败**（子进程起不来、崩了、没产出结果）→ 由 `EvalCore` 收成 `WorkerOutcome.ok=False`，runner 落一条只剩错误信息的 `CaseResult`，**现场留在 `envs/<key>/`**（`keep_env_on_failure=False` 则照常回收）；这时用例目录里几乎没有产物（子进程没跑起来）；
    - **判定不通过**（judge 判 `pass=false`）→ 运行本身正常，但结论是"没达标"：跑完后的环境同样留在 `<用例目录>/env/`。
    > 前两类与「判定不通过」的环境现场都在 `<用例目录>/env/`，与 `<用例目录>/baseline/`（跑之前）成对。**注意**：「用例级失败」在 core 眼里是成功（`case.py` 自己兜住了异常、子进程 exit 0），所以 core 的 `keep_env_on_failure` 对它无效——那两类现场只能由领域层自己留（`case.py:_keep_env`）。
-9. **子进程日志在 `runs/<run_id>/logs/<用例目录名>.log`**。用例怎么跑的、异常链是什么，先看这个文件；失败时 `worker.py` 会把日志尾部摘进错误信息。
-10. **`base/` 只读**：谁都不许写底座，一切写入落在环境里。读底座库也走只读连接（`env._open_readonly`）：读 WAL 库会顺带建 `-wal` / `-shm`，那也是写。
+10. **子进程日志在 `runs/<run_id>/logs/<用例目录名>.log`**。用例怎么跑的、异常链是什么，先看这个文件；失败时 `worker.py` 会把日志尾部摘进错误信息。
+11. **`base/` 只读**：谁都不许写底座，一切写入落在环境里。读底座库也走只读连接（`sqlite_read.open_readonly`）：读 WAL 库会顺带建 `-wal` / `-shm`，那也是写。
 
 ---
 

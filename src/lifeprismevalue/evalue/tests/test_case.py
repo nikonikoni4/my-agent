@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -59,6 +60,7 @@ from helpers import (
     CASES_TWO_TURNS,
     CASES_WITH_RULES,
     CP_REL,
+    DB_REL,
     init_expense_db,
     load_case,
     make_base,
@@ -315,6 +317,26 @@ def test_基线快照打在_precondition_之前(tmp_path) -> None:
     item = evidence["other_changed_files"][CP_REL]
     assert item["changed"] is True
     assert "+1. 锻炼->每日锻炼" in item["diff"]
+
+
+def test_写到未声明的表也会出现在证据里(tmp_path) -> None:
+    """h 步的接线：agent 把内容写到**别的表**，全库扫描要能把它收进证据。
+
+    这是"写错地方"唯一能被看见的通道（表类证据只按声明的表取）。
+    """
+    base = make_base(tmp_path)
+
+    def write(data_path: Path) -> None:
+        con = sqlite3.connect(data_path / DB_REL)
+        with con:
+            con.execute("INSERT INTO custom_exercise_log VALUES ('e1', 20, '平板支撑和臀桥')")
+        con.close()
+
+    ctx, _ = run_case(tmp_path, CASES_MIN, base_dir=base, agent=WriteFakeAgent(write))
+
+    evidence = json.loads((ctx.case_dir / "evidence.json").read_text(encoding="utf-8"))
+    assert evidence["targets"]["custom_expense_log"]["row_count"] == 0
+    assert "custom_exercise_log" in evidence["other_changed_tables"]
 
 
 # ---------------- 失败现场：跑完后的环境 ----------------

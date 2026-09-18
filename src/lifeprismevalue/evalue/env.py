@@ -40,6 +40,7 @@ from typing import Iterable
 
 from evaluate.core import Env, EnvProvider, EnvSpec, Worker
 
+from lifeprismevalue.evalue.sqlite_read import open_readonly, quote_identifier, table_names
 from lifeprismevalue.evalue.types import DB_MODE_COPY, DB_MODE_EMPTY, DbConfig, EnvConfig
 
 logger = logging.getLogger(__name__)
@@ -217,7 +218,7 @@ def _build_db(db: DbConfig, *, template: Path, root: Path) -> None:
         shutil.copy2(src_db, dst_db)
         return
 
-    src = _open_readonly(src_db)
+    src = open_readonly(src_db)
     con = sqlite3.connect(dst_db)
     try:
         _create_schema(src, con)
@@ -225,15 +226,6 @@ def _build_db(db: DbConfig, *, template: Path, root: Path) -> None:
     finally:
         con.close()
         src.close()
-
-
-def _open_readonly(db_path: Path) -> sqlite3.Connection:
-    """只读地打开底座里的库。
-
-    不用普通 `connect`：读一个库也可能写它（WAL 库会顺带建 `-wal` / `-shm`），
-    底座是只读的，任何写入都不该发生。`as_uri` 会做百分号编码，非 ASCII 路径也安全。
-    """
-    return sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
 
 
 def _create_schema(src: sqlite3.Connection, con: sqlite3.Connection) -> None:
@@ -275,18 +267,14 @@ def _fill_tables(
 
     con.execute("BEGIN")
     for table in tables:
-        columns = [row[1] for row in src.execute(f"PRAGMA table_info({_quote(table)})")]
+        name = quote_identifier(table)
+        columns = [row[1] for row in src.execute(f"PRAGMA table_info({name})")]
         if not columns:
             raise ValueError(f"keep_tables 里的表在底座里不存在: {table}")
-        rows = list(src.execute(f"select * from {_quote(table)}"))
+        rows = list(src.execute(f"select * from {name}"))
         placeholders = ",".join("?" * len(columns))
-        con.executemany(f"insert into {_quote(table)} values ({placeholders})", rows)
+        con.executemany(f"insert into {name} values ({placeholders})", rows)
     con.execute("COMMIT")
-
-
-def _quote(identifier: str) -> str:
-    """SQLite 标识符引用（表名可能含空格或与关键字重名）。"""
-    return '"' + identifier.replace('"', '""') + '"'
 
 
 # ---------------- 开槽前的自检 ----------------
@@ -325,7 +313,7 @@ def check_env_inputs(template: Path, config: EnvConfig) -> None:
     if config.db.mode != DB_MODE_EMPTY or not config.db.keep_tables:
         # 整库复制、或空库但一张表都不回填：都不必读底座库的结构
         return
-    known = db_table_names(db_path)
+    known = table_names(db_path)
     missing = [table for table in config.db.keep_tables if table not in known]
     if missing:
         raise ValueError(
@@ -337,18 +325,3 @@ def _covers(paths: Iterable[str], rel: str) -> bool:
     """声明里有没有覆盖 rel：等于它，或声明了它的某个父目录。"""
     target = Path(rel)
     return any(target == Path(raw) or Path(raw) in target.parents for raw in paths)
-
-
-def db_table_names(db_path: Path) -> set[str]:
-    """读一个 sqlite 文件里有哪些表（自检用：底座库 / 环境库都可）。
-
-    走只读连接：底座是只读的，普通连接在 WAL 库或带热日志的库上会顺带写它
-    （建 `-wal`/`-shm`，或做一次回滚恢复）。
-    """
-    con = _open_readonly(db_path)
-    try:
-        return {
-            name for (name,) in con.execute("select name from sqlite_master where type='table'")
-        }
-    finally:
-        con.close()

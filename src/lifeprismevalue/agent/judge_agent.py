@@ -70,6 +70,8 @@ Evidence_prompt = """
        - `exists` 为 false 表示该文件现在不存在。
    - `other_changed_files`：**未被用例声明、但确实被改动**的文本文件（结构同 `kind="file"`，
      含被删的），用于发现"顺手改了别的文件"（如改动提示词、日记等）。
+   - `other_changed_tables`：**未被用例声明、但确实被改动过**的表（`rows_baseline` → `rows_current`，
+     或"行数不变但内容有改动"），用于发现"写到了别的表"。
    - `precondition`：本次运行前写入的预置规则。
 
 3. **对话记录**：被评估 agent 的 user / assistant / tool_result 消息，**仅作参考**；
@@ -78,7 +80,9 @@ Evidence_prompt = """
 # 判读提醒
 - 证据是**与初始态的差异**，不是"环境里现在有什么"：初始态就存在的内容不会出现在 `rows` 里。
 - 要点说"应新增"→ 看 `rows` / `row_count` / `new_file`；说"应改动 / 应更新"→ 看 `changed` / `diff`；
-  说"不得改动 / 不得删除"→ 看 `removed`、`changed` 与 `other_changed_files`。
+  说"不得改动 / 不得删除"→ 看 `removed`、`changed`、`other_changed_files` 与 `other_changed_tables`。
+- **声明的表是 0 行时，先看 `other_changed_tables`**：可能是"写错地方"（写进了别的表），
+  而不是"没做"。两者结论不同，理由里要写清是哪一种，并点名写到了哪张表。
 - `error` 非空、或某项 `note` 说不可信时，不要把它当成"agent 没做"，理由里要写明证据不可用。
 """
 

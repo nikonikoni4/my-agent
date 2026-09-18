@@ -320,6 +320,104 @@ def test_顶层字段(tmp_path) -> None:
     assert set(evidence["targets"]) == {"custom_expense_log"}
 
 
+# ---------------- 未声明却被动过的表（全库扫描） ----------------
+# 表类证据只按用例声明的表取，所以"写到别的表去了"必须靠全库扫描才看得见。
+# 真实教训：一条「时间块备注」用例被 agent 写进了锻炼记录表并顺手打卡，
+# 裁判只看到"声明的那张表 0 行"，于是判成"没做"——而真相是"写错地方"。
+
+
+def test_未声明的表被写入时会被收进来(tmp_path) -> None:
+    base, env = make_dirs(tmp_path)
+    init_db(base, {"custom_expense_log": (EXPENSE_COLUMNS, [])})
+    init_db(
+        env,
+        {
+            "custom_expense_log": (EXPENSE_COLUMNS, []),
+            "custom_exercise_log": (["id", "content"], [("e1", "平板支撑和臀桥")]),
+        },
+    )
+
+    evidence = collect(make_case("custom_expense_log"), base, env)
+
+    other = evidence["other_changed_tables"]
+    assert "custom_exercise_log" in other
+    assert other["custom_exercise_log"]["rows_baseline"] == 0
+    assert other["custom_exercise_log"]["rows_current"] == 1
+    assert "未被本用例声明" in other["custom_exercise_log"]["note"]
+
+
+def test_声明的表不重复出现在全库扫描里(tmp_path) -> None:
+    """声明过的表有它自己的详细条目（rows/changed/removed），不该再进扫描结果。"""
+    base, env = make_dirs(tmp_path)
+    init_db(base, {"custom_expense_log": (EXPENSE_COLUMNS, [expense_row("a")])})
+    init_db(env, {"custom_expense_log": (EXPENSE_COLUMNS, [expense_row("a"), expense_row("b")])})
+
+    evidence = collect(make_case("custom_expense_log"), base, env)
+
+    assert evidence["targets"]["custom_expense_log"]["row_count"] == 1
+    assert evidence["other_changed_tables"] == {}
+
+
+def test_行数不变但内容被改也能看出来(tmp_path) -> None:
+    """只比行数会漏掉"改了一行但条数不变"（如把记录内容/数值改掉）。"""
+    base, env = make_dirs(tmp_path)
+    init_db(base, {"custom_exercise_log": (["id", "content"], [("e1", "跑步")])})
+    init_db(env, {"custom_exercise_log": (["id", "content"], [("e1", "散步")])})
+
+    evidence = collect(make_case("custom_expense_log"), base, env)
+
+    item = evidence["other_changed_tables"]["custom_exercise_log"]
+    assert item["rows_baseline"] == item["rows_current"] == 1
+    assert "行数不变" in item["note"]
+
+
+def test_没被动过的表不出现在扫描结果里(tmp_path) -> None:
+    """扫描要能"什么都不报"：否则每条用例的证据都被噪声塞满。"""
+    base, env = make_dirs(tmp_path)
+    kept = [("m1", "喜悦")]
+    for root in (base, env):
+        init_db(
+            root,
+            {
+                "mood_types": (["id", "name"], kept),
+                "custom_expense_log": (EXPENSE_COLUMNS, []),
+            },
+        )
+
+    evidence = collect(make_case("custom_expense_log"), base, env)
+
+    assert evidence["other_changed_tables"] == {}
+
+
+def test_只在一侧存在的表也算改动(tmp_path) -> None:
+    """被测工具能建自定义记录表（`create_type`）：本该写记录却建了张新表，也要露出来。"""
+    base, env = make_dirs(tmp_path)
+    init_db(base, {"custom_expense_log": (EXPENSE_COLUMNS, [])})
+    init_db(
+        env,
+        {
+            "custom_expense_log": (EXPENSE_COLUMNS, []),
+            "custom_new_thing": (["id"], [("x",)]),
+        },
+    )
+
+    evidence = collect(make_case("custom_expense_log"), base, env)
+
+    item = evidence["other_changed_tables"]["custom_new_thing"]
+    assert item["rows_baseline"] == 0 and item["rows_current"] == 1
+    assert "新建" in item["note"]
+
+
+def test_没声明库时不做表扫描(tmp_path) -> None:
+    base, env = make_dirs(tmp_path)
+
+    evidence = collect_evidence(
+        case=make_case("custom_expense_log"), baseline_dir=base, env_root=env, db_rel_path=""
+    )
+
+    assert evidence["other_changed_tables"] == {}
+
+
 # ---------------- 基线快照 ----------------
 
 def test_snapshot_baseline_整份存下环境当前的样子(tmp_path) -> None:

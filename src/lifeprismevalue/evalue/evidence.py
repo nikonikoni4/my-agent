@@ -17,19 +17,27 @@
 - **文件**（`agent/chat/custom_prompt.md` / 日记）：文本统一 diff，`<year>` / `<month>` /
   `<date>` 占位符按当天解析；新增文件、被删文件都算改动。
 
-另外做一次全树扫描，收进「未被 `evidence` 声明但确实改了」的文本文件（防漏判）。
+另外做两次全量扫描，专治"没写在声明的位置"这类漏判：
+
+- **文件**：收进「未被 `evidence` 声明但确实改了」的文本文件；
+- **表**：收进「未被声明但被动过」的表（`other_changed_tables`）。表类证据只按声明取，
+  于是"写到别的表去了"在判分时看不见——真实教训：一条"时间块备注"用例被 agent 写进了
+  锻炼记录表、还顺手打了个卡，裁判只能看到"声明的那张表 0 行"，于是判成"没做"，
+  而真相是"写错地方"（处置完全不同）。
 """
 
 from __future__ import annotations
 
 import datetime
 import difflib
+import hashlib
 import shutil
 import sqlite3
 from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable
 
+from lifeprismevalue.evalue.sqlite_read import open_readonly, quote_identifier, table_names
 from lifeprismevalue.evalue.types import Case
 
 # 全树对比时跳过的大文件 / 二进制后缀（避免把 DB、会话、图片当文本比）
@@ -48,6 +56,9 @@ DIFF_CONTEXT = 1
 
 # 行对齐用的主键列：表普遍有它，有它才能把「改动」从「一删一增」里分出来
 KEY_COLUMN = "id"
+
+# 全库扫描的单表行数上限：超过它就只比行数、不做逐行指纹（防漏判也要有成本上限）
+MAX_SCAN_ROWS = 20_000
 
 
 def snapshot_baseline(env_root: str | Path, baseline_dir: str | Path) -> None:
@@ -84,10 +95,12 @@ def collect_evidence(
         db_rel_path: 库在数据根里的相对路径；空串 = 本环境没声明库（表类证据会报错，
             而不是悄悄去猜一个路径）。
         scan_other_changed_files: 是否额外全树对比，收进「未声明但确实改了」的文本文件。
+            表级全量扫描不受它控制（见 `_collect_other_changed_tables`：那条信息缺失会
+            直接导致误判归因，而成本有上限）。
         now: 解析路径占位符用的「今天」，默认取当前本地时间（测试可注入）。
 
     Returns:
-        {"case_id", "precondition", "targets", "other_changed_files"}
+        {"case_id", "precondition", "targets", "other_changed_files", "other_changed_tables"}
     """
     env_root, baseline_dir = Path(env_root), Path(baseline_dir)
     targets = {
@@ -105,6 +118,13 @@ def collect_evidence(
         "other_changed_files": (
             _collect_other_changed_files(baseline_dir, env_root, case.evidence, now)
             if scan_other_changed_files
+            else {}
+        ),
+        "other_changed_tables": (
+            _collect_other_changed_tables(
+                baseline_dir / db_rel_path, env_root / db_rel_path, case.evidence
+            )
+            if db_rel_path
             else {}
         ),
     }
@@ -238,6 +258,117 @@ def _table_result(
         "removed": list(removed or []),
         "note": note,
         "error": error,
+    }
+
+
+# ---------------- 未声明却被动过的表（全库扫描） ----------------
+
+
+def _collect_other_changed_tables(
+    baseline_db: Path, env_db: Path, declared: Iterable[str]
+) -> dict:
+    """全库扫一遍：哪些**没被声明**的表被本次运行动过。
+
+    与 `_collect_other_changed_files` 同一个目的（防漏判），对象换成**表**：表类证据只按
+    用例声明的表取，于是"写到别的表去了"在判分时完全看不见。**刻意不给开关**——这条信息
+    缺失的代价是把"写错地方"误判成"没做"（两者处置完全不同），而成本有上限
+    （表数 × 每表行数上限），没有关掉它的理由。
+
+    Returns:
+        {表名: {"kind", "table", "rows_baseline", "rows_current", "note"}}
+    """
+    if not baseline_db.is_file() or not env_db.is_file():
+        return {}
+    declared_tables = {item for item in declared if not is_file_target(item)}
+
+    changed: dict[str, dict] = {}
+    before_tables, after_tables = table_names(baseline_db), table_names(env_db)
+    before_con, after_con = open_readonly(baseline_db), open_readonly(env_db)
+    try:
+        for table in sorted(before_tables | after_tables):
+            if table in declared_tables:
+                continue
+            item = _touched_table(
+                before_con,
+                after_con,
+                table,
+                exists_before=table in before_tables,
+                exists_after=table in after_tables,
+            )
+            if item is not None:
+                changed[table] = item
+    finally:
+        before_con.close()
+        after_con.close()
+    return changed
+
+
+def _touched_table(
+    before_con: sqlite3.Connection,
+    after_con: sqlite3.Connection,
+    table: str,
+    *,
+    exists_before: bool,
+    exists_after: bool,
+) -> dict | None:
+    """这张表被动过吗？没动过返回 None。
+
+    两侧都要看：表只在一侧存在也算改动——被测工具能建自定义记录表（`create_type`），
+    「本该写记录却去建了个新表」正是要靠这里露出来的那一类。
+    """
+    if not exists_before:
+        after = _row_count(after_con, table)
+        return None if after is None else _touched(table, 0, after, "本次新建的表")
+    if not exists_after:
+        before = _row_count(before_con, table)
+        return None if before is None else _touched(table, before, 0, "本次删掉了这张表")
+
+    before, after = _row_count(before_con, table), _row_count(after_con, table)
+    if before is None or after is None:
+        return None                 # 读不到就交给声明过的目标去报错，这里不猜
+    if before != after:
+        return _touched(table, before, after, f"行数 {before} -> {after}")
+    if before > MAX_SCAN_ROWS:
+        return None                 # 行数没变、表又太大：不逐行比（宁可漏这一种）
+    if _fingerprint(before_con, table) != _fingerprint(after_con, table):
+        return _touched(table, before, after, "行数不变，但内容有改动")
+    return None
+
+
+def _row_count(con: sqlite3.Connection, table: str) -> int | None:
+    """表行数；读不到（表不存在等）返回 None。"""
+    try:
+        return con.execute(f"select count(*) from {quote_identifier(table)}").fetchone()[0]
+    except sqlite3.Error:
+        return None
+
+
+def _fingerprint(con: sqlite3.Connection, table: str) -> str:
+    """整表逐行做指纹（流式，不把行攒进内存）。
+
+    行数相等时用它判"内容被改过"：只比行数会漏掉"改了一行但条数不变"
+    （例如把某条记录的类型改掉、把余额快照的数值改掉）。
+    """
+    name = quote_identifier(table)
+    try:
+        rows = con.execute(f"select * from {name} order by rowid")
+    except sqlite3.Error:
+        # 没有 rowid 的表（WITHOUT ROWID）：退化成不排序，仍能比出"内容不同"
+        rows = con.execute(f"select * from {name}")
+    digest = hashlib.sha256()
+    for row in rows:
+        digest.update(repr(row).encode("utf-8", "surrogatepass"))
+    return digest.hexdigest()
+
+
+def _touched(table: str, before: int, after: int, delta: str) -> dict:
+    """组装一条「未声明却被动了」的表记录（只说事实，怎么解读交给裁判）。"""
+    return {
+        "kind": "table",
+        "table": table,
+        "rows_baseline": before,
+        "rows_current": after,
+        "note": f"未被本用例声明为证据，但本次运行改动过它（{delta}）",
     }
 
 
