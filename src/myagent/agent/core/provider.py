@@ -7,14 +7,23 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass,field
 from typing import Any
 import datetime
+import json
 
 @dataclass
 class RawToolCall:
-    """模型发起的一次工具调用（原始形态，未经解析）。
+    """模型发起的一次工具调用（原始形态）。
 
-    arguments 保持 wire 上的 JSON 字符串原样。模型输出不可信，解析
-    （json.loads + dict 校验）统一由工具层 ToolRegister 承接（信任边界）：
-    解析失败以带 hint 的 ToolResult 回喂模型自纠，不作为 LLM 调用错误。
+    arguments 有两种形态，**凭类型区分，不另设标志位**：
+
+    - `dict`：provider 已解析成功。解析只在结果是 JSON 对象时替换，故
+      非 str **必然是 dict**；下游（护栏、工具层）直接使用，不再解析。
+    - `str`：wire 原样 JSON 字符串。非法 JSON、或解析结果不是对象
+      （数组/数字/null 等）时保持原样，由工具层 ToolRegister.parse_call
+      解析并以带 hint 的 ToolResult 回喂模型自纠——这类失败不作为 LLM
+      调用错误（分类轴归位，见 ADR 工具调用解析与截断处置移入工具层）。
+
+    注意：替换为 dict 后模型当时写的文本不再保留，`to_dict` / `raw_arguments`
+    序列化回去的结果是语义等价但字面不同的 JSON（见 raw_arguments）。
 
     truncated 由 provider 依据响应 finish_reason == "length" 标记：该调用的
     arguments 可能在生成中途被 max_tokens 切断。它是执行语境而非 wire 数据
@@ -22,8 +31,20 @@ class RawToolCall:
     """
     id : str
     name :str
-    arguments : str  # wire 原样 JSON 字符串；无参数时为 "{}"（空串按 "{}" 处理）
+    arguments : str | dict[str,Any]  # 解析成功为 dict；否则 wire 原样字符串（无参数时为 "{}"）
     truncated : bool = False
+
+    @property
+    def raw_arguments(self)->str:
+        """wire 形态的 arguments 字符串，供 session 记录与事件 payload 使用。
+
+        str 原样返回（解析失败时即模型当时写的文本）；dict 序列化回去。
+        `ensure_ascii=False` 是必须的：默认的 True 会把中文转义成 \\uXXXX，
+        参数里带中文时代码体积与 token 都会翻几倍。
+        """
+        if isinstance(self.arguments,str):
+            return self.arguments or "{}"
+        return json.dumps(self.arguments,ensure_ascii=False)
 
     def to_dict(self)->dict:
         if not self.id or not self.name :
@@ -33,9 +54,10 @@ class RawToolCall:
             "type" :"function",
             "function":{
                 "name":self.name,
-                # 契约：wire 格式中 arguments 是 JSON 字符串；原样透传不重新序列化，
-                # 回发给供应商的就是模型当时写的文本
-                "arguments" : self.arguments or "{}"
+                # 契约：wire 格式中 arguments 是 JSON 字符串，故统一走 raw_arguments
+                # 取字符串形态。本方法在每次请求都会执行（openai_provider 把历史
+                # assistant 消息连同 tool_calls 回放给供应商）
+                "arguments" : self.raw_arguments
             }
         }
 
@@ -202,12 +224,14 @@ class LLMProvider(ABC):
         """
 
     def extract_tool_calls(self,response_message,finish_reason : str | None = None)->list[RawToolCall] | None:
-        """把 SDK 响应里的 tool_calls 提取为 RawToolCall 列表（纯翻译，不做解析）。
+        """把 SDK 响应里的 tool_calls 提取为 RawToolCall 列表，并尽力解析 arguments。
 
-        arguments 保持模型输出的 JSON 字符串原样：是否合法 JSON、是否符合
-        schema 由工具层 ToolRegister 判定。finish_reason == "length" 时为提取
-        出的调用打 truncated 标记（arguments 可能中途被 max_tokens 切断），
-        回喂话术的选择由工具层依据该标记完成。
+        解析是**尽力而为、静默失败**：只有 json.loads 的结果是 JSON 对象时才把
+        arguments 换成 dict；非法 JSON、以及解析成数组/数字/null 等非对象的情况
+        一律保持原字符串。不抛异常、不设标志位——类型本身就是标志。
+
+        schema 校验、解析失败的话术与回喂仍由工具层 ToolRegister 承接（信任
+        边界没变，只是把"能解析的顺手解析掉"，让护栏等上游拿得到结构化参数）。
 
         Args:
             response_message: SDK 响应中的 choices[0].message 对象，
@@ -219,14 +243,20 @@ class LLMProvider(ABC):
         """
         if not response_message:
             return None
-        calls = [
-            RawToolCall(
+        calls = []
+        for tool_call in response_message.tool_calls:
+            raw = tool_call.function.arguments or "{}"
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                parsed = None
+            # 只有解析结果是 JSON 对象才替换；否则保持原字符串交给工具层判定
+            # （非对象如 [1,2] / 123 / null 由工具层回 PARSE_NOT_OBJECT 错误）
+            calls.append(RawToolCall(
                 id=tool_call.id,
                 name=tool_call.function.name,
-                arguments=tool_call.function.arguments or "{}",
-            )
-            for tool_call in response_message.tool_calls
-        ]
+                arguments=parsed if isinstance(parsed,dict) else raw,
+            ))
         if finish_reason == "length":
             for call in calls:
                 call.truncated = True

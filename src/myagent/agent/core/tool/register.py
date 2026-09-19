@@ -237,10 +237,11 @@ class ToolRegister:
     def parse_call(self, call: RawToolCall) -> ParsedToolCall | ToolResult:
         """把模型原始工具调用解析为可执行形态（工具层的信任边界入口）。
 
-        模型输出的 arguments JSON 字符串不可信，json.loads 在此完成：
-        - 解析成功且是 dict：返回 ParsedToolCall，交由 execute 继续校验执行
-        - 解析失败或不是 dict：返回带 hint 的错误 ToolResult（原文 + 错误
-          位置），回喂模型自纠；工具未执行
+        arguments 有两种形态（见 RawToolCall），按类型分流：
+        - dict：provider 已解析成功，直接构造 ParsedToolCall——非 str 必然是
+          dict（provider 只在 json.loads 结果是对象时才替换），无需再判断
+        - str：json.loads 在此完成，失败或不是 dict 时返回带 hint 的错误
+          ToolResult（原文 + 错误位置），回喂模型自纠；工具未执行
 
         解析失败的话术依据 call.truncated 分流（见 ADR 截断三成因）：
         截断（来自 finish_reason=length 的响应）建议精简参数/拆分调用，
@@ -253,6 +254,10 @@ class ToolRegister:
             ParsedToolCall（解析成功）或 ToolResult（error_type 为 PARSE_*
             之一，解析失败）
         """
+        # provider 已解析成对象：直接使用，类型即标志
+        if not isinstance(call.arguments, str):
+            return ParsedToolCall(call_id=call.id, tool_name=call.name, arguments=call.arguments)
+
         raw = call.arguments or "{}"
         try:
             arguments = json.loads(raw)

@@ -31,7 +31,8 @@ async def test_openai_provider_response(provider):
 
     assert response.content == "ok" , "输出返回错误"
     assert response.reasoning_content == "测试" ,  "输出返回错误"
-    assert response.tool_call_requests == [RawToolCall(id= "call_xxx",name = "test",arguments = '{"test":"a" }')],"输出返回错误"
+    # provider 尽力解析：解析结果是 JSON 对象时 arguments 换为 dict（见 RawToolCall）
+    assert response.tool_call_requests == [RawToolCall(id= "call_xxx",name = "test",arguments = {"test":"a"})],"输出返回错误"
     assert response.usage == Usage(prompt_tokens=1, completion_tokens=2, total_tokens=3),"输出返回错误"
     assert response.finish_reason == "tool_calls","输出返回错误"
 
@@ -63,6 +64,28 @@ async def test_length截断的tool_call提取时带truncated标记(provider):
     response_ok = await provider.chat([Message(role="user",content="测试")])
 
     assert response_ok.tool_call_requests[0].truncated is False
+
+
+@pytest.mark.asyncio
+async def test_arguments尽力解析_只有对象才换成dict(provider):
+    """extract_tool_calls 的解析规则：仅当 json.loads 结果是 JSON 对象时替换为 dict，
+    其余一律保持原字符串（交由工具层判定并回喂）。不抛异常、不设标志位。"""
+    cases = [
+        ('{"a": 1}', {"a": 1}),          # 合法对象 -> dict
+        ('{"a": "b"}', {"a": "b"}),
+        ('{"a": "b', '{"a": "b'),        # 非法 JSON -> 保持原文
+        ("", {}),                        # 无参数（空串按 "{}"） -> 空对象
+        ("[1, 2]", "[1, 2]"),            # 合法 JSON 但不是对象 -> 保持原文
+        ("123", "123"),                  # 数字同理
+        ("null", "null"),                # null 同理
+    ]
+    for raw, expected in cases:
+        tool_calls = [SimpleNamespace(id="c", function=SimpleNamespace(name="t", arguments=raw))]
+        provider._client.chat.completions.create.return_value = make_fake_completions(
+            finish_reason="tool_calls", tool_calls=tool_calls)
+        response = await provider.chat([Message(role="user", content="测试")])
+
+        assert response.tool_call_requests[0].arguments == expected, f"arguments={raw!r} 的提取结果不符"
 
 
 # ---------------- httpx 传输层异常 → 连接类（LLMConnectionError） ----------------

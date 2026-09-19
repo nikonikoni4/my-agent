@@ -107,8 +107,9 @@ class AgentLoop:
                     for tool_call in response.tool_call_requests:
                         id = tool_call.id
                         name = tool_call.name
-                        # arguments 保持 wire 原样 JSON 字符串，解析在 ToolRegister 内
-                        self._session.append("tool/call",ToolCallData(tool_name=name,call_id = id ,arguments=tool_call.arguments))
+                        # arguments 取 wire 形态字符串（provider 未解析成功时即原文），
+                        # 解析与校验都在 ToolRegister 内
+                        self._session.append("tool/call",ToolCallData(tool_name=name,call_id = id ,arguments=tool_call.raw_arguments))
                         self.persist_now("tool/call")
                         # TODO 工具出错相关处理
                         result = await self._tool_register.execute(tool_call)

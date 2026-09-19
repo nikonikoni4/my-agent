@@ -549,7 +549,7 @@ class ReActAgentLoop:
                         for tool_call in response.tool_call_requests:
                             self._event_service.emit(TOOL_CALL.name,ToolCallPayload())
                             tasks.append(tg.create_task(self.tool_register.execute(tool_call)))
-                            self._session.append("tool/call",ToolCallData(tool_name=tool_call.name,call_id = tool_call.id ,arguments=tool_call.arguments))
+                            self._session.append("tool/call",ToolCallData(tool_name=tool_call.name,call_id = tool_call.id ,arguments=tool_call.raw_arguments))
     
                     # 步骤 5b：按原调用顺序回收结果，写 tool/result 并广播
                     for index,task in enumerate(tasks):
@@ -558,7 +558,7 @@ class ReActAgentLoop:
                         self._session.append("tool/result",ToolResultData(call_id=tool_call.id,tool_name=tool_call.name,message=Message(role="tool",content=tool_result.content,tool_call_id=tool_call.id,),is_error=tool_result.is_error,duration_ms=tool_result.duration_ms),surface_op="append",source_event_seqs=[])
                         self._event_service.emit(TOOL_RESULT.name,ToolResultPayload(
                             tool_name=tool_call.name,
-                            arguments=tool_call.arguments,
+                            arguments=tool_call.raw_arguments,
                             is_error=tool_result.is_error,
                             error_type=tool_result.error_type.value if tool_result.error_type else None,
                             content=tool_result.content,

@@ -3,12 +3,16 @@ from typing import Any
 from myagent.agent.core import Tool
 from myagent.agent.core.provider import RawToolCall
 from myagent.agent.core.tool.register import ToolRegister
-from myagent.agent.core.tool.tool import ToolResult, ToolErrorType
+from myagent.agent.core.tool.tool import ParsedToolCall, ToolResult, ToolErrorType
 from myagent.agent.execption import ToolValueError, ToolConsecutiveFailureError
 import pytest
 
-def call(name: str, arguments: str = "{}", call_id: str = "call_1") -> RawToolCall:
-    """构造一次模型原始工具调用（arguments 为 wire 上的 JSON 字符串）"""
+def call(name: str, arguments: str | dict = "{}", call_id: str = "call_1") -> RawToolCall:
+    """构造一次模型原始工具调用。
+
+    arguments 为 str 表示 provider 未解析成功（wire 原样 JSON 字符串，含坏 JSON），
+    为 dict 表示 provider 已解析成功——两形态凭类型区分，见 RawToolCall。
+    """
     return RawToolCall(id=call_id, name=name, arguments=arguments)
 
 class WeatherTool(Tool):
@@ -241,6 +245,43 @@ async def test_空串参数按空对象处理正常执行(register: ToolRegister
 
     assert result.is_error is False
     assert result.content == "12:00"
+
+
+# ---------------------------------------------------------------------------
+# arguments 两形态分流（provider 已解析成 dict 时直通，工具层不再解析）
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_已解析的dict参数直通执行(register: ToolRegister):
+    """provider 解析成功时 arguments 已是 dict：工具层直接使用，不重新解析"""
+    register.register(WeatherTool())
+
+    result = await register.execute(call("get_weather", {"date": "2026-09-19"}))
+
+    assert result.is_error is False
+    assert "2026-09-19" in result.content
+
+
+def test_parse_call_对已解析调用直接产出ParsedToolCall(register: ToolRegister):
+    """类型即标志：非 str 必然是 dict，不解析也不回喂错误"""
+    parsed = register.parse_call(call("get_weather", {"date": "2026-09-19"}))
+
+    assert isinstance(parsed, ParsedToolCall)
+    assert parsed.arguments == {"date": "2026-09-19"}
+    assert parsed.tool_name == "get_weather"
+    assert parsed.call_id == "call_1"
+
+
+@pytest.mark.asyncio
+async def test_已解析的dict参数校验失败仍走工具层校验(register: ToolRegister):
+    """跳过解析不等于跳过校验：必填/未知参数仍由工具层判定"""
+    register.register(WeatherTool())
+
+    result = await register.execute(call("get_weather", {"unknown": 1}))
+
+    assert result.is_error is True
+    assert result.error_type is ToolErrorType.PARAM_VALIDATION
 
 
 # ---------------------------------------------------------------------------

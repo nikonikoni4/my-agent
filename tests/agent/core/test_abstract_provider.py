@@ -37,6 +37,39 @@ def test_tool_to_dict(correct_toolcallrequest:RawToolCall,wrong_toolcallrequest:
         wrong_toolcallrequest.to_dict()
 
 
+# ---------- RawToolCall.arguments 的两种形态（str | dict） ----------
+# 契约：provider 只在 json.loads 结果是 JSON 对象时把 arguments 换成 dict，
+# 其余（非法 JSON、数组/数字/null 等非对象）保持原字符串。凭类型区分，无标志位。
+
+
+def test_to_dict_两形态都产出JSON字符串():
+    """wire 格式要求 arguments 是字符串：dict 形态序列化回去，str 形态原样透传"""
+    as_str = RawToolCall(id="c1", name="t", arguments='{"a":  1}')
+    as_dict = RawToolCall(id="c2", name="t", arguments={"a": 1})
+
+    assert as_str.to_dict()["function"]["arguments"] == '{"a":  1}', "str 形态应原样透传，不重新序列化"
+    assert as_dict.to_dict()["function"]["arguments"] == '{"a": 1}', "dict 形态应序列化回 JSON 字符串"
+    assert isinstance(as_dict.to_dict()["function"]["arguments"], str), "wire 上 arguments 必须是字符串"
+
+
+def test_raw_arguments_中文不被转义():
+    """to_dict 每次请求都会执行（历史 assistant 消息连同 tool_calls 回放给供应商），
+    默认的 ensure_ascii=True 会把中文写成 \\uXXXX，使体积与 token 翻几倍"""
+    call = RawToolCall(id="c1", name="write", arguments={"content": "你好"})
+
+    assert call.raw_arguments == '{"content": "你好"}', "dict 形态序列化时不得转义中文"
+    assert "\\u" not in call.to_dict()["function"]["arguments"], "wire 上也不得出现转义的中文"
+
+
+def test_raw_arguments_两形态都是字符串():
+    """session 记录与事件 payload 都要求字符串，统一走 raw_arguments 取值"""
+    assert RawToolCall(id="c1", name="t", arguments='{"a": 1}').raw_arguments == '{"a": 1}'
+    assert RawToolCall(id="c2", name="t", arguments={"a": 1}).raw_arguments == '{"a": 1}'
+    # 无参数：空串按 "{}" 处理，与 parse_call 的口径一致
+    assert RawToolCall(id="c3", name="t", arguments="").raw_arguments == "{}"
+    assert RawToolCall(id="c4", name="t", arguments={}).raw_arguments == "{}"
+
+
 # ---------- Message.to_dict ----------
 
 @pytest.fixture
