@@ -6,7 +6,13 @@
    `sessions/` 会话落盘）并写 `run.json`（溯源用的三个版本轴 + 起止）；
 2. **组任务**：把用例列表翻译成 `WorkerTask` 列表（entrypoint 指向 `case.py` 的执行实体），
    交给 `evaluate.core.EvalCore` 铺到槽位上跑；
-3. **收结果**：把 `EvalCore` 交回的产出映射成 `CaseResult`，写 `summary.csv`。
+3. **收结果**：把 `EvalCore` 交回的产出映射成 `CaseResult`，并让 `summary` 模块
+   从**落盘的文件**重建 `summary.csv`。
+
+第 3 步为什么不直接用手里这份 `CaseResult` 拼表：那份数据一旦只活在内存里，
+`summary.csv` 就成了唯一副本——删掉它，「时间 / 耗时」这类字段再也算不出来。
+所以列的定义搬去了 [summary.py](./summary.py)，这里只负责"跑完调一次"，且走的是与
+命令行重建**完全相同**的代码路径（跑评测本身就在检验重建还成不成立）。
 
 用例到底怎么跑、跑成什么样，本模块**不解释**——那是 `case.py`（领域层）与
 `WorkerOutcome`（回执）的事。流程与约定见 [README.md](./README.md)。
@@ -19,7 +25,6 @@
 from __future__ import annotations
 
 import asyncio
-import csv
 import datetime
 import json
 import logging
@@ -29,18 +34,24 @@ from typing import Any
 
 from evaluate.core import EnvSpec, EvalCore, WorkerOutcome, WorkerTask
 
+from lifeprismevalue.evalue import summary
 from lifeprismevalue.evalue.caseload import load_case_set
 from lifeprismevalue.evalue.case import (
     DEFAULT_TURN_TIMEOUT,
-    JUDGE,
-    SIMULATOR,
-    UNDER_TEST,
+    collect_agent_info,
     content_summary,
+    snapshot_case,
 )
 from lifeprismevalue.evalue.env import LifeprismEnvProvider, check_env_inputs
 from lifeprismevalue.evalue.evidence import is_file_target
 from lifeprismevalue.evalue.sqlite_read import table_names
-from lifeprismevalue.evalue.types import Case, CaseSet, EnvConfig
+from lifeprismevalue.evalue.types import (
+    RESULT_FILENAME,
+    RUN_FILENAME,
+    Case,
+    CaseSet,
+    EnvConfig,
+)
 from lifeprismevalue.versions import (
     AXIS_PROMPT,
     AXIS_REACT,
@@ -55,30 +66,6 @@ DEFAULT_CASE_ENTRYPOINT = "lifeprismevalue.evalue.case:execute_case"
 
 # 默认槽位数。任务若依赖外部服务（LLM），并发过高只会撞限流；建议不超过物理核数。
 DEFAULT_MAX_WORKERS = 4
-
-# summary.csv 的列（见 lifeprismTestData/README.md「summary.csv 字段」）。
-# 顺序：标识信息（版本 + 本次用了哪些 agent + 各 agent 的模型）排在前面，便于扫表；
-# 后面是本次运行的结果与起止时间。
-SUMMARY_COLUMNS = [
-    "时间",
-    "提示词版本",
-    "工具版本",
-    "agent版本",
-    "版本",
-    "under_test",
-    "simulator",
-    "judge",
-    "under_test模型",
-    "simulator模型",
-    "judge模型",
-    "session_id",
-    "测试内容摘要",
-    "测试结果摘要",
-    "是否通过",
-    "多轮(Y/N)",
-    "会话开始时间",
-    "会话结束时间",
-]
 
 # run 目录下的子目录：环境（每槽一份）/ 子进程通信 / 子进程日志 / 会话落盘根
 ENVS_DIR_NAME = "envs"
@@ -121,6 +108,7 @@ class CaseResult:
     content_summary: str = ""   # 测试内容摘要
     session_id: str = ""        # 被测评 agent 的 session id
     passed: bool | None = None  # None = 未判（judge.mode=none 或运行未正常结束）
+    score: int | None = None    # 裁判给的 0~100 分；None = 未判 / 裁判没给（两种都留空）
     reason: str = ""
     multi_turn: bool = False
     started_at: str = ""
@@ -191,7 +179,7 @@ class EvalRunner:
             self._to_result(ctx, case_set, index, case, outcome)
             for index, (case, outcome) in enumerate(zip(case_set.cases, outcomes))
         ]
-        self._write_summary(ctx, results)
+        self._write_summary(ctx)
         return results
 
     # ---------- 调度 ----------
@@ -249,10 +237,11 @@ class EvalRunner:
             logger.error(
                 "用例 %s 的执行通道失败：%s（环境 %s）", case.id, outcome.error, outcome.env_key
             )
-            return CaseResult(
+            case_dir = self._case_dir(ctx, case_set, index, case)
+            result = CaseResult(
                 case_id=case.id,
                 case_type=case.type,
-                case_dir=str(self._case_dir(ctx, case_set, index, case)),
+                case_dir=str(case_dir),
                 version=case_set.meta.id,
                 content_summary=content_summary(case),
                 multi_turn=case.multi_turn,
@@ -263,6 +252,12 @@ class EvalRunner:
                 error=outcome.error,
                 versions=versions,
             )
+            _write_failure_artifacts(case_dir, case, result)
+            # agent 信息也按**同一个** collect_agent_info 算：子进程没起来，session 一份都
+            # 没有，于是模型名是 unknown（「启用但取不到」）而不是留空。两边同一个函数，
+            # 重建出来的行才与这里报的一致（对拍测试钉着这条）。
+            result.agents, result.models = collect_agent_info(case, case_dir)
+            return result
 
         return CaseResult(
             case_id=str(data.get("case_id") or case.id),
@@ -272,6 +267,7 @@ class EvalRunner:
             content_summary=str(data.get("content_summary") or content_summary(case)),
             session_id=str(data.get("session_id") or ""),
             passed=data.get("passed"),
+            score=data.get("score"),
             reason=str(data.get("reason") or ""),
             multi_turn=bool(data.get("multi_turn", case.multi_turn)),
             started_at=str(data.get("started_at") or outcome.started_at),
@@ -336,7 +332,7 @@ class EvalRunner:
             # 三个版本轴（prompt / tools / react）：提示词取版本库，代码用 rev 反查
             "versions": ctx.versions,
         }
-        (ctx.run_dir / "run.json").write_text(
+        (ctx.run_dir / RUN_FILENAME).write_text(
             json.dumps(run_meta, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         logger.info("run %s 就绪：%d 条用例，%d 个槽位", run_id, len(case_set.cases), self.max_workers)
@@ -352,11 +348,13 @@ class EvalRunner:
         """基线目录：`<用例目录>/baseline/`（环境初始态快照，取证时与它对比）。"""
         return self._case_dir(ctx, case_set, index, case) / BASELINE_DIR_NAME
 
-    def _write_summary(self, ctx: RunContext, results: list[CaseResult]) -> None:
-        """写本次 run 的 `summary.csv`，并追加到全局 `runs/summary.csv`。"""
-        rows = [_summary_row(r) for r in results]
-        _write_csv(ctx.run_dir / "summary.csv", rows)
-        _append_csv(ctx.runs_dir / "summary.csv", rows)
+    def _write_summary(self, ctx: RunContext) -> None:
+        """重建本次 run 的 `summary.csv`，并追加到全局总表。
+
+        输入是**落盘的文件**，不是手里那份 `results`——走同一条路，才能保证「删掉
+        summary 还能重建」这件事一直成立（列的定义与读法都在 [summary.py](./summary.py)）。
+        """
+        summary.write_run_and_append(ctx.run_dir, ctx.runs_dir)
 
     @staticmethod
     def _now() -> str:
@@ -394,86 +392,37 @@ def check_evidence_targets(case_set: CaseSet, config: EnvConfig, *, base_dir: Pa
         raise ValueError(f"用例声明的证据表在底座里不存在: {missing}（底座库 {config.db.path}）")
 
 
-# ---------------- summary 落盘 ----------------
+# ---------------- 给执行通道失败的用例补回执 ----------------
 
 
-def _summary_row(result: CaseResult) -> dict[str, str]:
-    """把 CaseResult 映射为 summary.csv 的一行（列的顺序见 SUMMARY_COLUMNS）。"""
-    passed = "" if result.passed is None else ("Y" if result.passed else "N")
-    versions = result.versions or {}
-    agents = result.agents or {}
-    models = result.models or {}
-    return {
-        "时间": result.ended_at or result.started_at,
-        "提示词版本": str(versions.get(AXIS_PROMPT, "")),
-        "工具版本": str(versions.get(AXIS_TOOLS, "")),
-        "agent版本": str(versions.get(AXIS_REACT, "")),
-        "版本": result.version,
-        "under_test": _yn(agents.get(UNDER_TEST)),
-        "simulator": _yn(agents.get(SIMULATOR)),
-        "judge": _yn(agents.get(JUDGE)),
-        "under_test模型": str(models.get(UNDER_TEST, "")),
-        "simulator模型": str(models.get(SIMULATOR, "")),
-        "judge模型": str(models.get(JUDGE, "")),
-        "session_id": result.session_id,
-        "测试内容摘要": result.content_summary,
-        "测试结果摘要": result.reason,
-        "是否通过": passed,
-        "多轮(Y/N)": "Y" if result.multi_turn else "N",
-        "会话开始时间": result.started_at,
-        "会话结束时间": result.ended_at,
-    }
+def _write_failure_artifacts(case_dir: Path, case: Case, result: CaseResult) -> None:
+    """给「执行通道失败」的用例补上产物。
 
+    子进程压根没起来，什么都没落。而重建报表正是靠这些文件认出这条用例，所以这里替它补：
 
-def _write_csv(path: Path, rows: list[dict[str, str]]) -> None:
-    """覆盖写 CSV（含表头）。"""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=SUMMARY_COLUMNS)
-        writer.writeheader()
-        writer.writerows(rows)
+    - `case.yaml`：用例定义快照——与 c 步走**同一个** `snapshot_case`，内容一模一样；
+    - `result.json`：回执里只有**推不出来的三样**（见 `case.py:_write_result`）。
 
+    不补的话这条用例会从报表里**整个消失**，连「它失败过」都看不出来。
 
-def _append_csv(path: Path, rows: list[dict[str, str]]) -> None:
-    """追加写 CSV（文件不存在时先写表头）。
+    ⚠️ 回执里的 `started_at` / `ended_at` 与正常路径**语义不同**：正常路径量的是被测评
+    agent 的运行时长（`case.py` 在跑之前 / 跑完之后打点），这里量的是**整个子进程**（由
+    `evaluate.core` 打点）——子进程没跑起来，没有更细的点可打。所以这类用例的「耗时(s)」
+    会偏大。量具坏了的时候看得见，好过看不见。
 
-    表头与当前 `SUMMARY_COLUMNS` 不一致时，把旧文件改名留档后重写——列集合会随版本
-    演进（如新增版本列），拿旧表头追加新行会让列错位且**静默**，宁可留档重开。
+    尽力而为：写不进去只告警，不往上抛。
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    header = _read_csv_header(path)
-    if header is not None and header != SUMMARY_COLUMNS:
-        backup = path.with_name(f"{path.stem}-{_timestamp_suffix()}.bak{path.suffix}")
-        path.replace(backup)
-        logger.warning("汇总表列已变化，旧表留档为 %s，本次按新列重写表头", backup.name)
-
-    write_header = not path.exists()
-    with path.open("a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=SUMMARY_COLUMNS)
-        if write_header:
-            writer.writeheader()
-        writer.writerows(rows)
-
-
-def _read_csv_header(path: Path) -> list[str] | None:
-    """读 CSV 的表头行；文件不存在或读不到返回 None。"""
-    if not path.is_file():
-        return None
+    payload = {
+        "started_at": result.started_at,
+        "ended_at": result.ended_at,
+        "error": result.error,
+    }
+    target = case_dir / RESULT_FILENAME
     try:
-        with path.open("r", newline="", encoding="utf-8") as f:
-            return next(csv.reader(f), None)
-    except OSError:
-        return None
-
-
-def _timestamp_suffix() -> str:
-    """留档文件名用的时间戳（UTC，YYYYmmdd-HHMMSS）。"""
-    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
-
-
-def _yn(value: bool | None) -> str:
-    """bool -> Y/N（None 视为 N）。"""
-    return "Y" if value else "N"
+        snapshot_case(case, case_dir)
+        target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except (OSError, ValueError) as e:
+        logger.warning("补产物失败：%s（%s: %s）", target, type(e).__name__, e)
 
 
 # ---------------- 版本信息 ----------------

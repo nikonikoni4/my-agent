@@ -31,12 +31,13 @@ from lifeprismevalue.evalue.case import (
     RULE_SECTION_TITLE,
     CaseExecutor,
     TurnCollector,
-    _collect_agent_info,
-    _failure_note,
+    collect_agent_info,
+    failure_note,
+    _parse_score,
     _parse_verdict,
     _read_transcript,
-    _read_turn_results,
-    _under_test_failure,
+    read_turn_results,
+    under_test_failure,
     _upsert_rule_section,
     session_file_path,
 )
@@ -224,12 +225,15 @@ def test_结果字段齐全(tmp_path) -> None:
 
     assert set(result) == {
         "case_id", "case_type", "case_dir", "version", "content_summary", "session_id",
-        "passed", "reason", "multi_turn", "started_at", "ended_at", "error", "agents", "models",
+        "passed", "score", "reason", "multi_turn", "started_at", "ended_at", "error",
+        "agents", "models",
     }
     assert result["case_id"] == "T-1"
     assert result["version"] == "记录任务-99"
     assert result["content_summary"] == "T-1·支出记录"
     assert result["started_at"] and result["started_at"] <= result["ended_at"]
+    # PASS_REPLY 里没有 score：判定有效，只是这次没拿到分
+    assert result["score"] is None
 
 
 # ---------------- g：session 复制改名 ----------------
@@ -415,6 +419,25 @@ def test_裁判_判不通过(tmp_path) -> None:
     assert "30 分钟" in result["reason"]
 
 
+def test_裁判_得分写进结果与judge_json(tmp_path) -> None:
+    """rubric 自带评分要求时：分数由裁判按它折算，可以与 pass 各判各的。"""
+    ctx, result = run_case(
+        tmp_path, judge=FakeAgent(reply='{"pass": true, "score": 60, "reason": "60 分及格"}')
+    )
+
+    assert result["score"] == 60 and result["passed"] is True
+    saved = json.loads((ctx.case_dir / "judge.json").read_text(encoding="utf-8"))
+    assert saved["score"] == 60
+
+
+def test_裁判_没给分时结果留空但判定仍然有效(tmp_path) -> None:
+    """score 缺失不该把判定一起拖下水：pass 有值就算判定成立。"""
+    _, result = run_case(tmp_path, judge=FakeAgent(reply='{"pass": false, "reason": "少记一条"}'))
+
+    assert result["passed"] is False
+    assert result["score"] is None
+
+
 def test_裁判_无法解析时pass为None并保留原文(tmp_path) -> None:
     ctx, result = run_case(tmp_path, judge=FakeAgent(reply="我觉得不太行"))
 
@@ -449,6 +472,7 @@ def test_裁判_mode_none时未判定且不落盘(tmp_path) -> None:
     _, result = run_case(tmp_path, CASES_JUDGE_NONE)
 
     assert result["passed"] is None
+    assert result["score"] is None          # 没判就没分，不留 0（0 是「判了且不达标」）
     assert "judge.mode=none" in result["reason"]
     assert not (Path(result["case_dir"]) / "judge.json").exists()
 
@@ -469,6 +493,43 @@ def test_parse_verdict_容错(raw, expected_pass, has_error) -> None:
     verdict = _parse_verdict(raw)
     assert verdict["pass"] is expected_pass
     assert bool(verdict["parse_error"]) is has_error
+
+
+def test_parse_verdict_取到得分() -> None:
+    verdict = _parse_verdict('```json\n{"pass": true, "score": 80, "reason": "大体符合"}\n```')
+
+    assert verdict["pass"] is True and verdict["score"] == 80 and verdict["parse_error"] == ""
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (85, 85),
+        (0, 0),
+        (100, 100),
+        (85.6, 86),          # 浮点四舍五入
+        ("85", 85),          # 字符串数字
+        (" 85 ", 85),
+        (120, 100),          # 越界夹回 [0, 100]
+        (-10, 0),
+        (None, None),
+        ("满分", None),       # 不是数字
+        (True, None),        # bool 是 int 的子类，必须挡掉（否则 true 会变成 1 分）
+        (float("nan"), None),  # json.loads 默认接受 NaN 字面量
+        (float("inf"), None),
+    ],
+)
+def test_parse_score_容错(value, expected) -> None:
+    assert _parse_score(value) == expected
+
+
+def test_parse_verdict_得分非法不写parse_error() -> None:
+    """得分取不到只让它自己为 None：parse_error 的语义是「整条判定不成立」。"""
+    verdict = _parse_verdict('{"pass": true, "score": "满分", "reason": "ok"}')
+
+    assert verdict["pass"] is True
+    assert verdict["score"] is None
+    assert verdict["parse_error"] == ""
 
 
 def test_read_transcript_只取三类消息并跳过异常行(tmp_path) -> None:
@@ -549,7 +610,7 @@ def test_read_turn_results_读出每轮终态(tmp_path) -> None:
         ],
     )
 
-    results = _read_turn_results(path)
+    results = read_turn_results(path)
 
     assert [r["turn"] for r in results] == [1, 2]
     assert results[0]["reason_type"] == "success"
@@ -572,12 +633,12 @@ def test_read_turn_results_缺失字段与坏行都容错(tmp_path) -> None:
         encoding="utf-8",
     )
 
-    results = _read_turn_results(path)
+    results = read_turn_results(path)
 
     assert len(results) == 1
     assert results[0]["reason_text"] == ""
     assert results[0]["error_type"] == ""
-    assert _read_turn_results(tmp_path / "nope.jsonl") == []
+    assert read_turn_results(tmp_path / "nope.jsonl") == []
 
 
 @pytest.mark.parametrize(
@@ -603,18 +664,18 @@ def test_read_turn_results_缺失字段与坏行都容错(tmp_path) -> None:
     ],
 )
 def test_under_test_failure_取第一条非success(turns, expected_turn) -> None:
-    assert (_under_test_failure(turns) or {}).get("turn") == expected_turn
+    assert (under_test_failure(turns) or {}).get("turn") == expected_turn
 
 
 def test_failure_note_含类别与异常链并可截断() -> None:
     chain = "AgentUnclaimedError: 无错误处理策略的错误\n  MaxStepsExceededError: 达到最大步数20"
-    note = _failure_note(
+    note = failure_note(
         {"turn": 2, "reason_type": "error", "error_type": "AgentUnclaimedError", "reason_text": chain}
     )
     assert note.startswith("运行未正常结束（turn 2 · error）")
     assert "AgentUnclaimedError" in note and "MaxStepsExceededError" in note
 
-    bare = _failure_note(
+    bare = failure_note(
         {"turn": 1, "reason_type": "interrupted", "error_type": "", "reason_text": ""}
     )
     assert bare == "运行未正常结束（turn 1 · interrupted）"
@@ -633,6 +694,7 @@ def test_运行异常时不判定_证据与统计仍落盘(short_tmp) -> None:
     ctx, result = run_case(short_tmp, agent=agent, judge=judge)
 
     assert result["passed"] is None
+    assert result["score"] is None                           # 没判就没分
     assert "运行未正常结束" in result["error"]
     assert "peer closed connection" in result["reason"]
     assert judge.sent == []                                  # 未判
@@ -683,7 +745,7 @@ def test_collect_agent_info_能从session里取到模型名(tmp_path) -> None:
         ],
     )
 
-    agents, models = _collect_agent_info(case, case_dir)
+    agents, models = collect_agent_info(case, case_dir)
 
     assert agents["judge"] is True
     assert models["under_test"] == "doubao-seed-1-6"

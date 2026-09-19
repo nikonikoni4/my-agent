@@ -15,7 +15,8 @@
 | `worker.py` | **执行通道**：一条任务 = 一条子进程（跨进程协议） |
 | `case.py` | **领域层**：单条用例的执行实体（a~j）与子进程入口 `execute_case` |
 | `evidence.py` | 取证：与环境基线对比捞「本次写入」（表 / 文件 / 文件与表的全量扫描），并负责打基线快照 |
-| `runner.py` | **调度装配**：读 `meta.env` → 组任务 → 交给 `EvalCore` → 收结果写 summary |
+| `runner.py` | **调度装配**：读 `meta.env` → 组任务 → 交给 `EvalCore` → 收结果 → 让 summary 重建报表 |
+| `summary.py` | **报表**：从产物现算 `summary.csv`（列声明表 + 复用 case.py 的派生函数），可单独跑 |
 
 ---
 
@@ -61,7 +62,9 @@ EvalRunner.run(cases_path):
        开 max_workers 个槽位（一份环境 + 一条子进程）
        逐条任务：取槽位 → 复用前 reset_env（删掉按同一份配置重拼）→ 子进程跑一条用例 → 放回槽位
        失败且 keep_env_on_failure：该槽位退役、现场留在 envs/<key>/，并补一条新槽位
-  5. 产出按入参同序映射成 CaseResult → 写 runs/<run_id>/summary.csv，并追加 runs/summary.csv
+  5. 产出按入参同序映射成 CaseResult → 让 summary 从**刚落盘的产物**重建
+     runs/<run_id>/summary.csv，并追加 runs/summary.csv
+     （不是拿手里那份内存结果拼表——走同一条路，才保证「删掉 summary 还能重建」一直成立）
 
 一条用例（case.py:execute_case，整体跑在子进程里）：
   0. config.use_data_path(env.root)：切数据根，必须早于创建任何 agent
@@ -73,6 +76,8 @@ EvalRunner.run(cases_path):
   h. 导出 evidence.json：与 baseline/ 对比
   i. 跑 judge（judge.mode=model）→ judge.json；none 则跳过
   j. 跑 stats → stats.json
+  收尾. 落 result.json：**只装别处推不出来的三样**（会话起止时间 / 异常原文），
+       其余列一律由读方现算 —— 回执里重复存一份，就多出第二个事实来源
 ```
 
 > **a 步的打点位置很关键**：必须在 precondition **之前**。precondition 写进 `custom_prompt.md` 的规则本身也是证据（有用例要判「规则文件终态」），打在它之后就把这一步藏起来了。
@@ -106,7 +111,9 @@ EvalRunner.run(cases_path):
 
 ## 五、测试与试跑
 
-- 测试在 `tests/`（`test_env_provider.py` / `test_worker.py` / `test_evidence.py` / `test_case.py` / `test_runner.py`）：用例级测试用假 agent 同进程跑；run 级测试用假 entrypoint（`tests/fake_case.py`）走真子进程，**不需要 LLM**。
+- 测试在 `tests/`（`test_env_provider.py` / `test_worker.py` / `test_evidence.py` / `test_case.py` / `test_summary.py` / `test_runner.py`）：用例级测试用假 agent 同进程跑；run 级测试用假 entrypoint（`tests/fake_case.py`）走真子进程，**不需要 LLM**。
+  `test_runner` 里有一条**对拍**：跑一次真链路，把 runner 手里的 `CaseResult` 与从产物重建出来的行逐格比对——两份实现（跑的时候判一次、报表里再算一次）任一处漂了就会红。
+  假 entrypoint 必须把产物**按真契约落齐**（形状一律用真函数），否则 run 级测试会在「报表某列为什么是空的」上给出假结论。
   `python -m pytest src/lifeprismevalue/evalue/tests -q`
 - 试跑真用例（会真调 LLM、真复制底座）：
 

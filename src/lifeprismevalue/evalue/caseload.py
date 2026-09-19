@@ -70,6 +70,43 @@ def load_case_set(path: str | Path) -> CaseSet:
     return CaseSet(meta=meta, cases=cases, notes=[str(n) for n in raw_notes], path=str(p))
 
 
+def case_from_snapshot(raw: Any) -> Case:
+    """把 `case.yaml` 快照读回成 `Case`（重建报表时用）。
+
+    快照是 `case.snapshot_case` 用 `asdict(Case)` 写出来的，字段名与 `Case` 一致，所以这里
+    能直接复用加载用例时的那批子构造器（turns / precondition / simulator / judge）——不另写
+    一套读法，否则同一份字段会出现两种解释。
+
+    为什么读方需要 `Case` 对象：`content_summary`、`collect_agent_info` 这些函数收的是
+    `Case`，而用例快照在磁盘上只是裸 dict。让读方绕这一步，是为了能直接调写方用的那些
+    函数，而不是把它们在 summary 里再实现一遍。
+
+    校验照旧走子构造器：快照是机器写的，本该合法；不合法说明快照被改过，那时**报错好过
+    静默还原成半个用例**。
+    """
+    where = "用例快照"
+    if not isinstance(raw, dict):
+        raise CaseLoadError(f"{where} 不是 mapping")
+    case_id = raw.get("id")
+    ctype = raw.get("type")
+    if not case_id or not ctype:
+        raise CaseLoadError(f"{where} 缺 id 或 type")
+
+    return Case(
+        id=str(case_id),
+        type=str(ctype),
+        turns=_build_turns(raw.get("turns"), where),
+        evidence=[str(e) for e in (raw.get("evidence") or [])],
+        rubric=str(raw.get("rubric") or ""),
+        precondition=_build_precondition(raw.get("precondition"), where),
+        # 快照里的 multi_turn 已经解析过了（写的时候就把 meta 的默认合并进来了）
+        multi_turn=bool(raw.get("multi_turn")),
+        input_mode=str(raw.get("input_mode") or INPUT_MODE_SCRIPTED),
+        simulator=_build_simulator(raw.get("simulator"), where),
+        judge=_build_judge(raw.get("judge"), where),
+    )
+
+
 # ---------------- 内部构造（逐层校验） ----------------
 
 

@@ -25,6 +25,19 @@ JUDGE_MODE_MODEL = "model"        # 裁判 agent
 JUDGE_MODE_NONE = "none"          # 不判，仅留证据
 JUDGE_MODES = (JUDGE_MODE_MODEL, JUDGE_MODE_NONE)
 
+# run 目录 / 用例目录下的产物文件名。**读写两侧都从这里取**，不许各写一份字面量：
+#   写（run 级）runner.py      —— run.json
+#   写（用例级）case.py        —— case.yaml / result.json / evidence.json / judge.json / stats.json
+#   读（重建 summary）summary.py
+# 写方与读方各写一份字面量迟早会漂移，而漂移的表现是「某一列静默全空」——没人会注意到。
+# 放在这里是因为本模块最轻（只有 dataclass 与字符串常量），三方都已经 import 它。
+RUN_FILENAME = "run.json"
+CASE_FILENAME = "case.yaml"
+RESULT_FILENAME = "result.json"
+EVIDENCE_FILENAME = "evidence.json"
+JUDGE_FILENAME = "judge.json"
+STATS_FILENAME = "stats.json"
+
 
 @dataclass
 class Turn:

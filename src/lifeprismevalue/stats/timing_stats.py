@@ -5,6 +5,14 @@
 - LLM 耗时 ≈ assistant/message - step/start（流式结束落点），首 token 延迟 = 首个流式片段 - step/start。
 - 工具耗时 = tool/result.duration_ms，累加。
 把每步拆成 LLM 时间与工具时间，回答"慢在模型还是慢在工具"。
+
+**本组件是「每步耗时的参考」，不是「整体运行时长」。** 两者永远不相等：
+`total_step_ms` 是各 step 耗时的**算术和**，不含 step 之外的时间——建 agent、发送消息、
+收尾、以及 step 之间的空隙都在它之外，所以它**必然小于**墙上时钟量出的运行时长。
+实测一条用例：这里 16.2s，而系统记的运行时长 18.0s。差值是正常的，不是采集丢了数据。
+
+整体运行时长以用例在跑之前 / 跑完之后打的两个点为准（`case.py` 的 d / f 步，
+也是 `summary.csv` 里「耗时(s)」列的口径）。术语定义见 `src/lifeprismevalue/CONTEXT.md`。
 """
 
 from __future__ import annotations
@@ -90,6 +98,9 @@ class TimingStats(StatsComponent):
         no_duration = "N/A（session 未记录 duration_ms）"
         lines = [
             "===== TimingStats（耗时结构）=====",
+            # 读的人容易把下面的「总 step 耗时」当成整体运行时长，这里显式说明它不含什么。
+            # 两者必然不等，差值来自建 agent / 发送 / 收尾等不进 session 的开销。
+            "（各 step 耗时之和，不含建 agent / 发送 / 收尾等开销；不等同于整体运行时长）",
             f"总 step 耗时    : {sec(result['total_step_ms'])}",
             f"其中 LLM 耗时   : {sec(result['total_llm_ms'])}",
             f"其中工具耗时    : {sec(result['total_tool_ms'], no_duration)}",

@@ -22,6 +22,7 @@ entrypoint。它做的第一件事是把数据根切到 `env.root`——工具�
 | h | 导出 `evidence.json`（与环境基线对比） | `evidence.collect_evidence` |
 | i | 裁判 → `judge.json` | `_run_judge` |
 | j | 统计 → `stats.json` | `_run_stats` |
+| 收尾 | 回执 → `result.json`（**只装别处推不出来的三样**，见 `_write_result`） | `_write_result` |
 
 「重置可变状态」不在本模块：环境每用例独占，槽位复用前由 core 的 `reset_env` 整份回滚。
 
@@ -42,6 +43,7 @@ import asyncio
 import datetime
 import json
 import logging
+import math
 import re
 import shutil
 from dataclasses import asdict, dataclass, field
@@ -55,7 +57,14 @@ from myagent.utils.helper import project_path_to_session_folder
 from lifeprismevalue import config
 from lifeprismevalue.evalue.caseload import load_case_set
 from lifeprismevalue.evalue.evidence import collect_evidence, snapshot_baseline
-from lifeprismevalue.evalue.types import Case
+from lifeprismevalue.evalue.types import (
+    CASE_FILENAME,
+    EVIDENCE_FILENAME,
+    JUDGE_FILENAME,
+    RESULT_FILENAME,
+    STATS_FILENAME,
+    Case,
+)
 from lifeprismevalue.stats import analyze_session
 
 logger = logging.getLogger(__name__)
@@ -184,21 +193,38 @@ class CaseExecutor:
         证据——异常记进 `CaseResult.error`，产物目录里跑到哪算哪（与「运行未正常结束」
         同一套收口思路）。异常逃到这一层时也把环境留下（`_keep_env`）：这正是最该看
         现场的一类（agent 工厂挂了、超时、走到未实现的路径）。
+
+        出口只有这一个，`result.json` 也在这里落——**每条用例目录必有一份**（真跑起来的
+        用例由本函数写，子进程压根没起来的由 runner 补），重建 summary 时才不用去猜
+        「这条是没跑，还是没落盘」。
         """
         try:
-            return asyncio.run(self._run_async(ctx))
+            result = asyncio.run(self._run_async(ctx))
         except Exception as e:  # noqa: BLE001 - 有意兜底：单条用例失败不影响其它用例
             logger.exception("用例 %s 执行失败", ctx.case.id)
             self._keep_env(ctx)
-            return self._result(
+            # agent 信息照常算（走与正常路径同一个 collect_agent_info）：重建报表时读方也
+            # 调它，两边同一个函数才会给出一致的行——随手填 {} 会让「用了没」两处说法不一。
+            agents, models = collect_agent_info(ctx.case, ctx.case_dir)
+            # 崩在任何一步都可能，收尾时刻就地补上——回执要自包含，否则 runner 会拿
+            # 「整个子进程的结束时刻」去回填，于是 API 报一个值、产物里没有值，两边对不上
+            # （重建报表只看产物）。
+            ctx.ended_at = ctx.ended_at or _now()
+            # error 与 reason 同值：与「运行未正常结束」那条路一个口径——「测试结果摘要」
+            # 要能直接看出失败原因。留空的话，重建报表会从回执里拿 error（那才是对的），
+            # 于是同一件事在本文件里报空、在报表里报原文，两边对不上。
+            note = f"{type(e).__name__}: {e}"
+            result = self._result(
                 ctx,
                 session_id=_session_id_of(ctx.sessions.get(UNDER_TEST)),
                 passed=None,
-                reason="",
-                error=f"{type(e).__name__}: {e}",
-                agents={},
-                models={},
+                reason=note,
+                error=note,
+                agents=agents,
+                models=models,
             )
+        self._write_result(ctx, result)
+        return result
 
     # ---------- 主流程 ----------
 
@@ -216,8 +242,8 @@ class CaseExecutor:
         ctx.ended_at = _now()                            # f
 
         self._dump_sessions(ctx)                         # g
-        failure = _under_test_failure(                   # 运行终态
-            _read_turn_results(ctx.case_dir / f"session_{UNDER_TEST}.jsonl")
+        failure = under_test_failure(                    # 运行终态
+            read_turn_results(dumped_session_path(ctx.case_dir, UNDER_TEST))
         )
         evidence = self._export_evidence(ctx)            # h
         verdict = (
@@ -227,27 +253,22 @@ class CaseExecutor:
         # 再落一次 session：judge 的会话在 i 之后才产生（复制循环幂等）
         self._dump_sessions(ctx)
 
-        agents, models = _collect_agent_info(case, ctx.case_dir)
-        if failure is not None:
-            note = _failure_note(failure)
-            self._keep_env(ctx)                          # 现场：跑完后的环境整份留下
-            return self._result(
-                ctx, session_id=session_id, passed=None, reason=note, error=note,
-                agents=agents, models=models,
-            )
+        agents, models = collect_agent_info(case, ctx.case_dir)
+        passed, score, reason = conclusion(case, verdict, failure)
 
-        if verdict is None:
-            passed: bool | None = None
-            reason = f"judge.mode={case.judge.mode}，未判定"
-        else:
-            passed = verdict["pass"]
-            reason = verdict["reason"] or verdict["parse_error"]
+        if failure is not None:
+            self._keep_env(ctx)                          # 现场：跑完后的环境整份留下
+            # error 与 reason 同一句：summary 的「测试结果摘要」要能直接看出失败原因
+            return self._result(
+                ctx, session_id=session_id, passed=passed, score=score, reason=reason,
+                error=reason, agents=agents, models=models,
+            )
 
         if passed is False:
             self._keep_env(ctx)                          # 判不通过也留（结论站的依据就是环境）
 
         return self._result(
-            ctx, session_id=session_id, passed=passed, reason=reason, error="",
+            ctx, session_id=session_id, passed=passed, score=score, reason=reason, error="",
             agents=agents, models=models,
         )
 
@@ -285,6 +306,7 @@ class CaseExecutor:
         error: str,
         agents: dict[str, bool],
         models: dict[str, str],
+        score: int | None = None,
     ) -> dict[str, Any]:
         """组装一条结果（run 级的 `versions` 由 runner 补，子进程不管）。"""
         return {
@@ -295,6 +317,7 @@ class CaseExecutor:
             "content_summary": content_summary(ctx.case),
             "session_id": session_id,
             "passed": passed,
+            "score": score,
             "reason": reason,
             "multi_turn": ctx.case.multi_turn,
             "started_at": ctx.started_at,
@@ -303,6 +326,40 @@ class CaseExecutor:
             "agents": agents,
             "models": models,
         }
+
+    def _write_result(self, ctx: CaseContext, result: dict[str, Any]) -> None:
+        """把**只有内存里才有**的那几个字段落一份到 `case_dir/result.json`。
+
+        为什么只有三个字段：这份回执原来是子进程回传给父进程的载荷，跑完就没了（成功时连
+        通信文件都会被清掉）。而 `_result` 的其余字段——结论、session_id、模型名、类型——
+        在同目录的产物里**都推得出来**（`case.yaml` / `judge.json` / `session_*.jsonl`）。
+        把它们再抄一份进来，等于制造第二个事实来源：两处一旦不一致，读的人无从判断谁对。
+
+        所以这里**只装推不出来的**：
+
+        | 字段 | 为什么别处没有 |
+        | --- | --- |
+        | `started_at` / `ended_at` | d / f 步在内存里打的点，从没进过 session（session 自己的 `created_at` 是另一回事，实测差 0.87s） |
+        | `error` | 用例级异常（agent 工厂抛错、超时）的原文只在内存与子进程日志里 |
+
+        其余字段一律由读方（`summary`）从产物现算，且调用本模块里已有的那些函数——
+        保证同一件事只有一份实现。
+
+        尽力而为：写不进去只告警，不往上抛——结论不能因为落盘失败而一起丢掉。
+        """
+        payload = {
+            "started_at": result.get("started_at", ""),
+            "ended_at": result.get("ended_at", ""),
+            "error": result.get("error", ""),
+        }
+        target = ctx.case_dir / RESULT_FILENAME
+        try:
+            ctx.case_dir.mkdir(parents=True, exist_ok=True)
+            target.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        except OSError as e:
+            logger.warning("落 result.json 失败：%s（%s: %s）", target, type(e).__name__, e)
 
     # ---------- a / b / c ----------
 
@@ -326,11 +383,7 @@ class CaseExecutor:
 
     def _snapshot_case(self, ctx: CaseContext) -> None:
         """c. 把该用例的定义快照到 `case_dir/case.yaml`（保证 run 自包含）。"""
-        ctx.case_dir.mkdir(parents=True, exist_ok=True)
-        (ctx.case_dir / "case.yaml").write_text(
-            yaml.safe_dump(asdict(ctx.case), allow_unicode=True, sort_keys=False),
-            encoding="utf-8",
-        )
+        snapshot_case(ctx.case, ctx.case_dir)
 
     # ---------- e / f：跑被测评 agent ----------
 
@@ -416,7 +469,7 @@ class CaseExecutor:
             if not src.exists():
                 logger.warning("会话文件不存在，跳过落盘: %s", src)
                 continue
-            shutil.copy2(src, ctx.case_dir / f"session_{key}.jsonl")
+            shutil.copy2(src, dumped_session_path(ctx.case_dir, key))
 
     # ---------- h：证据 ----------
 
@@ -430,7 +483,7 @@ class CaseExecutor:
             scan_other_changed_files=ctx.scan_other_changed_files,
         )
         ctx.case_dir.mkdir(parents=True, exist_ok=True)
-        (ctx.case_dir / "evidence.json").write_text(
+        (ctx.case_dir / EVIDENCE_FILENAME).write_text(
             json.dumps(evidence, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         return evidence
@@ -442,13 +495,14 @@ class CaseExecutor:
 
         输入 = 裁判提示词（agent 内建）+ `case.rubric` + `evidence` + under_test 对话记录
         （从 g 复制出的 `session_under_test.jsonl` 抽取 user/assistant/tool_result）。
-        输出 `{"pass": bool, "reason": str, ...}`；解析不了则 `pass=None` 并保留原文。
+        输出 `{"pass": bool, "score": int, "reason": str, ...}`；解析不了则 `pass=None`
+        并保留原文（`score` 单独解析，取不到只让它自己为 None，不牵连判定，见 `_parse_verdict`）。
         """
         if not ctx.case.uses_judge:
             return None
 
         case = ctx.case
-        transcript = _read_transcript(ctx.case_dir / f"session_{UNDER_TEST}.jsonl")
+        transcript = _read_transcript(dumped_session_path(ctx.case_dir, UNDER_TEST))
         prompt_text = _build_judge_input(case, evidence, transcript)
 
         agent = self._judge_factory(
@@ -472,7 +526,7 @@ class CaseExecutor:
             "raw": raw,
         }
         ctx.case_dir.mkdir(parents=True, exist_ok=True)
-        (ctx.case_dir / "judge.json").write_text(
+        (ctx.case_dir / JUDGE_FILENAME).write_text(
             json.dumps(verdict, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         return verdict
@@ -486,7 +540,7 @@ class CaseExecutor:
         统计是辅助信息、不参与判定，故 session 缺失时只记进 `errors`，不抛出。
         """
         case_id = ctx.case.id
-        session_path = ctx.case_dir / f"session_{UNDER_TEST}.jsonl"
+        session_path = dumped_session_path(ctx.case_dir, UNDER_TEST)
         if not session_path.is_file():
             logger.warning("用例 %s 的 session 文件不存在，跳过统计: %s", case_id, session_path)
             merged: dict = _stats_error(session_path, f"session 文件不存在: {session_path.name}")
@@ -498,7 +552,7 @@ class CaseExecutor:
                 merged = _stats_error(session_path, f"{type(e).__name__}: {e}")
 
         ctx.case_dir.mkdir(parents=True, exist_ok=True)
-        (ctx.case_dir / "stats.json").write_text(
+        (ctx.case_dir / STATS_FILENAME).write_text(
             json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         return merged
@@ -572,6 +626,29 @@ def session_file_path(env_root: Path, session_folder: Path, session_id: str) -> 
     return project_path_to_session_folder(env_root, session_folder) / f"{session_id}.jsonl"
 
 
+def dumped_session_path(case_dir: Path, role: str) -> Path:
+    """用例目录里某个角色 agent 的 session 副本路径（`session_<角色>.jsonl`）。
+
+    写方是 `_dump_sessions`，读方（summary）也从这里取——文件名只有一处定义，免得两处
+    各写一份字符串，改一处漏一处时表现是「某一列静默空掉」。
+    """
+    return case_dir / f"session_{role}.jsonl"
+
+
+def snapshot_case(case: Case, case_dir: Path) -> Path:
+    """把用例定义快照写成 `case_dir/case.yaml`（保证 run 自包含）。
+
+    写方有两处：跑起来的用例由 c 步写；子进程压根没起来时由 runner 补（它手里有同一个
+    `Case` 对象）。两处共用这一个函数——同一份快照出现两个写法，迟早会分叉。
+    """
+    case_dir.mkdir(parents=True, exist_ok=True)
+    path = case_dir / CASE_FILENAME
+    path.write_text(
+        yaml.safe_dump(asdict(case), allow_unicode=True, sort_keys=False), encoding="utf-8"
+    )
+    return path
+
+
 def content_summary(case: Case) -> str:
     """测试内容摘要：用例编号 + 类型（多轮再标注）。"""
     suffix = "（多轮）" if case.multi_turn else ""
@@ -610,7 +687,7 @@ def _message_text(message: Any) -> str:
     return ""
 
 
-def _read_turn_results(session_path: Path) -> list[dict]:
+def read_turn_results(session_path: Path) -> list[dict]:
     """从 session jsonl 读出每一轮的终态（`turn/end`）。
 
     这是「本轮跑成什么样」的唯一权威来源：`TURN_END` 事件的 payload 不带信息，而
@@ -646,7 +723,7 @@ def _read_turn_results(session_path: Path) -> list[dict]:
     return results
 
 
-def _under_test_failure(turn_results: list[dict]) -> dict | None:
+def under_test_failure(turn_results: list[dict]) -> dict | None:
     """取第一条非 success 的 turn 终态（error / interrupted）；都正常则返回 None。
 
     只报告、不重试：运行本身没跑完的用例，其结论不成立，不能当成「agent 记错了」计分。
@@ -657,7 +734,7 @@ def _under_test_failure(turn_results: list[dict]) -> dict | None:
     return None
 
 
-def _failure_note(turn: dict) -> str:
+def failure_note(turn: dict) -> str:
     """把 turn 的异常终态整理成一句可读摘要（写进 summary 的「测试结果摘要」）。
 
     `error_type` 是异常类别（最外层异常类名），`reason_text` 是异常链文本
@@ -666,6 +743,37 @@ def _failure_note(turn: dict) -> str:
     head = f"运行未正常结束（turn {turn['turn']} · {turn['reason_type']}）"
     detail = "｜".join(part for part in (turn["error_type"], turn["reason_text"]) if part)
     return f"{head}：{_truncate(detail, FAILURE_NOTE_MAX_CHARS)}" if detail else head
+
+
+def conclusion(
+    case: Case | None, verdict: dict | None, failure: dict | None
+) -> tuple[bool | None, int | None, str]:
+    """一条用例的最终结论：`(是否通过, 得分, 理由)`。
+
+    **跑的时候与重建报表的时候共用这一个函数**（写方在 `_run_async`，读方在 summary）。
+    两边各判一次必然漂，而漂的表现是「报表的结论和运行时的结论对不上」，属于最难查的一类
+    错——所以宁可让读方多绕一步 import，也不许第二份实现。
+
+    - 运行未正常结束（`failure` 非空）：**不判**，理由用 `failure_note`——运行本身没跑完
+      的用例，其结论不成立，不能当成「agent 记错了」计分；
+    - 没跑裁判（`judge.mode=none`）：不判，理由写明是配置如此；
+    - 判了：取裁判的 `pass` / `score` / 理由（理由缺失时退回解析错误）。
+
+    `case` 为 None（用例快照都没落下来）时无从判断配置，一律按"不判"处理。
+
+    读 `verdict` 一律用 `.get`：跑的时候它是内存里的 dict（键必在），重建的时候它是从
+    `judge.json` 读回来的（键可能因版本或手改而缺），两种输入都要接得住。
+    """
+    if failure is not None:
+        return None, None, failure_note(failure)
+    if verdict is None:
+        mode = case.judge.mode if case is not None else ""
+        return None, None, f"judge.mode={mode}，未判定"
+    return (
+        verdict.get("pass"),
+        verdict.get("score"),
+        verdict.get("reason") or verdict.get("parse_error") or "",
+    )
 
 
 def _read_transcript(session_path: Path) -> str:
@@ -709,10 +817,14 @@ def _build_judge_input(case: Case, evidence: dict, transcript: str) -> str:
 
 
 def _parse_verdict(raw: str) -> dict:
-    """从裁判输出里抽出 `{"pass": bool, "reason": str}`。
+    """从裁判输出里抽出 `{"pass": bool, "score": int, "reason": str}`。
 
     容错点（LLM 输出是外部边界）：剥掉 ``` 围栏、只取最外层 JSON、`pass` 允许是
-    "true"/"通过" 这类字符串。确实解析不出时 `pass=None`，把原文留给人工看。
+    "true"/"通过" 这类字符串、`score` 允许是字符串数字或浮点。确实解析不出 `pass` 时
+    `pass=None`，把原文留给人工看。
+
+    `score` 与 `pass` **互不拖累**：`score` 缺失或非法只让它自己为 None，不写 `parse_error`
+    ——那条错误的语义是「整条判定不成立」，而 `pass` 有效时判定是成立的，只是这次没拿到分。
     """
     text = raw.strip()
     fenced = re.search(r"```(?:json)?\s*(.*?)```", text, re.S)
@@ -721,22 +833,45 @@ def _parse_verdict(raw: str) -> dict:
 
     start, end = text.find("{"), text.rfind("}")
     if start == -1 or end <= start:
-        return {"pass": None, "reason": "", "parse_error": "裁判输出中未找到 JSON"}
+        return {
+            "pass": None, "score": None, "reason": "",
+            "parse_error": "裁判输出中未找到 JSON",
+        }
     try:
         data = json.loads(text[start : end + 1])
     except json.JSONDecodeError as e:
-        return {"pass": None, "reason": "", "parse_error": f"JSON 解析失败: {e}"}
+        return {"pass": None, "score": None, "reason": "", "parse_error": f"JSON 解析失败: {e}"}
 
+    reason = str(data.get("reason", ""))
+    score = _parse_score(data.get("score"))
     passed = data.get("pass")
     if isinstance(passed, str):
         passed = passed.strip().lower() in {"true", "yes", "y", "通过", "达标"}
     if not isinstance(passed, bool):
-        return {
-            "pass": None,
-            "reason": str(data.get("reason", "")),
-            "parse_error": "缺少布尔字段 pass",
-        }
-    return {"pass": passed, "reason": str(data.get("reason", "")), "parse_error": ""}
+        return {"pass": None, "score": score, "reason": reason, "parse_error": "缺少布尔字段 pass"}
+    return {"pass": passed, "score": score, "reason": reason, "parse_error": ""}
+
+
+def _parse_score(value: Any) -> int | None:
+    """把裁判给的 `score` 收成 0~100 的整数；缺失或不是数字则返回 None。
+
+    容错：字符串数字（`"85"`）与浮点（`85.6`）都收；越界夹到 `[0, 100]`——裁判偶尔会写
+    原始分（判分要点说「满分 5 分」却给了 4）或负分，夹住比整条丢掉有用。
+
+    两个必须显式挡掉的：`bool`（Python 里 `True` 是 `int` 的实例，不挡就会把 `true` 读成
+    1 分）与非有限数（`json.loads` 默认接受 `NaN` / `Infinity` 字面量，`round(nan)` 会抛
+    ValueError，而这是外部边界，不该让它冒到用例层）。
+    """
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            value = float(value.strip())
+        except ValueError:
+            return None
+    if not isinstance(value, (int, float)) or not math.isfinite(value):
+        return None
+    return max(0, min(100, round(value)))
 
 
 def _upsert_rule_section(text: str, rules: list[str]) -> str:
@@ -755,7 +890,7 @@ def _upsert_rule_section(text: str, rules: list[str]) -> str:
     return "\n".join(lines[:start] + [RULE_SECTION_TITLE, body] + lines[end:]) + "\n"
 
 
-def _collect_agent_info(case: Case, case_dir: Path) -> tuple[dict[str, bool], dict[str, str]]:
+def collect_agent_info(case: Case, case_dir: Path) -> tuple[dict[str, bool], dict[str, str]]:
     """标出本次用了哪些 agent，并取各自 session 里的模型名。
 
     三个角色相互独立：under_test 恒存在；simulator 仅 `input_mode=agent`；judge 仅
@@ -775,14 +910,14 @@ def _collect_agent_info(case: Case, case_dir: Path) -> tuple[dict[str, bool], di
         if not is_used:
             models[role] = MODEL_NOT_USED
             continue
-        models[role] = _read_model_name(case_dir / f"session_{role}.jsonl") or MODEL_UNKNOWN
+        models[role] = read_model_name(dumped_session_path(case_dir, role)) or MODEL_UNKNOWN
     return used, models
 
 
-def _read_model_name(session_path: Path) -> str:
+def read_model_name(session_path: Path) -> str:
     """从 session jsonl 的第一条 `request/header` 里取 model_name；取不到返回空串。
 
-    直接按 jsonl 字段解析（不依赖 session 的类型定义），与 `_read_turn_results` 同路数。
+    直接按 jsonl 字段解析（不依赖 session 的类型定义），与 `read_turn_results` 同路数。
     """
     if not session_path.is_file():
         return ""
@@ -798,6 +933,28 @@ def _read_model_name(session_path: Path) -> str:
             continue
         data = record.get("data") or {}
         return str(data.get("model_name") or "")
+    return ""
+
+
+def read_session_id(session_path: Path) -> str:
+    """从 session jsonl 的第一条 `meta_data` 里取 session_id；取不到返回空串。
+
+    跑的时候 session_id 是从 agent 对象上取的（`_session_id_of`），重建报表时 agent 早
+    没了，只能从落盘的 session 文件里读回来——与 `read_model_name` 同路数，逐行容错。
+    """
+    if not session_path.is_file():
+        return ""
+    for raw_line in session_path.read_text(encoding="utf-8").splitlines():
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
+        try:
+            record = json.loads(raw_line)
+        except json.JSONDecodeError:
+            continue
+        if record.get("type") != "meta_data":
+            continue
+        return str(record.get("session_id") or "")
     return ""
 
 

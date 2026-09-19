@@ -14,13 +14,14 @@ from pathlib import Path
 import pytest
 from evaluate.core import WorkerTask
 
+from lifeprismevalue.evalue import summary
 from lifeprismevalue.evalue.caseload import CaseLoadError, load_case_set
 from lifeprismevalue.evalue.runner import (
     DEFAULT_CASE_ENTRYPOINT,
-    SUMMARY_COLUMNS,
     CaseResult,
     EvalRunner,
 )
+from lifeprismevalue.evalue.summary import SUMMARY_COLUMNS, SUMMARY_FILENAME
 from helpers import CASES_AGENT_MODE, fake_cases, make_base, write_cases
 
 FAKE_ENTRYPOINT = "lifeprismevalue.evalue.tests.fake_case:execute"
@@ -63,17 +64,25 @@ def test_run_产出与用例同序并写summary(tmp_path) -> None:
     assert Path(results[0].case_dir).parent.name == META_ID
     assert all(Path(r.case_dir).is_dir() for r in results)
 
-    rows = list(csv.DictReader((run_dir / "summary.csv").open(encoding="utf-8")))
+    # 每条用例目录里必有一份回执（重建 summary 靠它认人；不落它用例会从报表里消失）
+    assert all((Path(r.case_dir) / "result.json").is_file() for r in results)
+
+    rows = list(csv.DictReader((run_dir / SUMMARY_FILENAME).open(encoding="utf-8")))
     assert len(rows) == 2
     assert list(rows[0].keys()) == SUMMARY_COLUMNS
     assert rows[0]["是否通过"] == "Y"
+    assert rows[0]["得分"] == "100"
     assert rows[0]["session_id"] == "fake-0"
+    assert rows[0]["类型"] == "假类型"                  # 单独一列，可直接筛选
     assert rows[0]["测试内容摘要"] == "ok-1·假类型"
     assert rows[0]["under_test模型"] == "fake-model"
     assert rows[0]["多轮(Y/N)"] == "N"
+    assert rows[0]["耗时(s)"] == "0.0"
+    # 起止时间两列已换成「耗时(s)」：绝对时间锚点只剩「时间」列
+    assert "会话开始时间" not in rows[0] and "会话结束时间" not in rows[0]
 
     # 全局总表也追加了同一批
-    global_rows = list(csv.DictReader((runs_dir / "summary.csv").open(encoding="utf-8")))
+    global_rows = list(csv.DictReader((runs_dir / SUMMARY_FILENAME).open(encoding="utf-8")))
     assert [row["session_id"] for row in global_rows] == ["fake-0", "fake-1"]
 
 
@@ -258,38 +267,86 @@ def test_run_按表取证据却没声明库时开跑前就报错(tmp_path) -> No
         asyncio.run(runner.run(write_cases(tmp_path, body)))
 
 
-# ---------------- summary 落盘 ----------------
+# ---------------- summary 可重建（summary 与跑流程解耦的验收判据） ----------------
 
 
-def test_write_summary_写本次run并追加全局(tmp_path) -> None:
-    runner = EvalRunner(base_dir=make_base(tmp_path), runs_dir=tmp_path / "runs")
-    cases_path = write_cases(tmp_path, fake_cases("ok-1"))
-    ctx = runner._prepare_run(cases_path, load_case_set(cases_path))
-    results = [
-        CaseResult(
-            case_id="T-1", case_type="支出记录", case_dir="d1", version="记录任务-99",
-            content_summary="T-1·支出记录", session_id="s1", passed=True, reason="通过",
-            started_at="2026-01-01T00:00:00+00:00", ended_at="2026-01-01T00:00:10+00:00",
-        ),
-        CaseResult(
-            case_id="T-2", case_type="梦境记录", case_dir="d2", version="记录任务-99",
-            content_summary="T-2·梦境记录", passed=None, multi_turn=True,
-        ),
-    ]
+def assert_rebuild_matches(run_dir: Path, results: list[CaseResult]) -> None:
+    """**对拍**：runner 手里那份内存结论，与从产物重建出来的行，必须逐格一致。
 
-    runner._write_summary(ctx, results)
+    这是**跨实现**的一致性检查——「跑的时候的结论」与「报表里的结论」应当来自同一条路
+    （都调 `case.py:conclusion`），任一环节漂了这里就会红。
 
-    run_csv = list(csv.DictReader((ctx.run_dir / "summary.csv").open(encoding="utf-8")))
-    assert len(run_csv) == 2
-    assert run_csv[0]["是否通过"] == "Y"
-    assert run_csv[0]["时间"] == "2026-01-01T00:00:10+00:00"
-    assert run_csv[1]["是否通过"] == ""      # 未判
-    assert run_csv[1]["多轮(Y/N)"] == "Y"
+    只验「重建 == 之前写出来的那份」是不够的：那两份都是 summary 自己的输出，两边一起错
+    也发现不了。对拍拿的是另一个来源（子进程回传给 runner 的那份 `CaseResult`）。
+    """
+    rows = summary.build_rows(run_dir)
+    assert len(rows) == len(results), "用例数与行数对不上"
 
-    # 再写一次：run 内覆盖、全局追加
-    runner._write_summary(ctx, results)
-    assert len(list(csv.DictReader((ctx.run_dir / "summary.csv").open(encoding="utf-8")))) == 2
-    assert len(list(csv.DictReader((ctx.runs_dir / "summary.csv").open(encoding="utf-8")))) == 4
+    for result, row in zip(results, rows):
+        assert row["类型"] == result.case_type
+        assert row["测试内容摘要"] == result.content_summary
+        assert row["多轮(Y/N)"] == ("Y" if result.multi_turn else "N")
+        assert row["session_id"] == result.session_id
+        assert row["是否通过"] == (
+            "" if result.passed is None else ("Y" if result.passed else "N")
+        )
+        assert row["得分"] == ("" if result.score is None else str(result.score))
+        assert row["测试结果摘要"] == result.reason
+        assert row["时间"] == (result.ended_at or result.started_at)
+        assert row["耗时(s)"] == summary.duration_seconds(result.started_at, result.ended_at)
+        for role in ("under_test", "simulator", "judge"):
+            assert row[role] == ("Y" if result.agents.get(role) else "N")
+            assert row[f"{role}模型"] == result.models.get(role, "")
+
+
+def test_删掉summary还能原样重建(tmp_path) -> None:
+    """**这是本次改造的验收判据**：删光 summary.csv，重建要一模一样。
+
+    做法：跑一次 run → 抄下 runner 写出来的那份 → 删掉它 → 走**命令行那条路径**
+    （`summary.rebuild`，写到旁路的 `summary.rebuild.csv`）→ 逐字节比对。
+
+    不一致就说明还有字段只活在内存里：跑的时候用过、却没落到产物上。改造前「时间 / 耗时」
+    正是如此（起止时间只在子进程回传给父进程的载荷里过了一趟，没进任何文件）。
+    """
+    _, _, run_dir = run(tmp_path, fake_cases("ok-1", "ok-2"))
+    summary_path = run_dir / SUMMARY_FILENAME
+    expected = summary_path.read_text(encoding="utf-8")
+
+    summary_path.unlink()
+    assert not summary_path.exists()
+
+    (rebuilt,) = summary.rebuild(run_dir)
+
+    # 主动重建不碰正式表：它**默认写到旁路文件**，所以这条命令不可能覆盖 runner 的产物
+    assert rebuilt == run_dir / summary.REBUILD_FILENAME
+    assert rebuilt.read_text(encoding="utf-8") == expected
+
+
+def test_跑完的那些行与内存结论对拍(tmp_path) -> None:
+    """跑一次真链路，把 runner 报的与重建出来的逐格对拍（含用例级失败的那条）。"""
+    results, _, run_dir = run(tmp_path, fake_cases("ok-1", "fail-1", "ok-2"), max_workers=1)
+
+    assert_rebuild_matches(run_dir, results)
+
+
+def test_执行通道失败也留一份回执(tmp_path) -> None:
+    """子进程没起来时没人落产物 —— runner 得替它补。
+
+    不补的话这条用例会从报表里**整个消失**，连「它失败过」都看不出来。
+    """
+    results, _, run_dir = run(tmp_path, fake_cases("fail-1", "ok-1"), max_workers=1)
+
+    case_dir = Path(results[0].case_dir)
+    assert (case_dir / "case.yaml").is_file()          # 用例快照也补了，类型等列才有值
+    data = json.loads((case_dir / "result.json").read_text(encoding="utf-8"))
+    # 回执**只装推不出来的三样**——其余列一律由 summary 从产物现算
+    assert set(data) == {"started_at", "ended_at", "error"}
+    assert "故意失败" in data["error"]
+
+    row = summary.build_rows(run_dir)[0]
+    assert "故意失败" in row["测试结果摘要"]            # 原文来自回执
+    assert row["是否通过"] == ""                       # 未判定：空，不是 N
+    assert row["类型"] == "假类型"                     # 来自补的用例快照
 
 
 # ---------------- 入口契约 ----------------
@@ -326,3 +383,23 @@ def test_用真执行实体跑一条用例_不调LLM(tmp_path) -> None:
     assert (case_dir / "env").is_dir()
     assert not (case_dir / "judge.json").exists()      # 未判定
     assert (run_dir / "logs" / f"{case_dir.name}.log").is_file()
+
+
+def test_真执行实体的产物能被summary重建(tmp_path) -> None:
+    """端到端：**真** `case.py` 落的产物，喂给 `summary` 能算出一行来，且与内存结论对拍。
+
+    上面那条验的是「case.py 跑得起来」，这条验的是「它落的东西够重建报表」——两条缺一不可：
+    产物少落了，run 级测试（走假 entrypoint）是看不出来的，假实体自己会把产物补齐。
+    """
+    results, _, run_dir = run(
+        tmp_path,
+        CASES_AGENT_MODE,
+        max_workers=1,
+        case_entrypoint=DEFAULT_CASE_ENTRYPOINT,
+    )
+    result = results[0]
+
+    assert (Path(result.case_dir) / "result.json").is_file()
+    assert result.error.startswith("NotImplementedError")
+
+    assert_rebuild_matches(run_dir, results)
