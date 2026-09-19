@@ -43,7 +43,7 @@ logger.setLevel(logging.INFO)
 
 AGENT_NAME = "old_agent"
 # 会话落盘根目录（gitignored），lifeprism 数据目录编码为其中的一层项目子目录
-SESSION_FOLDER = Path("localData")
+SESSION_FOLDER = Path(".\localData\sessions")
 # 文件工具白名单，与旧 lifeprism 的 ALLOWED_DIRS 对齐（identity 末尾的目录说明会用到）
 ALLOWED_DIRS = ["user", "diary", "agent"]
 

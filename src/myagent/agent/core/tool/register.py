@@ -294,7 +294,7 @@ class ToolRegister:
             )
         return ParsedToolCall(call_id=call.id, tool_name=call.name, arguments=arguments)
 
-    async def execute(self, call: RawToolCall) -> ToolResult:
+    async def execute(self, call: RawToolCall,permission_passed:bool=True,deny_reason:str="") -> ToolResult:
         """执行一次模型发起的工具调用：解析参数 → 校验 → 执行，并记录执行耗时。
 
         Args:
@@ -312,6 +312,13 @@ class ToolRegister:
         # 计时口径：整个 execute（解析→校验→执行），即"一次工具调用换回结果的真实等待"；
         # 成功与失败都记。熔断抛错路径不返回结果，故不填耗时（无结果可承载）。
         started = time.perf_counter()
+        if not permission_passed:
+            # 没有通过权限检查
+            return ToolResult(
+                f"status : error\n message : 工具调用({call.name})被权限护栏拦截。 deny_reason : {deny_reason}",
+                error_type=ToolErrorType.Permission_Denied,
+                duration_ms = int((time.perf_counter() - started) * 1000)
+            )
         result = await self._execute(call)
         result.duration_ms = int((time.perf_counter() - started) * 1000)
         return result

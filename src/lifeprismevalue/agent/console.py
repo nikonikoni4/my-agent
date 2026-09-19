@@ -13,6 +13,9 @@
   所以这里统一从 session/event 分流：既能监控这三类事实，也拿得到完整内容。
 - main：读取控制台输入 -> agent.send 入队；/cancel 调 agent.cancel() 打断当前输出。
 
+护栏（ToolUseGuard）只在这里挂：它是本地手工验证用的组件，不进 create_old_agent，
+免得评测/别的入口被动带上。白名单见 ALLOW_PATH，改这里就能试"拒"与"放行"两种情况。
+
 控制台输入：
     普通文本  作为用户消息发送（agent 正在输出时输入会先入队，本轮结束后执行）
     /cancel   取消当前在途 turn
@@ -31,13 +34,19 @@ from myagent.agent.core.session.types import (
     ToolCallData,
     TurnEndData,
 )
-from myagent.infra.events.eventspec import SESSION_EVENT
+from myagent.agent.guard.tool_use_guard import ToolUseGuard
+from myagent.infra.events.eventspec import SESSION_EVENT, TOOL_CALL
 from myagent.infra.events.payload import SessionEventPayload
 
 from lifeprismevalue.agent.old_lifeprism_agent import create_old_agent
 
 # 各模块输出之间的分割线：控制台里把不同事件的打印块隔开，便于查看
 _SEP = "-" * 64
+
+# 路径护栏白名单（绝对路径，前缀匹配到目录则其下全部放行）。
+#   ✅ 放行 lifeprism 数据根下的一切：想验证"工具照常执行"就留这一条
+#   ⛔ 清空成 []：fail-closed，任何文件工具调用都会被拒——用来验证"护栏拦得住"
+ALLOW_PATH: list[str] = [r"D:\desktop\软件开发\agent\lifeprismData"]
 
 
 class ConsoleMonitor:
@@ -107,6 +116,12 @@ async def _main() -> None:
     # monitor 必须保持强引用（见 ConsoleMonitor.__init__ 的弱引用说明），
     # 它是 _main 的局部变量，函数存活期间不会被回收。
     monitor = ConsoleMonitor(agent._event_service)
+
+    # 挂路径护栏：订阅 tool/call（waterfall 语义），在工具执行前逐条裁决文件路径。
+    # 同 monitor，它也必须由 _main 的局部变量强引用——EventService 存的是 WeakMethod，
+    # 没人强引用的话注册当场失效（不报错，只是护栏永远不生效）。
+    tool_use_guard = ToolUseGuard({"allow_path": ALLOW_PATH})
+    agent._event_service.register(TOOL_CALL.name, tool_use_guard.file_sys_path_guard)
 
     agent.start()
     print("=== lifeprism agent 控制台 ===")

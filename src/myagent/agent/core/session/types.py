@@ -129,10 +129,13 @@ class ToolCallData(SessionData):
     """tool/call：一次工具调用，执行时写入、先于 tool/result。"""
     call_id: str  # 与 tool/result 配对；并行调用同一工具时靠它区分
     tool_name: str
-    # wire 形态 JSON 字符串（RawToolCall.raw_arguments）：provider 未解析成功时
-    # 即模型当时写的原文，已解析成 dict 的则在写入边界序列化回去
-    arguments: str
-
+    # 与 RawToolCall.arguments 同两形态：provider 解析成功为 dict，未解析成功即
+    # 模型当时写的 wire 原文 str。落盘按拿到时的形态原样存（str 存 JSON string、
+    # dict 存嵌套对象），不在这里归一化——由各读回侧自己决定要哪种形态
+    # （报表侧见 stats/session_view.py 的 _wire_arguments）
+    arguments: str | dict
+    permission_passed : bool = True
+    deny_reason : str = ""
 
 @dataclass
 class ToolResultData(SessionData):

@@ -543,27 +543,7 @@ class ReActAgentLoop:
                 self.persist_session_now()
                 # 步骤 5：有工具调用则执行后进入下一步，否则收敛结束
                 if response.tool_call_requests:
-                    # 步骤 5a：并发执行本批工具，先逐条登记 tool/call 并广播
-                    async with asyncio.TaskGroup() as tg:
-                        tasks = []
-                        for tool_call in response.tool_call_requests:
-                            self._event_service.emit(TOOL_CALL.name,ToolCallPayload())
-                            tasks.append(tg.create_task(self.tool_register.execute(tool_call)))
-                            self._session.append("tool/call",ToolCallData(tool_name=tool_call.name,call_id = tool_call.id ,arguments=tool_call.raw_arguments))
-    
-                    # 步骤 5b：按原调用顺序回收结果，写 tool/result 并广播
-                    for index,task in enumerate(tasks):
-                        tool_call = response.tool_call_requests[index]
-                        tool_result =  task.result()
-                        self._session.append("tool/result",ToolResultData(call_id=tool_call.id,tool_name=tool_call.name,message=Message(role="tool",content=tool_result.content,tool_call_id=tool_call.id,),is_error=tool_result.is_error,duration_ms=tool_result.duration_ms),surface_op="append",source_event_seqs=[])
-                        self._event_service.emit(TOOL_RESULT.name,ToolResultPayload(
-                            tool_name=tool_call.name,
-                            arguments=tool_call.raw_arguments,
-                            is_error=tool_result.is_error,
-                            error_type=tool_result.error_type.value if tool_result.error_type else None,
-                            content=tool_result.content,
-                            duration_ms=tool_result.duration_ms,
-                        ))
+                    await self._tool_call(response)
                 else:
                     break
 
@@ -586,6 +566,43 @@ class ReActAgentLoop:
                 if decision and decision not in RETRY_DECISIONS:
                     break
 
+    async def _tool_call(self,response:LLMResponse):
+        # 步骤 5a：并发执行本批工具，先逐条登记 tool/call 并广播
+        async with asyncio.TaskGroup() as tg:
+            tasks = []
+            #tool_call_decision {call_id: {"decision": "deny", "reason": str}}，可能为空表。只装deny的
+            tool_call_decision:dict  = await self._event_service.waterfall(TOOL_CALL.name,ToolCallPayload(response.tool_call_requests)) or {}
+            for tool_call in response.tool_call_requests:
+                permission_passed = True
+                deny_reason = ""
+                if tool_call.id in tool_call_decision:
+                    permission_passed = False
+                    deny_reason = tool_call_decision[tool_call.id]["reason"]
+                self._session.append("tool/call",
+                    ToolCallData(
+                        tool_name=tool_call.name,
+                        call_id = tool_call.id ,
+                        arguments=tool_call.arguments,
+                        permission_passed=permission_passed,
+                        deny_reason=deny_reason)
+                    )
+                tasks.append(tg.create_task(self.tool_register.execute(tool_call,permission_passed,deny_reason)))
+                            
+        # 步骤 5b：按原调用顺序回收结果，写 tool/result 并广播
+        # 必须在 TaskGroup 之外：组内 task 要到 with 退出时才被 await，组内取
+        # task.result() 只会拿到 InvalidStateError（Result is not set）
+        for index,task in enumerate(tasks):
+            tool_call = response.tool_call_requests[index]
+            tool_result =  task.result()
+            self._session.append("tool/result",ToolResultData(call_id=tool_call.id,tool_name=tool_call.name,message=Message(role="tool",content=tool_result.content,tool_call_id=tool_call.id,),is_error=tool_result.is_error,duration_ms=tool_result.duration_ms),surface_op="append",source_event_seqs=[])
+            self._event_service.emit(TOOL_RESULT.name,ToolResultPayload(
+                tool_name=tool_call.name,
+                arguments=tool_call.raw_arguments,
+                is_error=tool_result.is_error,
+                error_type=tool_result.error_type.value if tool_result.error_type else None,
+                content=tool_result.content,
+                duration_ms=tool_result.duration_ms,
+            ))
     @staticmethod
     def _step_end_reason(step_error) -> tuple[str,str]:
         """本轮的记账内容：无错 success；取消 interrupted；其余 error + 异常链文本。

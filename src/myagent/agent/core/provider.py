@@ -34,6 +34,39 @@ class RawToolCall:
     arguments : str | dict[str,Any]  # 解析成功为 dict；否则 wire 原样字符串（无参数时为 "{}"）
     truncated : bool = False
 
+    @classmethod
+    def from_wire(cls,id:str,name:str,raw_arguments:str | None,truncated:bool = False)->"RawToolCall":
+        """从 wire 数据构造一次调用：空 arguments 按 "{}" 处理，并尽力解析。
+
+        解析规则**只在这里实现一处**，所有构造路径（非流式提取、流式拼接）
+        都必须经过本方法——否则会出现"某条路径没解析"的漏网，而下游拿不到
+        dict 时并不会报错，只会静默退化成字符串。
+
+        尽力解析 = 静默失败：仅当 json.loads 的结果是 JSON 对象时才换成 dict；
+        非法 JSON、以及数组/数字/null 等非对象结果一律保持原字符串，交由工具层
+        判定并回喂（PARSE_ERROR / PARSE_NOT_OBJECT），不作为 LLM 调用错误。
+
+        Args:
+            id: 调用标识。
+            name: 工具名。
+            raw_arguments: wire 上的 arguments 字符串，None 或空串按 "{}" 处理。
+            truncated: 是否因 finish_reason=length 被截断。
+
+        Returns:
+            arguments 为 dict（解析成功）或原字符串（未解析成功）的 RawToolCall。
+        """
+        raw = raw_arguments or "{}"
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            parsed = None
+        return cls(
+            id=id,
+            name=name,
+            arguments=parsed if isinstance(parsed,dict) else raw,
+            truncated=truncated,
+        )
+
     @property
     def raw_arguments(self)->str:
         """wire 形态的 arguments 字符串，供 session 记录与事件 payload 使用。
@@ -243,20 +276,14 @@ class LLMProvider(ABC):
         """
         if not response_message:
             return None
-        calls = []
-        for tool_call in response_message.tool_calls:
-            raw = tool_call.function.arguments or "{}"
-            try:
-                parsed = json.loads(raw)
-            except json.JSONDecodeError:
-                parsed = None
-            # 只有解析结果是 JSON 对象才替换；否则保持原字符串交给工具层判定
-            # （非对象如 [1,2] / 123 / null 由工具层回 PARSE_NOT_OBJECT 错误）
-            calls.append(RawToolCall(
+        calls = [
+            RawToolCall.from_wire(
                 id=tool_call.id,
                 name=tool_call.function.name,
-                arguments=parsed if isinstance(parsed,dict) else raw,
-            ))
+                raw_arguments=tool_call.function.arguments,
+            )
+            for tool_call in response_message.tool_calls
+        ]
         if finish_reason == "length":
             for call in calls:
                 call.truncated = True

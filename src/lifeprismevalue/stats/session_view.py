@@ -31,7 +31,8 @@ class TokenUsage:
 class ToolCallView:
     """一次工具调用：tool/call 与配对的 tool/result 合并成一条。
 
-    arguments 保留 wire 原样字符串（忠实记录模型输出）；需要结构化时用 arguments_json。
+    arguments 是字符串（落盘为嵌套对象时在读回边界序列化回来，见 _wire_arguments）；
+    需要结构化时用 arguments_json。
     """
 
     turn: int
@@ -110,6 +111,19 @@ def _extract_text(content: Any) -> str:
     if content is None:
         return ""
     return content if isinstance(content, str) else str(content)
+
+
+def _wire_arguments(value: Any) -> str:
+    """把落盘的 tool/call arguments 归一化成 wire 形态字符串。
+
+    落盘有两种形态（provider 解析成功是嵌套对象、未解析成功是 wire 原文，见
+    ToolCallData.arguments），这里在读回边界统一成字符串，ToolCallView 的契约
+    （arguments 是字符串、结构化交给 arguments_json）就不随落盘形态漂移，
+    统计产物的格式也不会跟着变。ensure_ascii=False 与落盘侧一致，中文不转义。
+    """
+    if value is None:
+        return ""
+    return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
 
 
 def _parse_ts(value: str | None) -> datetime | None:
@@ -240,7 +254,7 @@ def _consume(
             step=step if step is not None else 0,
             call_id=data.get("call_id", ""),
             tool_name=data.get("tool_name", ""),
-            arguments=data.get("arguments", ""),
+            arguments=_wire_arguments(data.get("arguments")),
         )
         if view is not None:
             view.tool_calls.append(call)

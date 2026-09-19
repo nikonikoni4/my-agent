@@ -117,10 +117,33 @@ async def test_O1_stream_chat_聚合正文推理工具调用与usage():
     assert len(final.tool_call_requests) == 1
     call = final.tool_call_requests[0]
     assert call.id == "call_1" and call.name == "get_weather"
-    assert call.arguments == '{"date": "2026-09-05"}', "工具参数碎片应按槽位拼接为 wire 字符串"
+    # 碎片拼接后交给 from_wire：结果是 JSON 对象，故换成 dict（与 chat 路径同规则）
+    assert call.arguments == {"date": "2026-09-05"}, "工具参数碎片应按槽位拼接并尽力解析"
+    assert call.raw_arguments == '{"date": "2026-09-05"}', "wire 形态仍可按原拼接结果取回"
     assert call.truncated is False
     # finish 块在最终 LLMResponse 之前单独产出（用于区分正常结束与中途失败）
     assert any(getattr(i, "finish_reason", None) == "tool_calls" for i in items[:-1])
+
+
+@pytest.mark.asyncio
+async def test_O1b_流式路径同样尽力解析_坏JSON保持原文():
+    """回归：流式是与 chat 并列的构造路径，早期漏走解析会让下游静默拿不到 dict。
+    这里锁定两条路径共用 from_wire 的规则——能解析的换 dict，坏 JSON 保持原文。"""
+    provider = make_provider()
+    good = SimpleNamespace(index=0, id="call_ok",
+                           function=SimpleNamespace(name="t", arguments='{"date": "x"}'))
+    bad = SimpleNamespace(index=1, id="call_bad",
+                          function=SimpleNamespace(name="t", arguments='{"date": "x'))
+    provider._client.chat.completions.create = AsyncMock(return_value=FakeStream([
+        _chunk(delta=_delta(tool_calls=[good, bad])),
+        _chunk(delta=_delta(), finish_reason="tool_calls"),
+    ]))
+
+    items = [item async for item in provider.stream_chat([Message(role="user", content="hi")])]
+    calls = {c.id: c for c in items[-1].tool_call_requests}
+
+    assert calls["call_ok"].arguments == {"date": "x"}, "可解析的应换为 dict"
+    assert calls["call_bad"].arguments == '{"date": "x', "坏 JSON 应保持原文，交工具层回喂"
 
 
 # ---------------------------------------------------------------------------

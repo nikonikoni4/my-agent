@@ -29,6 +29,7 @@ class ToolErrorType(str, Enum):
     PARAM_VALIDATION = "param_validation"
     TOOL_EXECUTION = "tool_execution"
     BREAKER_INTERCEPT = "breaker_intercept"
+    Permission_Denied = "permission_denied"
 
 
 @dataclass

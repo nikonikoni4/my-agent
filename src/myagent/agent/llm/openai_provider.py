@@ -154,10 +154,11 @@ class OpenAIProvider(LLMProvider):
                     total_tokens=completion.usage.total_tokens,
                 )
 
-            # 工具调用提取：arguments 保持 wire 原样 JSON 字符串，不在此解析
-            # （解析是工具层 ToolRegister 的信任边界，失败走带 hint 的工具结果
-            # 回喂模型自纠，不作为 LLM 调用错误）。finish_reason=length 时
-            # 提取出的调用带 truncated 标记，回喂话术由工具层依据标记选择
+            # 工具调用提取：arguments 由 RawToolCall.from_wire 尽力解析（仅当
+            # 结果是 JSON 对象时换 dict，失败保持原文）。解析失败仍不作为 LLM
+            # 调用错误——带 hint 的回喂、熔断计数都在工具层 ToolRegister。
+            # finish_reason=length 时提取出的调用带 truncated 标记，回喂话术
+            # 由工具层依据标记选择
             tool_call_requests = self.extract_tool_calls(choice.message, choice.finish_reason)
         except openai.APIError as e :
             logger.debug(f"llm call 错误 {e}")
@@ -254,15 +255,17 @@ class OpenAIProvider(LLMProvider):
 
             tool_call_requests = None
             if tool_calls_acc:
-                # arguments 保持流式拼接的原样字符串，不做 JSON 解析（解析是
-                # 工具层的信任边界）；finish_reason=length 时打 truncated 标记，
-                # 回喂话术（截断 vs 语法错误）由工具层依据标记选择
+                # 拼接结果交给 RawToolCall.from_wire：它统一负责"空串按 {} 处理 +
+                # 尽力解析（仅结果是 JSON 对象时换 dict）"，与非流式的 chat 路径
+                # 走同一处规则——解析不在这里另写一遍，否则两条路径会漂移。
+                # finish_reason=length 时打 truncated 标记，回喂话术（截断 vs
+                # 语法错误）由工具层依据标记选择
                 truncated = finish_reason == "length"
                 tool_call_requests = [
-                    RawToolCall(
+                    RawToolCall.from_wire(
                         id=acc["id"],
                         name=acc["name"],
-                        arguments=acc["arguments"] or "{}",
+                        raw_arguments=acc["arguments"],
                         truncated=truncated,
                     )
                     for _, acc in sorted(tool_calls_acc.items())
@@ -327,7 +330,10 @@ if __name__ == "__main__":
     print(llm_response.reasoning_content)
     print(llm_response.content)
     print(llm_response.tool_call_requests)
-    print(WeatherTool().execute(**json.loads(llm_response.tool_call_requests[0].arguments)))
+    # arguments 两形态：provider 解析成功是 dict，未解析成功是 wire 原文串
+    _call = llm_response.tool_call_requests[0]
+    _kwargs = _call.arguments if isinstance(_call.arguments, dict) else json.loads(_call.arguments)
+    print(asyncio.run(WeatherTool().execute(**_kwargs)))
 
     # 流式输出自测
     async def run_stream():

@@ -42,6 +42,7 @@ R4  补全：异常打断工具调用时补齐占位 tool/result（is_error=True
 R5  turn/end 的 error_type 承载"终止本 turn 的类别"（成功空串 / 耗尽 RetryExhaustedError），
     原错误只留在 reason_text 链里
 R6  无人认领时类别也可查：error_type=AgentUnclaimedError，cause 在 reason_text 链中
+R7  tool/call 的 arguments 按拿到时的形态落盘：解析成功的存 dict、未解析的存原文
 
 请求组装的用例（System Prompt / System Reminder / runtime context 的落点）见文件末尾"请求组装"一节。
 
@@ -619,7 +620,9 @@ async def test_P12_非熔断ExceptionGroup_无人认领上抛():
     AgentUnclaimedError，cause 保留原始 group"""
     loop, provider, session = make_loop([tool_round("c1")], tools=OkTool())
 
-    async def boom(call):
+    # 桩的签名必须与 ToolRegister.execute 一致（loop 按三参调用：权限判定的
+    # 结果随批下发），少一个参数会在 loop 侧抛 TypeError 顶替掉本用例要验的异常
+    async def boom(call, permission_passed=True, deny_reason=""):
         raise RuntimeError("工具外异常")
 
     loop.tool_register.execute = boom
@@ -738,7 +741,9 @@ async def test_R4_异常打断工具调用_补齐占位tool_result():
     tool/result，避免消息面出现"有 tool_calls 却没有 tool 响应"的非法组合"""
     loop, provider, session = make_loop([tool_round("c1")], tools=OkTool())
 
-    async def boom(call):
+    # 同 P12：桩的签名须与 ToolRegister.execute 一致，否则抛的是 TypeError，
+    # 本用例虽仍能通过（只断言 session 记录），但验的已不是工具执行异常这条路
+    async def boom(call, permission_passed=True, deny_reason=""):
         raise RuntimeError("工具外异常")
 
     loop.tool_register.execute = boom
@@ -791,6 +796,24 @@ async def test_R6_无人认领的turnend类别人工可查():
     assert turn_end.data.error_type == "AgentUnclaimedError"
     assert turn_end.data.reason_text.splitlines()[0] == "AgentUnclaimedError: 无错误处理策略的错误"
     assert "RuntimeError: provider boom" in turn_end.data.reason_text
+
+
+@pytest.mark.asyncio
+async def test_R7_tool_call的arguments按解析结果存形态():
+    """tool/call 的 arguments 存"当时拿到的形态"：provider 解析成功是 dict，未解析成功
+    是 wire 原文 str，不再统一序列化回字符串——护栏/工具层看到的两形态与落盘一致。"""
+    loop, provider, session = make_loop([
+        tool_round("c1", arguments={"city": "北京"}),   # provider 已解析 -> dict
+        tool_round("c2", arguments='{"city": "北京"'),   # 坏 JSON -> 原文
+        LLMResponse(content="done", usage=Usage()),
+    ], tools=OkTool())
+
+    await loop.turn(user_message())
+
+    assert [c.data.arguments for c in records(session, "tool/call")] == [
+        {"city": "北京"},
+        '{"city": "北京"',
+    ]
 
 
 # ===========================================================================

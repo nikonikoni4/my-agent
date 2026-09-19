@@ -52,9 +52,34 @@ class AssistantMessagePayload(Payload):
 
 
 @dataclass
+class ToolCallInfo:
+    """payload 侧的一次工具调用。
+
+    字段与 provider 的 RawToolCall 同形，但类型定义留在 infra 内——payload 只依赖
+    原语，不反向依赖 agent.core，由 loop 在广播时逐条转换填入。
+
+    arguments 两形态凭类型区分，判据与 RawToolCall 一致：
+        dict : provider 已解析成功，下游（护栏、工具层）直接使用，不再解析
+        str  : wire 原样 JSON 字符串（非法 JSON、或解析结果不是对象），
+               由工具层以带 hint 的 ToolResult 回喂模型自纠
+    truncated 由 provider 依据 finish_reason == "length" 标记，供工具层选择回喂话术。
+    """
+    id: str
+    name: str
+    arguments: str | dict
+    truncated: bool = False
+
+
+@dataclass
 class ToolCallPayload(Payload):
-    """tool/call : 工具execute时, tool_name, tool_params"""
-    pass
+    """tool/call : 一次广播携带本批全部工具调用，供护栏等订阅方在工具执行前查看。
+
+    粒度是**批**不是条：需要整批视野的订阅方（如"这批里有几个写操作"）与逐条
+    判断的订阅方（如路径护栏）都从这一个 payload 取数，不必为两种消费方式发
+    两种事件；逐条还是整批判断，是订阅方自己的事。
+    """
+    tool_call_requests: list[ToolCallInfo]
+
 
 
 @dataclass
