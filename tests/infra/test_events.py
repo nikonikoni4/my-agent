@@ -3,8 +3,6 @@ from dataclasses import dataclass
 from typing import Callable
 
 from myagent.infra.events import EventService
-from myagent.infra.events.eventspec import REQUEST_ERROR, TOOL_RESULT
-from myagent.infra.events.payload import RequestErrorPayLoad, ToolResultPayload
 import asyncio
 import gc
 import logging
@@ -307,17 +305,3 @@ async def test_waterfall_拒绝同步订阅方(event_service: EventService,caplo
     assert result is None , "违约订阅方不得产出有效裁决"
     assert "sync_callback" in caplog.text , "报错要指出是哪个订阅方违约"
     assert "waterfall订阅契约" in caplog.text , "报错要回指契约文档位置"
-
-
-def test_trigger_拒绝waterfall语义(event_service: EventService):
-    """同步入口 trigger 只接 emit 语义：waterfall 语义传进来会静默丢掉整条裁决链
-    （协程没人 await），故显式报错并指向异步入口。"""
-    with pytest.raises(TypeError,match="trigger_waterfall"):
-        event_service.trigger(REQUEST_ERROR,RequestErrorPayLoad(error_type=ValueError("x")))
-
-
-@pytest.mark.asyncio
-async def test_trigger_waterfall_拒绝emit语义(event_service: EventService):
-    """异步入口只管 waterfall 语义：emit 是纯通知，调用方不需要等，走同步的 trigger()。"""
-    with pytest.raises(TypeError,match="trigger"):
-        await event_service.trigger_waterfall(TOOL_RESULT,ToolResultPayload())

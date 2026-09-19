@@ -135,7 +135,7 @@ class Session:
         record = self._build_record(data,event_type,surface_op,source_event_seqs)
         self.record_list.append(record)
         self.surface_manager.refresh_node(self.record_list)
-        self._event_service.trigger(SESSION_EVENT,SessionEventPayload(copy.deepcopy(record)))
+        self._event_service.emit(SESSION_EVENT.name,SessionEventPayload(copy.deepcopy(record)))
 
     def compact(self):
         pass 

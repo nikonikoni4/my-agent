@@ -64,20 +64,19 @@ def on_error(self, payload, _next):        # ← 缺 async，契约违例
 **注册处不受影响**：`register()` 接受的是 callable，async 绑定方法与同步绑定方法的注册写法
 完全一致。契约只约束订阅方自身的定义，不约束注册点。
 
-## 5. 相关约束：两类派发入口的分工
+## 5. 相关约束：两个派发入口各自直接调用
 
-`EventService` 按"调用方要不要等结果"分成两个入口，不可互串：
+`EventService` 按"调用方要不要等结果"分两个入口，各调各的：
 
 | | 语义 | 入口 | 订阅方 | 调用方写法 |
 |---|---|---|---|---|
-| emit | 纯通知，无返回值 | `trigger(spec, payload)` | 同步 | `event_service.trigger(...)` |
-| waterfall | 裁决，有返回值 | `trigger_waterfall(spec, payload)` | **async** | `await event_service.trigger_waterfall(...)` |
+| emit | 纯通知，无返回值 | `emit(name, payload)` | 同步 | `event_service.emit(SPEC.name, payload)` |
+| waterfall | 裁决，有返回值 | `waterfall(name, payload)` | **async** | `await event_service.waterfall(SPEC.name, payload)` |
 
-误用一律显式抛 `TypeError`，不做静默降级：
+**不设 `trigger(spec, payload)` 这类按 spec 统一分派的包装**：两种语义的同步性不同，
+包进同一个签名会把"调用方要不要等待"藏起来——读调用点时看不出该不该写 `await`，
+而这恰恰是本契约最要紧的一件事。直接调用后，`emit(...)` 一眼看出不必等，
+`await waterfall(...)` 一眼看出必须等。
 
-- 把 waterfall 语义的 spec 传给同步的 `trigger()`：同步入口无法 await 订阅方，
-  会把整条裁决链丢掉。
-- 把 emit 语义的 spec 传给异步的 `trigger_waterfall()`：纯通知不需要调用方等待。
-
-两个入口分开而非合并成单个异步入口，是为了让 emit 的调用方（数量多、且都是纯通知）
-不必 `await`——它们没有要等的结果，强加 `await` 只会让主循环在不该阻塞的地方阻塞。
+emit 的调用点数量多且全是纯通知，它们不该被强加 `await`——没有要等的结果，
+在不需要等待的地方阻塞只会拖慢主循环。

@@ -377,7 +377,7 @@ class ReActAgentLoop:
         try:
             # 步骤 2：写 turn/start 记录并广播
             self._session.append("turn/start",TurnStartData())
-            self._event_service.trigger(TURN_START,TurnStartPayload())
+            self._event_service.emit(TURN_START.name,TurnStartPayload())
             # 步骤 3：进入 step 循环（重试与终止由 step 内部决策）
             await self.step(user_message)
         # 步骤 4：取消——记 interrupted 后原样上抛
@@ -395,7 +395,7 @@ class ReActAgentLoop:
         finally:
             # 步骤 6：无论成败都写 turn/end 并广播（一并触发工具熔断复位）
             self._session.append("turn/end",TurnEndData(reason_type=final_result.reason_type,reason_text=final_result.reason_text,error_type=final_result.error_type))
-            self._event_service.trigger(TURN_END,TurnEndPayload())
+            self._event_service.emit(TURN_END.name,TurnEndPayload())
 
     def _request_header(self,user_message : Message | None) -> list[Message]:
         """装配本次请求的消息面：system、system-reminder、运行时上下文与会话派生历史。
@@ -423,7 +423,7 @@ class ReActAgentLoop:
         if user_message:
             merged = self._merge_runtime_context(user_message,assembly_prompt.context)
             self._session.append("user/message",UserMessageData(merged),surface_op="append")
-            self._event_service.trigger(USER_MESSAGE,UserMessagePayload())
+            self._event_service.emit(USER_MESSAGE.name,UserMessagePayload())
 
         # 步骤 3：算出本次请求头快照
         current = RequestHeaderData(
@@ -438,11 +438,11 @@ class ReActAgentLoop:
         last = self._session.latest_request_header()
         if last is None:
             self._session.append("request/header", current)
-            self._event_service.trigger(REQUEST_HEADER,RequestHeaderPayload())
+            self._event_service.emit(REQUEST_HEADER.name,RequestHeaderPayload())
         elif (last.model_name, last.system_prompt, last.system_reminder, last.tools, last.params) != (current.model_name, current.system_prompt, current.system_reminder, current.tools, current.params):
             current.reason = "change"
             self._session.append("request/header", current)
-            self._event_service.trigger(REQUEST_HEADER,RequestHeaderPayload())
+            self._event_service.emit(REQUEST_HEADER.name,RequestHeaderPayload())
 
         # 步骤 5：拼消息面——system → system-reminder → 会话派生的历史消息
         messages : list[Message] = []
@@ -531,7 +531,7 @@ class ReActAgentLoop:
                 # 步骤 2：开步——计数、写 step/start、广播
                 step_count += 1
                 self._session.append("step/start",StepStartData())
-                self._event_service.trigger(STEP_START,StepStartPayload())
+                self._event_service.emit(STEP_START.name,StepStartPayload())
                 step_opened = True
                 # 步骤 3：装配消息面（用户消息只在首步注入）并落盘
                 messages = self._request_header(user_message)
@@ -547,15 +547,16 @@ class ReActAgentLoop:
                     async with asyncio.TaskGroup() as tg:
                         tasks = []
                         for tool_call in response.tool_call_requests:
+                            self._event_service.emit(TOOL_CALL.name,ToolCallPayload())
                             tasks.append(tg.create_task(self.tool_register.execute(tool_call)))
                             self._session.append("tool/call",ToolCallData(tool_name=tool_call.name,call_id = tool_call.id ,arguments=tool_call.arguments))
-                            self._event_service.trigger(TOOL_CALL,ToolCallPayload())
+    
                     # 步骤 5b：按原调用顺序回收结果，写 tool/result 并广播
                     for index,task in enumerate(tasks):
                         tool_call = response.tool_call_requests[index]
                         tool_result =  task.result()
                         self._session.append("tool/result",ToolResultData(call_id=tool_call.id,tool_name=tool_call.name,message=Message(role="tool",content=tool_result.content,tool_call_id=tool_call.id,),is_error=tool_result.is_error,duration_ms=tool_result.duration_ms),surface_op="append",source_event_seqs=[])
-                        self._event_service.trigger(TOOL_RESULT,ToolResultPayload(
+                        self._event_service.emit(TOOL_RESULT.name,ToolResultPayload(
                             tool_name=tool_call.name,
                             arguments=tool_call.arguments,
                             is_error=tool_result.is_error,
@@ -579,7 +580,7 @@ class ReActAgentLoop:
                 if step_opened:
                     reason_type,reason_text = self._step_end_reason(step_error)
                     self._session.append("step/end",StepEndData(reason_type=reason_type,reason_text=reason_text))
-                    self._event_service.trigger(STEP_END,StepEndPayload())
+                    self._event_service.emit(STEP_END.name,StepEndPayload())
                 # 阶段 3：错误处理
                 decision = await self._handle_error(step_error)
                 if decision and decision not in RETRY_DECISIONS:
@@ -640,11 +641,11 @@ class ReActAgentLoop:
                         tool_calls=response.tool_call_requests,
                         reasoning_content=response.reasoning_content,
                     ),usage=response.usage),surface_op="append",source_event_seqs=[])
-                    self._event_service.trigger(ASSISTANT_MESSAGE,AssistantMessagePayload())
+                    self._event_service.emit(ASSISTANT_MESSAGE.name,AssistantMessagePayload())
                 # 步骤 2b：流式增量——写 assistant/chunk 并广播
                 else:
                     self._session.append("assistant/chunk",AssistantChunkData(item))
-                    self._event_service.trigger(ASSISTANT_CHUNK,AssistantChunkPayload())
+                    self._event_service.emit(ASSISTANT_CHUNK.name,AssistantChunkPayload())
         # 步骤 3：模型层错误原样上抛（此处不补记，交由 step 决策）
         except LLMCallError:
             raise
@@ -690,7 +691,7 @@ class ReActAgentLoop:
                 message=Message(role="tool",content=content,tool_call_id=call.call_id),
                 is_error=True,
             ),surface_op="append",source_event_seqs=[])
-            self._event_service.trigger(TOOL_RESULT,ToolResultPayload(
+            self._event_service.emit(TOOL_RESULT.name,ToolResultPayload(
                 tool_name=call.tool_name,
                 arguments=call.arguments,
                 is_error=True,
@@ -733,8 +734,8 @@ class ReActAgentLoop:
         # 步骤 2：取消不进决策链，原样上抛
         if isinstance(step_error,asyncio.CancelledError):
             raise step_error
-        # 步骤 3：触发 request/error waterfall（异步入口），取决策与退避策略
-        request_error_result = await self._event_service.trigger_waterfall(REQUEST_ERROR,RequestErrorPayLoad(error_type=step_error))
+        # 步骤 3：触发 request/error waterfall，取决策与退避策略
+        request_error_result = await self._event_service.waterfall(REQUEST_ERROR.name,RequestErrorPayLoad(error_type=step_error))
         decision = (request_error_result or {}).get("decision",None)
         # 步骤 4：无人认领——直接抛 AgentUnclaimedError（未重试，不落 llm/retry）
         if decision is None:

@@ -3,7 +3,6 @@
 import inspect, logging, weakref, types
 from typing import  Callable
 from collections import defaultdict
-from myagent.infra.events.eventspec import EventSpec
 from myagent.infra.events.payload import Payload
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -27,12 +26,13 @@ _WATERFALL_CONTRACT_DOC = "docs/coding-rules/2026-09-18-waterfall订阅契约.md
 # 待办：需要引入订阅顺序声明/优先级机制，以及回调解绑接口（off），使组件
 # 仍存活时也能主动注销自己的回调，不再依赖初始化时序隐式保证正确性。
 
-# --- 派发入口按"调用方要不要等结果"分成同步与异步两条 ---
-# emit（纯通知）   → trigger()          同步。调用方不需要任何返回值。
-# waterfall（裁决）→ trigger_waterfall() 异步。调用方必须等到裁决才能继续，
-#                    且裁决可能要等外部应答（如人在回路），届时订阅方内部 await。
-# 两者不可互串：同步入口 await 不了订阅方，异步入口则会让 emit 的调用方白白
-# 等待。误用一律显式抛 TypeError，不做静默降级。
+# --- 两个派发入口各自直接调用，不做按 spec 统一分派的包装 ---
+# emit(name, payload)             同步。纯通知，调用方不需要任何返回值。
+# await waterfall(name, payload)  异步。裁决，调用方必须等到裁决值才能继续；
+#                                 裁决可能要等外部应答（如人在回路），届时
+#                                 订阅方内部 await。
+# 不提供 trigger(spec, payload) 这类统一入口：两种语义的同步性不同，包在一起会
+# 把"调用方要不要等待"藏进同一个签名里，读调用点时看不出该不该 await。
 # waterfall 的订阅方必须写成 async——契约见 _WATERFALL_CONTRACT_DOC。
 
 
@@ -45,8 +45,8 @@ class EventService:
     注意：注册 lambda/闭包时调用方必须自己持有该函数的引用，
     否则注册后弱引用立即失效
 
-    派发入口：emit 语义走同步的 trigger()，waterfall 语义走异步的
-    trigger_waterfall()（订阅方必须是 async，契约见 _WATERFALL_CONTRACT_DOC）。
+    派发入口两个，按事件语义各走各的：emit 语义调同步的 emit()，waterfall 语义
+    调异步的 waterfall()（订阅方必须是 async，契约见 _WATERFALL_CONTRACT_DOC）。
     """
     # 事件类型 -> (弱引用, 注册时记录的callback名) 序列。 比如 pre-tool-use事件，进行工具调用审批
     _hooks: defaultdict[str, list[tuple[weakref.ReferenceType, str]]]
@@ -160,33 +160,3 @@ class EventService:
                 continue
             alive.append((entry, name))
         self._hooks[event_name] = alive
-    def trigger(self,event_spec:EventSpec,payload):
-        """
-        使用spec同步触发 emit 语义事件（纯通知，无返回值）。
-
-        waterfall 语义事件必须走 async 的 trigger_waterfall：本方法是同步的，
-        既拿不到也无法 await 订阅方，误用会让整条裁决链静默失效，故在此
-        显式报错而不是把一个协程对象丢掉。
-        """
-        if event_spec.semantics != "emit":
-            raise TypeError(
-                f"{event_spec.name} 是 {event_spec.semantics} 语义，"
-                f"必须用 await trigger_waterfall() 触发"
-            )
-        self.emit(event_spec.name,payload)
-
-    async def trigger_waterfall(self,event_spec:EventSpec,payload):
-        """
-        使用spec异步触发 waterfall 语义事件，返回洋葱链最外层订阅方的裁决值
-        （作为控制信号传回调用方，如错误处理订阅方决定"继续/终止/人工确认"）。
-
-        Returns:
-            裁决值；无订阅方或订阅方全部失效时返回 None（调用方据此判定
-            "无人认领"）。
-        """
-        if event_spec.semantics != "waterfall":
-            raise TypeError(
-                f"{event_spec.name} 是 {event_spec.semantics} 语义，"
-                f"应用同步的 trigger() 触发"
-            )
-        return await self.waterfall(event_spec.name,payload)

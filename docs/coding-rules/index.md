@@ -26,7 +26,7 @@ abstract: coding-rules 目录索引；收录编写代码时必须遵守的规范
 - updated_at: 2026-09-18
 - path: `docs/coding-rules/2026-09-18-waterfall订阅契约.md`
 - 触发规则：注册或修改 `request/error` 等 waterfall 语义事件的订阅方时阅读；改动
-  `EventService.waterfall` / `trigger` / `trigger_waterfall` 时阅读
+  `EventService.emit` / `waterfall` 时阅读
 - 内容摘要：waterfall 订阅方必须是 async 可调用对象、委托下游必须 `await _next()`；
-  违反时分发器记 ERROR 后返回 `None` 的后果链；emit 与 waterfall 两类派发入口的分工
-  （同步 `trigger` / 异步 `trigger_waterfall`）
+  违反时分发器记 ERROR 后返回 `None` 的后果链；emit 与 waterfall 两个派发入口各自
+  直接调用（同步 `emit` / 异步 `waterfall`，不设按 spec 分派的包装）

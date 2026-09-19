@@ -39,7 +39,7 @@ def make_evaluator(output_dir, event_service=None):
 
 def emit(event_service, *, name, arguments="{}", is_error=False, error_type=None, content=""):
     """触发一次 tool/result（字段与 loop 侧填充的负载一致）。"""
-    event_service.trigger(TOOL_RESULT, ToolResultPayload(
+    event_service.emit(TOOL_RESULT.name, ToolResultPayload(
         tool_name=name,
         arguments=arguments,
         is_error=is_error,
