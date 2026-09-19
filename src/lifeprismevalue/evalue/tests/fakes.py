@@ -55,7 +55,7 @@ class FakeAgent:
 
     def _emit(self, type_: str, data) -> None:
         record = SessionRecordData(type=type_, seq=len(self.sent), data=data)
-        self._event_service.trigger(SESSION_EVENT, SessionEventPayload(session_record=record))
+        self._event_service.emit(SESSION_EVENT.name, SessionEventPayload(session_record=record))
 
     def persist_session_now(self) -> None:
         self.persisted = True

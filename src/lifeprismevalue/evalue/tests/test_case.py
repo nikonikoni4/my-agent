@@ -776,8 +776,8 @@ def test_turn_collector_记录多step正文并忽略非字符串content() -> Non
     service = EventService()
     collector = TurnCollector(service)
 
-    service.trigger(
-        SESSION_EVENT,
+    service.emit(
+        SESSION_EVENT.name,
         SessionEventPayload(
             session_record=SessionRecordData(
                 type="assistant/message",
@@ -788,8 +788,8 @@ def test_turn_collector_记录多step正文并忽略非字符串content() -> Non
             )
         ),
     )
-    service.trigger(
-        SESSION_EVENT,
+    service.emit(
+        SESSION_EVENT.name,
         SessionEventPayload(
             session_record=SessionRecordData(
                 type="assistant/message",
@@ -801,8 +801,8 @@ def test_turn_collector_记录多step正文并忽略非字符串content() -> Non
     assert collector.assistant_texts == ["第一段"]   # 非字符串 content 被忽略、不报错
 
     collector.expect_turn()
-    service.trigger(
-        SESSION_EVENT,
+    service.emit(
+        SESSION_EVENT.name,
         SessionEventPayload(
             session_record=SessionRecordData(
                 type="turn/end",
