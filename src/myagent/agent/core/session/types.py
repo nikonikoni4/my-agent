@@ -267,3 +267,19 @@ class LLMRetryData(SessionData):
     reason : str # 触发本次重试的决策（retry / backoff_retry）
     error_type : str = "" # 触发本次重试的错误类名
     error_message : str = "" # 触发本次重试的错误信息（异常链文本）
+
+
+@dataclass
+class AgentGrantData(SessionData):
+    """agent/grant：一次预算授予的记录（授予多少、因何决策、触发它的错误）。
+
+    只在真正决定"继续并放宽预算"时写入：`Session.granted_steps` 按本类型记录的
+    steps 求和，得该 turn 的额外步数预算，故 break / 无人认领这类"未授予"的收尾
+    不得写入。
+
+    授予是**账本事实**而非 loop 的持存状态：决策方（如人在回路）只表达意图，
+    由 loop 落成本记录，判预算时再读回来现算。
+    """
+    steps : int # 本次授予的额外步数
+    reason : str # 触发本次授予的决策（continue）
+    error_type : str = "" # 触发本次授予的错误类名

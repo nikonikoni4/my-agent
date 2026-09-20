@@ -7,13 +7,20 @@
 （补全 → 记账 → 决策），终止统一以"抛出"表达，turn 由 except 得知终态。
 
 == 入口 / 调度层 ==
-E1  start() 启动后台循环（整个 loop 一个 task）；send 把消息写入 inbox["next_turn"] 并唤醒
+E1  start() 启动后台循环（整个 loop 一个 task）；followup 把消息追加到
+    inbox["next_turn"] 队尾、steer 插到同队列第 0 位，**两者结尾都调 send() 唤醒**；
+    send() 自己只做唤醒（按需启动），不碰 inbox
+E1b send() 只唤醒不入队：唤醒空闲 loop 不产生 turn，也不重建已在运行的 task
+E1c steer 插到 next_turn 第 0 位：先于已排队的 followup 消息被消费
+E1d 连续 steer 是"后插先跑"（每次 insert(0) 累积的结果）
+E1e steer 不打断在途 turn：当前 turn 照常收尾，插队消息留给下一个 turn
 E2  _loop 被唤醒后按序执行 turn 并消费 inbox（next_step 优先于 next_turn）
 E3  _on_loop_done：loop 因未归一化异常终止 → 异常留在 loop task 上（可被调用方取回），
     并由回调 logger.error 留痕（防止静默失败）
 E4  cancel() 打断在途 turn 并结束循环：step/turn 记 interrupted，取消传播到 _loop 后
     被消化（记 warning + break），loop task 正常结束、无 error 日志
-E5  cancel() 落在空闲等待时：同样记 warning + break 结束循环；之后 send() 按需重启循环
+E5  cancel() 落在空闲等待时：同样记 warning + break 结束循环；之后的 followup 会经
+    send() 按需重启循环
 
 == 正常收敛（不外抛） ==
 P1  模型不再请求工具 → step/end success，turn/end success
@@ -24,6 +31,9 @@ P4  参数 JSON 解析失败 → 回喂带 hint 结果，不上抛 → success
 == 终止出口（统一抛出） ==
 P5  用户取消（模型调用挂起）→ step/end、turn/end 记 interrupted，取消原样上抛
 P6  达到 step_limit → MaxStepsExceededError 无人认领 → AgentUnclaimedError（cause 为前者）
+P6b 达到 step_limit 且订阅方授予额外步数 → 落 agent/grant，预算抬高后继续执行
+P6c 每步都触顶：每次授予各落一条，预算是授予的合计（按 steps 求和，不是数条数）
+P6d 触顶后订阅方给 break → 不落授予记录，本 turn 就此收束
 P7  LLM 调用超时（TimeoutError）→ 无人认领 → AgentUnclaimedError
 P8  401 认证失败（配置类错误，策略表不再覆盖）→ 无人认领 → AgentUnclaimedError，不等待
 P9  429 限流 backoff_retry → 记 llm/retry + 退避；超限 → RetryExhaustedError（cause 为限流）
@@ -96,6 +106,8 @@ class ScriptedProvider(LLMProvider):
 
     脚本元素含义（每次模型调用消费一个）：
       "hang"                —— 挂起（等待被取消）
+      asyncio.Event         —— 阻塞到测试 set() 放行，再消费下一个元素
+                               （用来把 turn 稳定停在"在途"状态）
       BaseException 实例    —— 直接抛出
       LLMResponse           —— 产出一个完整结果
       list                  —— 逐项产出；元素为 BaseException 时先产出前面的再抛出
@@ -120,6 +132,12 @@ class ScriptedProvider(LLMProvider):
         if item == "hang":
             await asyncio.sleep(3600)  # 挂起直到被取消/超时
             return
+        # 放行门：阻塞在这里（turn 因而是"在途"），直到测试 set() 它
+        while isinstance(item, asyncio.Event):
+            await item.wait()
+            if not self._script:
+                raise RuntimeError("ScriptedProvider 脚本耗尽，loop 仍在继续调模型")
+            item = self._script.pop(0)
         for entry in (item if isinstance(item, list) else [item]):
             if isinstance(entry, BaseException):
                 raise entry
@@ -236,6 +254,20 @@ def user_message(text="你好"):
     return Message(role="user", content=text)
 
 
+def texts_of(messages) -> list[str]:
+    """取出一次模型调用所看到的消息正文（content 可能是 str，也可能是块列表）。"""
+    texts = []
+    for message in messages:
+        content = getattr(message, "content", None)
+        if isinstance(content, str):
+            texts.append(content)
+        elif isinstance(content, list):
+            texts.extend(
+                block.get("text", "") for block in content if isinstance(block, dict)
+            )
+    return texts
+
+
 def tool_round(call_id: str, tool_name: str = "ok", arguments: str = "{}") -> list:
     """一轮"模型请求工具"的脚本片段。"""
     return [LLMResponse(content=None, tool_call_requests=[
@@ -271,18 +303,115 @@ async def shutdown(loop, loop_task):
 
 
 @pytest.mark.asyncio
-async def test_E1_send入inbox并唤醒_loop完成一轮():
-    """start() 启动整个 loop 的单一 task；send 唤醒后跑完一轮，inbox 清空"""
+async def test_E1_followup入队并唤醒_loop完成一轮():
+    """start() 启动整个 loop 的单一 task；followup 入队并唤醒后跑完一轮，inbox 清空"""
     loop, provider, session = make_loop([LLMResponse(content="你好", finish_reason="stop")])
     loop_task = loop.start()
     try:
-        await loop.send("你好", "next_turn")
+        loop.followup("你好")  # 结尾自带 send()，无需再手动唤醒
         await wait_until(lambda: records(session, "turn/end"))
         assert provider.calls == 1
         assert loop.inbox["next_turn"] == []
         assert loop.inbox["next_step"] == []
         assert last(session, "turn/end").data.reason_type == "success"
     finally:
+        await shutdown(loop, loop_task)
+
+
+@pytest.mark.asyncio
+async def test_E1b_send只唤醒不入队():
+    """send() 只做唤醒：不往 inbox 塞东西，唤醒空闲 loop 不产生 turn，也不重建 task"""
+    loop, provider, session = make_loop([LLMResponse(content="你好", finish_reason="stop")])
+    loop_task = loop.start()
+    try:
+        loop.send()
+        await asyncio.sleep(0.05)  # 留出调度机会：唤醒后 inbox 是空的，_loop 转一圈又睡下
+        assert loop.inbox["next_turn"] == []
+        assert loop.inbox["next_step"] == []
+        assert provider.calls == 0
+        assert records(session, "turn/end") == []
+        assert loop._task is loop_task, "send 复用已在运行的 task，不重建"
+    finally:
+        await shutdown(loop, loop_task)
+
+
+@pytest.mark.asyncio
+async def test_E1c_steer插到next_turn第0位():
+    """steer 插队：先于已在队列里的 followup 消息被消费"""
+    gate = asyncio.Event()
+    loop, provider, session = make_loop([
+        gate,  # 第一轮停在放行门上——用来把 turn 保持在"在途"
+        LLMResponse(content="第一轮", finish_reason="stop"),
+        LLMResponse(content="第二轮", finish_reason="stop"),
+        LLMResponse(content="第三轮", finish_reason="stop"),
+    ])
+    loop_task = loop.start()
+    try:
+        loop.followup("第一轮")
+        await wait_until(lambda: provider.calls == 1)  # 第一轮已在途（卡在放行门上）
+        loop.followup("普通消息")
+        loop.steer("插队消息")
+        assert [m.content for m in loop.inbox["next_turn"]] == [
+            [{"type": "text", "text": "插队消息"}],
+            [{"type": "text", "text": "普通消息"}],
+        ], "steer 插到队首，followup 追加到队尾"
+        gate.set()
+        await wait_until(lambda: len(records(session, "turn/end")) == 3)
+        # 插队消息与普通消息依次落在第 2、3 轮
+        assert "插队消息" in texts_of(provider.seen_messages[1])
+        assert "普通消息" in texts_of(provider.seen_messages[2])
+    finally:
+        gate.set()
+        await shutdown(loop, loop_task)
+
+
+@pytest.mark.asyncio
+async def test_E1d_连续steer是后插先跑():
+    """每次 steer 都 insert(0)，故连续 steer 两条时后插的那条先被消费"""
+    gate = asyncio.Event()
+    loop, provider, session = make_loop([
+        gate,
+        LLMResponse(content="第一轮", finish_reason="stop"),
+        LLMResponse(content="第二轮", finish_reason="stop"),
+        LLMResponse(content="第三轮", finish_reason="stop"),
+    ])
+    loop_task = loop.start()
+    try:
+        loop.followup("第一轮")
+        await wait_until(lambda: provider.calls == 1)
+        loop.steer("先 steer")
+        loop.steer("后 steer")
+        gate.set()
+        await wait_until(lambda: len(records(session, "turn/end")) == 3)
+        assert "后 steer" in texts_of(provider.seen_messages[1])
+        assert "先 steer" in texts_of(provider.seen_messages[2])
+    finally:
+        gate.set()
+        await shutdown(loop, loop_task)
+
+
+@pytest.mark.asyncio
+async def test_E1e_steer不打断在途turn():
+    """turn 在途时 steer：当前 turn 照常收尾记 success，插队消息留给下一个 turn
+    ——steer 只是入队 + 唤醒，不动在途的 turn"""
+    gate = asyncio.Event()
+    loop, provider, session = make_loop([
+        gate,
+        LLMResponse(content="第一轮", finish_reason="stop"),
+        LLMResponse(content="插队轮", finish_reason="stop"),
+    ])
+    loop_task = loop.start()
+    try:
+        loop.followup("第一轮")
+        await wait_until(lambda: provider.calls == 1)  # 第一轮已在途（卡在放行门上）
+        loop.steer("插队")
+        assert records(session, "turn/end") == [], "steer 不应就地结束在途 turn"
+        gate.set()  # 放行，让第一轮正常收尾
+        await wait_until(lambda: len(records(session, "turn/end")) == 2)
+        assert records(session, "turn/end")[0].data.reason_type == "success"
+        assert "插队" in texts_of(provider.seen_messages[1])
+    finally:
+        gate.set()
         await shutdown(loop, loop_task)
 
 
@@ -297,7 +426,7 @@ async def test_E2_loop优先消费next_step():
     try:
         loop.inbox["next_turn"].append(user_message("turn消息"))
         loop.inbox["next_step"].append(user_message("step消息"))
-        loop._wakeup.set()
+        loop.send()
         await wait_until(lambda: len(records(session, "turn/end")) == 2)
         # 第一次模型调用看到的是 next_step 的消息（先被消费）
         first_seen = provider.seen_messages[0]
@@ -314,7 +443,7 @@ async def test_E3_on_loop_done_异常终止记error日志(caplog):
     loop_task = loop.start()
     try:
         with caplog.at_level(logging.ERROR, logger=LOOP_LOGGER):
-            await loop.send("你好", "next_turn")
+            loop.followup("你好")
             await wait_until(lambda: "agent loop 任务异常终止" in caplog.text)
         error = loop_task.exception()
         assert isinstance(error, AgentUnclaimedError)
@@ -333,7 +462,7 @@ async def test_E4_cancel打断在途turn并结束循环(caplog):
     loop, provider, session = make_loop(["hang"])
     loop_task = loop.start()
     with caplog.at_level(logging.WARNING, logger=LOOP_LOGGER):
-        await loop.send("取消我", "next_turn")
+        loop.followup("取消我")
         await wait_until(lambda: records(session, "step/start"))
         loop.cancel()
         await asyncio.gather(loop_task, return_exceptions=True)
@@ -360,8 +489,8 @@ async def test_E5_空闲态cancel结束循环_可重启(caplog):
         assert loop_task.cancelled() is False, "取消在 _loop 内被消化，任务应以正常结束收场"
         assert "打断循环" in caplog.text
         assert provider.calls == 0
-        # cancel 后 loop 仍可用：send 自动重启循环
-        await loop.send("你好", "next_turn")
+        # cancel 后 loop 仍可用：followup 结尾的 send() 自动重启循环
+        loop.followup("你好")
         assert loop._task is not loop_task, "send 应重启出一个新的 loop task"
         await wait_until(lambda: records(session, "turn/end"))
         assert last(session, "turn/end").data.reason_type == "success"
@@ -503,6 +632,86 @@ async def test_P6_达到step_limit_无人认领上抛记error():
     assert isinstance(excinfo.value.__cause__, MaxStepsExceededError)
     assert last(session, "turn/end").data.reason_type == "error"
     assert "达到最大步数" in last(session, "turn/end").data.reason_text
+
+
+@pytest.mark.asyncio
+async def test_P6b_触顶经授予额外步数后继续收敛():
+    """达到 step_limit 时经 request/error 授予额外步数：loop 落一条 agent/grant，
+    预算被抬高（配置基准 + 授予合计），循环继续执行至正常收敛而非终止。
+
+    "按 steps 求和"由断言条数为 1 锁住：若实现成"每条记录抵消一步"，授予 2 步
+    只够走一步，会再触发一次 request/error。
+    """
+    script = [tool_round(f"c{i}") for i in range(3)] + [
+        LLMResponse(content="收敛", finish_reason="stop")
+    ]
+    loop, provider, session = make_loop(script, tools=OkTool(), step_limit=2)
+    asked = []
+
+    async def grant_steps(payload, nxt):
+        asked.append(payload.error_type)
+        if isinstance(payload.error_type, MaxStepsExceededError):
+            return {"decision": "continue", "grant": {"steps": 2}}
+        return await nxt()
+
+    loop._event_service.register(REQUEST_ERROR.name, grant_steps)
+
+    await loop.turn(user_message())
+
+    assert len(asked) == 1, "授予 2 步后预算够用，不再反复触顶"
+    assert provider.calls == 4, "触顶经授予后继续执行到模型收敛"
+    grants = records(session, "agent/grant")
+    assert [g.data.steps for g in grants] == [2]
+    assert grants[0].data.reason == "continue"
+    assert grants[0].data.error_type == "MaxStepsExceededError"
+    assert session.granted_steps(session.turn) == 2
+    assert [r.data.reason_type for r in records(session, "step/end")] == ["success"] * 4, \
+        "触顶那一轮在开步前被拒，不写 step/end；其余四步各 success"
+    assert last(session, "turn/end").data.reason_type == "success"
+
+
+@pytest.mark.asyncio
+async def test_P6c_每次触顶各授予一次_按合计抬高预算():
+    """step_limit=1 时每步都触顶：每次都授予 1 步，预算是本 turn 授予的合计，
+    故能反复放行；每次授予各落一条 agent/grant"""
+    script = [tool_round(f"c{i}") for i in range(2)] + [
+        LLMResponse(content="收敛", finish_reason="stop")
+    ]
+    loop, provider, session = make_loop(script, tools=OkTool(), step_limit=1)
+
+    async def grant_one(payload, nxt):
+        if isinstance(payload.error_type, MaxStepsExceededError):
+            return {"decision": "continue", "grant": {"steps": 1}}
+        return await nxt()
+
+    loop._event_service.register(REQUEST_ERROR.name, grant_one)
+
+    await loop.turn(user_message())
+
+    assert provider.calls == 3
+    grants = records(session, "agent/grant")
+    assert [g.data.steps for g in grants] == [1, 1]
+    assert session.granted_steps(session.turn) == 2, "预算是两次授予的合计"
+    assert last(session, "turn/end").data.reason_type == "success"
+
+
+@pytest.mark.asyncio
+async def test_P6d_触顶后选break_不落授予记录():
+    """触顶后订阅方给出 break：不落 agent/grant（未放宽预算就不该记账），
+    本 turn 就此收束，不上抛"""
+    script = [tool_round(f"c{i}") for i in range(3)]
+    loop, provider, session = make_loop(script, tools=OkTool(), step_limit=2)
+
+    async def deny(payload, nxt):
+        return {"decision": "break"}
+
+    loop._event_service.register(REQUEST_ERROR.name, deny)
+
+    await loop.turn(user_message())
+
+    assert provider.calls == 2, "break 后不再继续开步"
+    assert records(session, "agent/grant") == [], "未放宽预算就不落授予记录"
+    assert session.granted_steps(session.turn) == 0
 
 
 # ===========================================================================

@@ -71,7 +71,7 @@ class ToolCallInfo:
 
 
 @dataclass
-class ToolCallPayload(Payload):
+class ToolCallPayload[T](Payload):
     """tool/call : 一次广播携带本批全部工具调用，供护栏等订阅方在工具执行前查看。
 
     粒度是**批**不是条：需要整批视野的订阅方（如"这批里有几个写操作"）与逐条
@@ -79,6 +79,7 @@ class ToolCallPayload(Payload):
     两种事件；逐条还是整批判断，是订阅方自己的事。
     """
     tool_call_requests: list[ToolCallInfo]
+    session : T
 
 
 

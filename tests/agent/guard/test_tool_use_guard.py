@@ -73,7 +73,8 @@ def make_call(call_id: str, tool_name: str, tool_params) -> ToolCallInfo:
 
 
 def make_payload(*calls: ToolCallInfo) -> ToolCallPayload:
-    return ToolCallPayload(tool_call_requests=list(calls))
+    # 护栏只读 tool_call_requests，不碰 session：本用例传 None 表达"用不到"
+    return ToolCallPayload(tool_call_requests=list(calls), session=None)
 
 
 # ==========================================

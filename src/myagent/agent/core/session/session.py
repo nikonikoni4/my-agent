@@ -2,7 +2,8 @@ from myagent.agent.core.provider import Message
 from myagent.agent.core.session.types import (
     SessionMetaData,SessionData,AssistantChunkData,AssistantMessageData, StepEndData,CompactionStartData,
     SessionRecordData,ToolCallData,ToolResultData,TurnEndData,CompactionSummaryData,
-    TurnStartData,StepStartData,UserMessageData,RequestHeaderData,CompactionEndData,LLMRetryData
+    TurnStartData,StepStartData,UserMessageData,RequestHeaderData,CompactionEndData,LLMRetryData,
+    AgentGrantData
 )
 from myagent.infra.events.service import EventService
 from myagent.infra.events.eventspec import SESSION_EVENT,SessionEventPayload
@@ -31,7 +32,8 @@ class Session:
         "compaction/start": CompactionStartData,
         "compaction/summary": CompactionSummaryData,
         "compaction/end": CompactionEndData,
-        "llm/retry" : LLMRetryData
+        "llm/retry" : LLMRetryData,
+        "agent/grant": AgentGrantData
     }
 
     # 信封上 step 记为 None 的事件：不属于任何 step（轮边界事件与压缩事务）
@@ -94,6 +96,19 @@ class Session:
             1
             for record in self.record_list
             if record.turn == turn and record.type == "llm/retry"
+        )
+
+    def granted_steps(self, turn: int) -> int:
+        """统计指定 turn 内授予的额外步数预算合计。
+
+        该 turn 不存在或没有授予记录时返回 0。与 llm_retry_count 同构——两者都是
+        "状态折叠自账本"：预算不持存在 loop 里，判上限时现算（配置基准 + 本收益）。
+        带 turn 参数，故查询非本次 turn 也成立。
+        """
+        return sum(
+            record.data.steps
+            for record in self.record_list
+            if record.turn == turn and record.type == "agent/grant"
         )
 
     def _build_record(self,data:SessionData,event_type,surface_op = None,source_event_seqs:list |None=None)->SessionRecordData:

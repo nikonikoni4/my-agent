@@ -14,6 +14,7 @@ from myagent.agent.core.session.types import (
     TurnEndData,
     CompactionEndData,
     CompactionSummaryData,
+    AgentGrantData,
 )
 
 
@@ -467,6 +468,48 @@ class TestLlmRetryCount:
         session = make_session(records)
         assert session.llm_retry_count(0) == 0
         assert session.llm_retry_count(1) == 0
+
+
+class TestGrantedSteps:
+    """测试 granted_steps：按 turn 求 agent/grant 记录的 steps 合计。
+
+    这是步数预算的账本折叠——loop 不持存预算，每轮判上限时现算
+    （配置基准 + 本 turn 授予合计）。
+    """
+
+    @pytest.mark.asyncio
+    async def test_empty_session_returns_zero(self, make_session):
+        """测试场景：没有任何授予记录时，预算增量为 0"""
+        session = make_session()
+        assert session.granted_steps(1) == 0
+
+    @pytest.mark.asyncio
+    async def test_sums_steps_within_turn(self, make_session):
+        """测试场景：同 turn 多条授予按 steps 求和，不是数记录条数"""
+        session = make_session()
+        session.append("turn/start", TurnStartData())
+        session.append("agent/grant", AgentGrantData(steps=5, reason="continue"))
+        session.append("agent/grant", AgentGrantData(steps=3, reason="continue"))
+        assert session.granted_steps(session.turn) == 8
+
+    @pytest.mark.asyncio
+    async def test_counts_only_requested_turn(self, make_session):
+        """测试场景：按 turn 过滤，上一轮的授予不计入本轮"""
+        session = make_session()
+        session.append("turn/start", TurnStartData())
+        session.append("agent/grant", AgentGrantData(steps=5, reason="continue"))
+        session.append("turn/start", TurnStartData())
+        assert session.granted_steps(session.turn) == 0
+        assert session.granted_steps(session.turn - 1) == 5
+
+    @pytest.mark.asyncio
+    async def test_ignores_other_types_in_same_turn(self, make_session):
+        """测试场景：同 turn 内的其他类型记录不计入，只算 agent/grant 的 steps"""
+        session = make_session()
+        session.append("turn/start", TurnStartData())
+        session.append("step/start", StepStartData())
+        session.append("agent/grant", AgentGrantData(steps=2, reason="continue"))
+        assert session.granted_steps(session.turn) == 2
 
 
 class TestCompactNotImplemented:

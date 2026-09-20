@@ -11,7 +11,7 @@ from myagent.agent.core.session.types import (
     AssistantChunkData,AssistantMessageData, StepEndData,
     ToolCallData,ToolResultData,TurnEndData,
     TurnStartData,StepStartData,UserMessageData,RequestHeaderData,
-    LLMRetryData,
+    LLMRetryData,AgentGrantData,
 )
 from myagent.agent.core.session.session import Session
 
@@ -34,7 +34,7 @@ LLM_CALL_TIMEOUT = 120
 ERROR_CHAIN_MAX_DEPTH = 3
 # 需要"继续下一轮"的决策；其余决策一律结束本 turn 的循环
 RETRY_DECISIONS = ("retry","backoff_retry")
-
+LOOP_CONTROL = ("continue","break")
 
 def _collect_error_lines(error:BaseException,lines:list,depth:int,indent:str) -> None:
     """把一个异常及其起因链展开成带缩进的多行文本，就地追加到 lines。
@@ -288,39 +288,44 @@ class ReActAgentLoop:
         # 步骤 3：记 error 日志（带堆栈），让循环的死亡在日志里可见
         logger.error(f"agent loop 任务异常终止：{exc!r}",exc_info=exc)
 
-    async def send(self,user_prompt : str | list,send_type : Literal["next_turn","next_step"]="next_turn"):
-        """向 loop 投递一条用户消息并唤醒循环。
+    def send(self) -> None:
+        """唤醒后台循环：按需启动 loop，然后置唤醒信号。**不碰收件箱。**
+
+        这是本 loop 的启动入口与唯一唤醒原语：循环停止（`cancel()` 或异常终止）后
+        再次调用会重启一个新的 `_loop` 任务；循环存活时复用旧任务，不重建。
+
+        只负责"把循环叫醒"，消息的入队交给 `followup` / `steer`——它们入队后各自
+        调用本方法收尾。故单独调用 `send()` 只是让空闲的循环空转一圈（收件箱为空，
+        消费不到东西就又睡下）。
 
         Args:
-            user_prompt: 字符串按单个文本块包装；列表按原样作为多模态 content。
-            send_type: 声明投递的队列类型；当前实现固定写入 next_turn，next_step 未生效。
+            无。
 
         Returns:
             None。
 
         Events:
-            无（只入队并置唤醒信号，TURN_START 等在 turn 内触发）。
+            无（唤醒本身不发事件；turn 内部的 TURN_START 等由 _loop 消费消息时触发）。
 
         Raises:
-            无。
+            无（`start()` 内部 create_task 需要运行中的事件循环，在无循环的同步上下文
+            调用会由 asyncio 抛 RuntimeError）。
         """
         # 步骤 1：循环未启动或已结束则先启动
         if self._task is None or self._task.done():
             self.start()
-        # 步骤 2：把 str 归一化为 content 块列表
-        content = [{"type":"text","text":user_prompt}] if isinstance(user_prompt,str) else user_prompt
-        # 步骤 3：入队并唤醒循环
-        self.inbox["next_turn"].append(Message(role= "user",content=content))
+        # 步骤 2：置唤醒信号，让挂在 wait() 上的 _loop 立刻回到消费循环
         self._wakeup.set()
 
-    def followup(self):
-        """占位接口：预留给「turn 进行中追加消息」，当前为空实现。
+    @staticmethod
+    def _to_user_message(user_prompt : str | list) -> Message:
+        """把用户输入归一化为 user 角色的消息（str 包成单个文本块，列表按原样作多模态）。
 
         Args:
-            无。
+            user_prompt: 字符串或 content 块列表。
 
         Returns:
-            None。
+            可直接入队的 Message。
 
         Events:
             无。
@@ -328,7 +333,60 @@ class ReActAgentLoop:
         Raises:
             无。
         """
-        pass
+        content = [{"type":"text","text":user_prompt}] if isinstance(user_prompt,str) else user_prompt
+        return Message(role= "user",content=content)
+
+    def followup(self,user_prompt : str | list) -> None:
+        """追加一条用户消息到队尾（本轮之后排队），并入队后唤醒循环。
+
+        语义是"跟在后面"：已有的排队消息（含此前 steer 的插队消息）都先于它被消费。
+        结尾自动调用 `send()`，故调用方无需再自己唤醒。
+
+        Args:
+            user_prompt: 字符串按单个文本块包装；列表按原样作为多模态 content。
+
+        Returns:
+            None。
+
+        Events:
+            无（只入队并唤醒；TURN_START 等在 _loop 消费到该消息时触发）。
+
+        Raises:
+            无。
+        """
+        # 步骤 1：入队——追加到队尾，保持先来先服务
+        self.inbox["next_turn"].append(self._to_user_message(user_prompt))
+        # 步骤 2：唤醒循环消费
+        self.send()
+
+    def steer(self,user_prompt : str | list) -> None:
+        """把一条用户消息插到队首（插队到下一条），并入队后唤醒循环。
+
+        与 `followup` 的唯一差别是落点：本方法插到 `next_turn` 第 0 位，故它先于
+        所有已排队的消息被消费。每次都插到第 0 位，因此连续 steer 是"后插先跑"。
+
+        **不打断在途的 turn**：正在跑的那一轮照常收尾，插队消息在它结束后的下一轮
+        才被消费；要立刻中断请用 `cancel()`（那会连同收件箱一起作废）。
+
+        理想用法：发生某些错误之后，需要向AI给出额外的提示，比如输出内容过长，出现截断错误，
+        这时候打断当前轮，然后给出提示
+
+        Args:
+            user_prompt: 字符串按单个文本块包装；列表按原样作为多模态 content。
+
+        Returns:
+            None。
+
+        Events:
+            无（只入队并唤醒；TURN_START 等在 _loop 消费到该消息时触发）。
+
+        Raises:
+            无。
+        """
+        # 步骤 1：入队——插到队首
+        self.inbox["next_turn"].insert(0,self._to_user_message(user_prompt))
+        # 步骤 2：唤醒循环消费
+        self.send()
 
     def persist_session_now(self):
         """立即把 session 落盘（磁盘错误静默，不影响主流程）。
@@ -485,6 +543,14 @@ class ReActAgentLoop:
             reasoning_content=message.reasoning_content,
         )
 
+    def _effective_step_limit(self) -> int:
+        """本 turn 的步数上限 = 配置基准 + 本 turn session里授予的额外步数。
+
+        预算不持存在 loop 的字段里，每次判上限时现算：授予由 hand_decision 落成
+        agent/grant 记录（见 _record_agent_grant），故崩溃恢复后重算结果不变。
+        """
+        return self.agent_config.step_limit + self._session.granted_steps(self._session.turn)
+
     async def step(self,user_message):
         """驱动一次「模型 → 工具 → 再模型」的循环，直到无工具调用或本轮被终止。
 
@@ -511,25 +577,25 @@ class ReActAgentLoop:
             每条 session.append 另会触发 session/event。
 
         Raises:
-            MaxStepsExceededError: 步数达到 agent_config.step_limit。
+            MaxStepsExceededError: 步数达到本 turn 的有效上限（配置基准 + session授予合计）。
             AgentUnclaimedError: request/error 无人认领该错误。
             RetryExhaustedError: 重试次数超过 agent_config.max_retry_count。
             asyncio.CancelledError: 取消，原样上抛。
             Exception: _ask_model / 工具执行 / session.append 抛出的其它异常原样上抛；
                 同批多个工具异常由 TaskGroup 包成 ExceptionGroup 抛出。
         """
-        step_count = 0
-
         while True:
             step_error = None
             step_opened = False
 
             try:
-                # 步骤 1：步数预算检查——开始前拒绝，故不会产生 step/end 配对问题
-                if step_count >= self.agent_config.step_limit:
-                    raise MaxStepsExceededError(f"达到最大步数{self.agent_config.step_limit}，强制终止本turn")
-                # 步骤 2：开步——计数、写 step/start、广播
-                step_count += 1
+                # 步骤 1：步数预算检查——开始前拒绝，故不会产生 step/end 配对问题。
+                # 判据现算自session，loop 不持存步数：已走步数即 session.step，
+                # 上限是配置基准 + 本 turn 授予合计
+                effective_limit = self._effective_step_limit()
+                if self._session.step >= effective_limit:
+                    raise MaxStepsExceededError(f"达到最大步数{effective_limit}，强制终止本turn")
+                # 步骤 2：开步——写 step/start、广播（session.step 随之自增）
                 self._session.append("step/start",StepStartData())
                 self._event_service.emit(STEP_START.name,StepStartPayload())
                 step_opened = True
@@ -561,9 +627,10 @@ class ReActAgentLoop:
                     reason_type,reason_text = self._step_end_reason(step_error)
                     self._session.append("step/end",StepEndData(reason_type=reason_type,reason_text=reason_text))
                     self._event_service.emit(STEP_END.name,StepEndPayload())
-                # 阶段 3：错误处理
+                # 阶段 3：错误处理——决策已归一为控制信号（见 LOOP_CONTROL 词表）；
+                # 只有 break 结束本 turn，continue 回到循环顶部走下一轮
                 decision = await self._handle_error(step_error)
-                if decision and decision not in RETRY_DECISIONS:
+                if decision != "continue":
                     break
 
     async def _tool_call(self,response:LLMResponse):
@@ -571,7 +638,7 @@ class ReActAgentLoop:
         async with asyncio.TaskGroup() as tg:
             tasks = []
             #tool_call_decision {call_id: {"decision": "deny", "reason": str}}，可能为空表。只装deny的
-            tool_call_decision:dict  = await self._event_service.waterfall(TOOL_CALL.name,ToolCallPayload(response.tool_call_requests)) or {}
+            tool_call_decision:dict  = await self._event_service.waterfall(TOOL_CALL.name,ToolCallPayload(response.tool_call_requests,self._session)) or {}
             for tool_call in response.tool_call_requests:
                 permission_passed = True
                 deny_reason = ""
@@ -751,26 +818,62 @@ class ReActAgentLoop:
         # 步骤 2：取消不进决策链，原样上抛
         if isinstance(step_error,asyncio.CancelledError):
             raise step_error
-        # 步骤 3：触发 request/error waterfall，取决策与退避策略
-        request_error_result = await self._event_service.waterfall(REQUEST_ERROR.name,RequestErrorPayLoad(error_type=step_error))
-        decision = (request_error_result or {}).get("decision",None)
-        # 步骤 4：无人认领——直接抛 AgentUnclaimedError（未重试，不落 llm/retry）
+        # 步骤 3：触发 request/error waterfall，取裁决值。返回值是无类型 dict，key 名
+        # 只在本点出现——在此拆成具名参数，下游不必再知道 dict 里有什么
+        verdict = await self._event_service.waterfall(REQUEST_ERROR.name,RequestErrorPayLoad(error_type=step_error)) or {}
+        # 步骤 4：集中处理 decision，最终返回 continue or break
+        return await self.hand_decision(
+            step_error,
+            decision = verdict.get("decision"),
+            policy   = verdict.get("policy"),
+            grant    = verdict.get("grant"),
+        )
+
+    async def hand_decision(self,step_error, decision, policy=None, grant=None) -> str:
+        """把 waterfall 的裁决落定成循环控制信号（取值见 LOOP_CONTROL）。
+
+        裁决携带的状态变更在此落地，而不是由订阅方直接改 loop 的状态：执行权留在
+        loop（只有它知道自己的运行态），订阅方只表达意图——grant 是"申请放宽 N 步
+        预算"，由本方法落成 agent/grant session记录，下轮判预算时现算（见
+        _effective_step_limit）。故 loop 不持存预算，也无需按错误类型二次判别。
+
+        Args:
+            step_error: 触发本次裁决的异常，用于记账与耗尽时的 from 链。
+            decision: waterfall 的决策值；None 表示无人认领。
+            policy: 退避参数（retry / backoff_retry 档消费）。
+            grant: 预算授予意图，形如 {"steps": N}；仅 continue 档消费。
+
+        Returns:
+            "continue"（走下一轮）或 "break"（结束本 turn）。
+
+        Events:
+            重试档经 _record_llm_retry 写 llm/retry；继续档带 grant 时经
+            _record_agent_grant 写 agent/grant（两者均另触发 session/event）。
+
+        Raises:
+            AgentUnclaimedError: decision 为 None，没有任何订阅方认领该错误。
+            RetryExhaustedError: 重试次数超过 agent_config.max_retry_count。
+        """
+        # 步骤 1：无人认领——直接抛 AgentUnclaimedError（未重试，不落 llm/retry）
         if decision is None:
             raise AgentUnclaimedError("无错误处理策略的错误") from step_error
-        # 步骤 5：非重试决策原样返回（调用方据此 break）
-        if decision not in RETRY_DECISIONS:
-            return decision
-        # 步骤 6：算本次重试序号 = 本轮已记录的 llm/retry 条数 + 1
-        attempt = self._session.llm_retry_count(self._session.turn) + 1
-        max_retry_count = self.agent_config.max_retry_count
-        # 步骤 7：超出上限——直接抛 RetryExhaustedError（未重试，不落 llm/retry）
-        if attempt > max_retry_count:
-            raise RetryExhaustedError(f"{max_retry_count}/{max_retry_count} 达到最大重试错误") from step_error
-        # 步骤 8：记账本次重试，按策略退避等待后返回决策（循环继续）
-        self._record_llm_retry(step_error,decision,attempt)
-        policy = RetryPolicy(**(request_error_result.get("policy") or {}))
-        await self.retry_delay(step_error,policy,attempt)
+        # 步骤 2：重试档——算序号、超限即抛、记账、按策略退避，然后继续
+        if decision in RETRY_DECISIONS:
+            attempt = self._session.llm_retry_count(self._session.turn) + 1
+            max_retry_count = self.agent_config.max_retry_count
+            if attempt > max_retry_count:
+                raise RetryExhaustedError(f"{max_retry_count}/{max_retry_count} 达到最大重试错误") from step_error
+            self._record_llm_retry(step_error,decision,attempt)
+            await self.retry_delay(step_error,RetryPolicy(**(policy or {})),attempt)
+            return "continue"
+        # 步骤 3：继续档——把授予的预算落成session事实，再继续
+        if decision == "continue":
+            if grant:
+                self._record_agent_grant(step_error,decision,grant)
+            return "continue"
+        # 步骤 4：其余（break）原样作为控制信号
         return decision
+
 
     def _record_llm_retry(self,error,decision:str,attempt:int) -> None:
         """落一条 llm/retry 记录：第几次重试、因何决策、触发它的错误本身。
@@ -798,6 +901,34 @@ class ReActAgentLoop:
             reason=decision,
             error_type=type(error).__name__,
             error_message=_format_error_chain(error),
+        ))
+
+    def _record_agent_grant(self,error,decision:str,grant:dict) -> None:
+        """落一条 agent/grant：本次授予多少步、因何决策、触发它的错误。
+
+        只在真正放宽预算时调用——该类型记录的 steps 合计是后续每轮判预算的依据
+        （`Session.granted_steps`），故 break / 无人认领这类"未授予"的收尾不得写入。
+        与 _record_llm_retry 对仗：发生点记账，session即事实。
+
+        Args:
+            error: 触发本次授予的异常，用于记录错误类名。
+            decision: 触发本次授予的决策（continue）。
+            grant: 授予意图，形如 {"steps": N}。
+
+        Returns:
+            None。
+
+        Events:
+            写 agent/grant 记录（经 session 触发 session/event）。
+
+        Raises:
+            KeyError: grant 缺 steps 字段——决策方给的形状不对，不静默按 0 记账。
+        """
+        # 步骤 1：把本次授予落成一条可结构化查询的记录
+        self._session.append("agent/grant",AgentGrantData(
+            steps=grant["steps"],
+            reason=decision,
+            error_type=type(error).__name__,
         ))
 
     async def retry_delay(self,error,policy:RetryPolicy,attempt:int)->float:
