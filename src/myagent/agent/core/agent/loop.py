@@ -785,13 +785,17 @@ class ReActAgentLoop:
             ))
 
     async def _handle_error(self,step_error):
-        """本轮的处置决策：返回决策值供循环判断是否继续；None 表示本轮无错误。
+        """本轮的处置决策：返回控制信号（continue / break）供循环判断是否继续。
+
+        无错也归一为 "continue"——调用方只认 continue 才继续，故不能用 None 表示
+        "无错"（那会被判成终止）。
 
         - 取消：原样上抛（由 _loop / 上层收尾），不进入决策链
         - 无决策（无人认领）：抛 AgentUnclaimedError（from 原错误）
         - retry / backoff_retry：按策略退避等待后返回决策（循环继续）
         - 重试次数耗尽：抛 RetryExhaustedError（from 最后一次错误）
-        - 其它决策：原样返回（循环走 break；语义未定，见 docs/known-limitations）
+        - continue：放宽预算（带 grant 时）后返回决策（循环继续）
+        - 其它决策（break）：返回控制信号；带 as_error 时原样上抛原错误
 
         只有"决定重试"的那次在发生点落一条 llm/retry：它既是"第几次重试"的事实，也是
         下轮 attempt 的计数来源（llm_retry_count 按该记录条数统计）。无人认领与耗尽都不
@@ -801,7 +805,7 @@ class ReActAgentLoop:
             step_error: 本步异常；None 表示本轮无错。
 
         Returns:
-            None（无错），或决策值（retry / backoff_retry / 其它）供调用方判断是否继续。
+            控制信号："continue"（无错，或退避/放宽预算后继续）或 "break"（终止本 turn）。
 
         Events:
             触发 REQUEST_ERROR（waterfall，向策略注册表取 decision / policy）；
@@ -812,9 +816,9 @@ class ReActAgentLoop:
             AgentUnclaimedError: request/error 返回的 decision 为 None（无人认领）。
             RetryExhaustedError: attempt 超过 agent_config.max_retry_count。
         """
-        # 步骤 1：无错直接返回 None
+        # 步骤 1：无错即继续（调用方的判据是 != "continue" 才终止，故不能返回 None）
         if step_error is None:
-            return None
+            return "continue"
         # 步骤 2：取消不进决策链，原样上抛
         if isinstance(step_error,asyncio.CancelledError):
             raise step_error
@@ -827,9 +831,10 @@ class ReActAgentLoop:
             decision = verdict.get("decision"),
             policy   = verdict.get("policy"),
             grant    = verdict.get("grant"),
+            as_error = verdict.get("as_error", False),
         )
 
-    async def hand_decision(self,step_error, decision, policy=None, grant=None) -> str:
+    async def hand_decision(self,step_error, decision, policy=None, grant=None, as_error:bool = False) -> str:
         """把 waterfall 的裁决落定成循环控制信号（取值见 LOOP_CONTROL）。
 
         裁决携带的状态变更在此落地，而不是由订阅方直接改 loop 的状态：执行权留在
@@ -837,11 +842,16 @@ class ReActAgentLoop:
         预算"，由本方法落成 agent/grant session记录，下轮判预算时现算（见
         _effective_step_limit）。故 loop 不持存预算，也无需按错误类型二次判别。
 
+        as_error 区分"终止"的两种强度：不带则只跳出本 turn（不抛，本 turn 按正常
+        收尾记账，循环照常活着等下一句）；带上则把这次终止如实上报——原错误原样
+        上抛，turn 据此记 error + 异常链，异常冒泡出 _loop 使后台循环一并停止。
+
         Args:
             step_error: 触发本次裁决的异常，用于记账与耗尽时的 from 链。
             decision: waterfall 的决策值；None 表示无人认领。
             policy: 退避参数（retry / backoff_retry 档消费）。
             grant: 预算授予意图，形如 {"steps": N}；仅 continue 档消费。
+            as_error: 终止档是否按失败上报，见上。
 
         Returns:
             "continue"（走下一轮）或 "break"（结束本 turn）。
@@ -853,6 +863,7 @@ class ReActAgentLoop:
         Raises:
             AgentUnclaimedError: decision 为 None，没有任何订阅方认领该错误。
             RetryExhaustedError: 重试次数超过 agent_config.max_retry_count。
+            BaseException: as_error 为真时，原样抛出 step_error。
         """
         # 步骤 1：无人认领——直接抛 AgentUnclaimedError（未重试，不落 llm/retry）
         if decision is None:
@@ -871,7 +882,9 @@ class ReActAgentLoop:
             if grant:
                 self._record_agent_grant(step_error,decision,grant)
             return "continue"
-        # 步骤 4：其余（break）原样作为控制信号
+        # 步骤 4：其余（break）原样作为控制信号；as_error 声明"这次终止按失败上报"
+        if as_error:
+            raise step_error
         return decision
 
 

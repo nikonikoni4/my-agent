@@ -33,7 +33,8 @@ P5  用户取消（模型调用挂起）→ step/end、turn/end 记 interrupted�
 P6  达到 step_limit → MaxStepsExceededError 无人认领 → AgentUnclaimedError（cause 为前者）
 P6b 达到 step_limit 且订阅方授予额外步数 → 落 agent/grant，预算抬高后继续执行
 P6c 每步都触顶：每次授予各落一条，预算是授予的合计（按 steps 求和，不是数条数）
-P6d 触顶后订阅方给 break → 不落授予记录，本 turn 就此收束
+P6d 触顶后订阅方给 break → 不落授予记录，跳出本 turn 但循环继续
+P6e 触顶后 break 带 as_error → 原样上抛该错误，turn 记 error（与 P6d 相区别）
 P7  LLM 调用超时（TimeoutError）→ 无人认领 → AgentUnclaimedError
 P8  401 认证失败（配置类错误，策略表不再覆盖）→ 无人认领 → AgentUnclaimedError，不等待
 P9  429 限流 backoff_retry → 记 llm/retry + 退避；超限 → RetryExhaustedError（cause 为限流）
@@ -698,7 +699,7 @@ async def test_P6c_每次触顶各授予一次_按合计抬高预算():
 @pytest.mark.asyncio
 async def test_P6d_触顶后选break_不落授予记录():
     """触顶后订阅方给出 break：不落 agent/grant（未放宽预算就不该记账），
-    本 turn 就此收束，不上抛"""
+    只是跳出本 turn——不抛异常，循环照常活着等下一句"""
     script = [tool_round(f"c{i}") for i in range(3)]
     loop, provider, session = make_loop(script, tools=OkTool(), step_limit=2)
 
@@ -712,6 +713,31 @@ async def test_P6d_触顶后选break_不落授予记录():
     assert provider.calls == 2, "break 后不再继续开步"
     assert records(session, "agent/grant") == [], "未放宽预算就不落授予记录"
     assert session.granted_steps(session.turn) == 0
+
+
+@pytest.mark.asyncio
+async def test_P6e_触顶后break带as_error_原样上抛并记error():
+    """break 带上 as_error：不只是跳出本 turn，而是把这次终止如实上报——原错误
+    原样上抛（不包成 AgentUnclaimedError），turn/end 记 error 且 error_type 为
+    原错误类名。与 P6d 那条只跳出、循环继续的 break 相区别"""
+    script = [tool_round(f"c{i}") for i in range(3)]
+    loop, provider, session = make_loop(script, tools=OkTool(), step_limit=2)
+
+    async def abandon(payload, nxt):
+        return {"decision": "break", "as_error": True}
+
+    loop._event_service.register(REQUEST_ERROR.name, abandon)
+
+    with pytest.raises(MaxStepsExceededError) as excinfo:
+        await loop.turn(user_message())
+
+    assert isinstance(excinfo.value, MaxStepsExceededError), "原样上抛，不包成无人认领"
+    assert provider.calls == 2, "终止于触顶那一轮，不再开步"
+    assert records(session, "agent/grant") == [], "未放宽预算就不落授予记录"
+    turn_end = last(session, "turn/end")
+    assert turn_end.data.reason_type == "error"
+    assert turn_end.data.error_type == "MaxStepsExceededError"
+    assert "达到最大步数" in turn_end.data.reason_text
 
 
 # ===========================================================================

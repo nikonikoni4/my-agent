@@ -11,7 +11,11 @@ import asyncio
 
 import pytest
 
-from myagent.agent.execption import LLMRateLimitError, MaxStepsExceededError
+from myagent.agent.execption import (
+    LLMRateLimitError,
+    MaxStepsExceededError,
+    ToolConsecutiveFailureError,
+)
 from myagent.agent.hitl.hitl import HITL
 from myagent.agent.hitl.types import HumanReturn
 from myagent.infra.events.payload import RequestErrorPayLoad
@@ -93,3 +97,85 @@ async def test_人类不回应_超时按break收束():
     result = await hitl.maxstep_continue(error_payload(MaxStepsExceededError("超限")), _next)
 
     assert result == {"decision": "break"}
+
+
+# ---------------------------------------------------------------------------
+# 工具熔断：raise_on_break 配置下 ToolRegister 抛出 ToolConsecutiveFailureError
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_熔断_非熔断错误委托下游():
+    """限流之类的错误不归熔断处理管：await 委托下游，不弹窗"""
+    channel = ScriptedChannel("continue")
+    hitl = HITL(channel)
+    calls, _next = make_next()
+
+    result = await hitl.tool_breaker_continue(error_payload(LLMRateLimitError("429")), _next)
+
+    assert result == {"decision": "retry"}
+    assert calls == [1]
+    assert channel.asked == []
+
+
+@pytest.mark.asyncio
+async def test_熔断_裸异常被认领():
+    """熔断错直接上抛时被认领，选"继续"→ continue（不带 grant：熔断与步数预算无关）"""
+    channel = ScriptedChannel("continue")
+    hitl = HITL(channel)
+    _, _next = make_next()
+
+    result = await hitl.tool_breaker_continue(
+        error_payload(ToolConsecutiveFailureError("连续失败 3 次触发熔断")), _next
+    )
+
+    assert result == {"decision": "continue"}
+    assert len(channel.asked) == 1
+
+
+@pytest.mark.asyncio
+async def test_熔断_包在ExceptionGroup里仍被认领():
+    """关键：熔断错与同批其他异常一起时被 TaskGroup 包成 ExceptionGroup 上抛，
+    payload.error_type 是 group 而非熔断错本身——仍须认领"""
+    channel = ScriptedChannel("continue")
+    hitl = HITL(channel)
+    _, _next = make_next()
+    group = ExceptionGroup("批失败", [
+        ToolConsecutiveFailureError("连续失败 3 次触发熔断"),
+        RuntimeError("同批另一个工具炸了"),
+    ])
+
+    result = await hitl.tool_breaker_continue(error_payload(group), _next)
+
+    assert result == {"decision": "continue"}
+    assert len(channel.asked) == 1, "group 里含熔断错即认领"
+    assert "熔断" in channel.asked[0].content
+
+
+@pytest.mark.asyncio
+async def test_熔断_不含熔断错的group委托下游():
+    """非熔断的 ExceptionGroup（TaskGroup 包的普通工具异常）不认领，委托下游"""
+    channel = ScriptedChannel("continue")
+    hitl = HITL(channel)
+    calls, _next = make_next()
+    group = ExceptionGroup("批失败", [RuntimeError("甲")])
+
+    result = await hitl.tool_breaker_continue(error_payload(group), _next)
+
+    assert result == {"decision": "retry"}
+    assert calls == [1]
+    assert channel.asked == []
+
+
+@pytest.mark.asyncio
+async def test_熔断_选取消_终止并按失败上报():
+    """人类选"取消"：熔断意味着该工具本轮不可用，终止并如实上报——
+    break 带 as_error，使 turn 记 error 而非 success"""
+    hitl = HITL(ScriptedChannel("break"))
+    _, _next = make_next()
+
+    result = await hitl.tool_breaker_continue(
+        error_payload(ToolConsecutiveFailureError("熔断")), _next
+    )
+
+    assert result == {"decision": "break", "as_error": True}

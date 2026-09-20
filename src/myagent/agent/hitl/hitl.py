@@ -2,7 +2,7 @@ import asyncio
 
 from myagent.agent.hitl.base import HITLChannel
 from myagent.agent.hitl.types import HumanChoice,HITLMessage,HumanReturn
-from myagent.agent.execption import MaxStepsExceededError
+from myagent.agent.execption import MaxStepsExceededError,ToolConsecutiveFailureError
 from myagent.infra.events.payload import RequestErrorPayLoad
 class HITL:
     """
@@ -66,3 +66,45 @@ class HITL:
                 return {"decision": "break"}
         except asyncio.TimeoutError:
             return {"decision": "break"}
+
+    async def tool_breaker_continue(self,payload:RequestErrorPayLoad,_next:callable):
+        """工具熔断的处置：raise_on_break 配置下，单个工具连续失败达阈值时
+        ToolRegister 抛 ToolConsecutiveFailureError——含义是"该工具已不可用、
+        需要外部介入"，故交人工决定这一步怎么走。
+
+        错误形状要注意：熔断错与同批其他工具异常一起时，TaskGroup 会把它包成
+        ExceptionGroup 上抛，payload.error_type 未必是熔断错本身，故先展开再判
+        （见 _is_tool_breaker）。
+
+        不管辖的错误必须 await 委托给链上下一个订阅方（见契约文档）。裁决的形状是
+        "意图"而非"动作"：订阅方不直接改 loop 的状态，只表达 decision；终止是否按
+        失败上报由 as_error 声明（见 ReActAgentLoop.hand_decision）。
+        """
+        if not self._is_tool_breaker(payload.error_type):
+            return await _next()
+        message = HITLMessage(
+            human_return_type="single-select",
+            content="工具连续失败已触发熔断，本轮内该工具不可用，选择：",
+            choices=[
+                HumanChoice("继续","continue","继续当前指令；熔断状态到本轮结束才复位，模型须改用其他工具"),
+                HumanChoice("取消","break","终止当前执行，本轮按失败收尾"),
+            ]
+        )
+        try:
+            result : HumanReturn =await asyncio.wait_for(self.channel.ask_human(message),self.timeout)
+            if result.choice_id == "continue":
+                return {"decision": "continue"}
+            return {"decision": "break","as_error": True}
+        except asyncio.TimeoutError:
+            return {"decision": "break","as_error": True}
+
+    @staticmethod
+    def _is_tool_breaker(error) -> bool:
+        """判断错误是否（含嵌套地）为工具熔断错。
+
+        TaskGroup 会把同批工具异常连同熔断错一起包成 ExceptionGroup，故群组要递归
+        展开——只看最外层会把"包着的熔断"当成不认识的错误放过去。
+        """
+        if isinstance(error,BaseExceptionGroup):
+            return any(HITL._is_tool_breaker(child) for child in error.exceptions)
+        return isinstance(error,ToolConsecutiveFailureError)
