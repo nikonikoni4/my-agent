@@ -1,8 +1,8 @@
 """假 agent 与假 session 文件：让用例级测试不碰 LLM。
 
-`FakeAgent` 只暴露 driver 真正用到的那几样（`_event_service` / `_session` / `send` /
+`FakeAgent` 只暴露 driver 真正用到的那几样（`_event_service` / `_session` / `followup` /
 `persist_session_now` / `cancel`）；`FileFakeAgent` 额外把 session 落成真文件，用来验
-「跑完复制改名」；`WriteFakeAgent` 在 send 时按回调往数据根写东西（模拟落库 / 落盘）；
+「跑完复制改名」；`WriteFakeAgent` 在 followup 时按回调往数据根写东西（模拟落库 / 落盘）；
 `TurnEndAgent` 可以让某一轮以 error / interrupted 收场。
 """
 
@@ -43,7 +43,7 @@ class FakeAgent:
         self.persisted = False
         self.cancelled = False
 
-    async def send(self, text: str) -> None:
+    def followup(self, text: str) -> None:
         self.sent.append(text)
         if not self.emit_events:
             return
@@ -65,15 +65,15 @@ class FakeAgent:
 
 
 class FileFakeAgent(FakeAgent):
-    """在 send 时落一个真实 session 文件（模拟 SessionPresist 的行为）。"""
+    """在 followup 时落一个真实 session 文件（模拟 SessionPresist 的行为）。"""
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self.data_path: Path | None = None
         self.session_folder: Path | None = None
 
-    async def send(self, text: str) -> None:
-        await super().send(text)
+    def followup(self, text: str) -> None:
+        super().followup(text)
         path = session_file_path(
             self.data_path, self.session_folder, self._session.meta_data.session_id
         )
@@ -82,7 +82,7 @@ class FileFakeAgent(FakeAgent):
 
 
 class WriteFakeAgent(FileFakeAgent):
-    """在 send 时按回调往数据根写东西：模拟「被测 agent 真的落库 / 落盘」。
+    """在 followup 时按回调往数据根写东西：模拟「被测 agent 真的落库 / 落盘」。
 
     为什么要它：基线是在跑用例**之前**打的（case.py 的 a 步），所以测试里的写入必须
     发生在跑的过程中，而不是跑之前就把环境改好——那是「先改好再打基线」，改动会被
@@ -93,8 +93,8 @@ class WriteFakeAgent(FileFakeAgent):
         super().__init__(**kwargs)
         self.write = write
 
-    async def send(self, text: str) -> None:
-        await super().send(text)
+    def followup(self, text: str) -> None:
+        super().followup(text)
         self.write(self.data_path)
 
 
@@ -113,7 +113,7 @@ class TurnEndAgent(FileFakeAgent):
         self.reason_text = reason_text
         self.error_type = error_type
 
-    async def send(self, text: str) -> None:
+    def followup(self, text: str) -> None:
         """自己发事件（而非沿用父类恒为 success 的终态），使 collector 与落盘一致。"""
         self.sent.append(text)
         self._emit(

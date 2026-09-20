@@ -210,13 +210,13 @@ def test_等不到turn_end时超时收口(tmp_path) -> None:
 
 def test_发送异常时仍然flush并cancel(tmp_path) -> None:
     class BoomAgent(FakeAgent):
-        async def send(self, text: str) -> None:
-            raise RuntimeError("send 挂了")
+        def followup(self, text: str) -> None:
+            raise RuntimeError("followup 挂了")
 
     agent = BoomAgent()
     _, result = run_case(tmp_path, agent=agent)
 
-    assert "send 挂了" in result["error"]
+    assert "followup 挂了" in result["error"]
     assert agent.persisted is True and agent.cancelled is True
 
 

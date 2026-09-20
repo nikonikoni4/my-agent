@@ -174,7 +174,7 @@ async def test_单轮_真实LLM完整链路_保存与还原(tmp_path):
     project_path = tmp_path / "proj"
     agent_loop, session, store = build_agent(tmp_path / "sessions", project_path, "e2e单轮链路")
 
-    await agent_loop.send(SINGLE_TURN_PROMPT)
+    agent_loop.followup(SINGLE_TURN_PROMPT)
     # 收尾：强制把 buffer 里剩余记录（工具结果、step/end、turn/end 等）落盘
     session.presistence.presist()
 
@@ -258,7 +258,7 @@ async def test_多轮_跨轮上下文与session累积(tmp_path):
     # ---- 逐轮对话：每轮前后对比消息面，验证历史只增不改 ----
     for i, prompt in enumerate(MULTI_TURN_PROMPTS, 1):
         before = session.derive_messages()
-        await agent_loop.send(prompt)
+        agent_loop.followup(prompt)
         # 每轮结束强制把剩余记录（工具结果、step/end、turn/end 等）落盘
         session.presistence.presist()
         after = session.derive_messages()

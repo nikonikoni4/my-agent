@@ -124,9 +124,9 @@ class CaseContext:
 class TurnCollector:
     """订阅 session/event，等待 turn/end 并收集 assistant 正文。
 
-    `ReActAgentLoop.send()` 只是把消息入队，turn 在后台跑；完成信号是 session 记录里的
-    `turn/end`（session 每次 append 都会触发 session/event）。
-    用法：`expect_turn()` → `send()` → `await wait_turn(timeout)`。
+    `ReActAgentLoop.followup()` 只是把消息入队并唤醒，turn 在后台跑；完成信号是 session
+    记录里的 `turn/end`（session 每次 append 都会触发 session/event）。
+    用法：`expect_turn()` → `followup()` → `await wait_turn(timeout)`。
 
     注意：EventService 以弱引用持有回调，本实例必须由调用方强引用（driver 内为局部变量）。
     """
@@ -445,7 +445,7 @@ class CaseExecutor:
         # 该用例只剩 error，i~j（裁判 / 统计）不执行。待统一：超时也应走
         # 「运行未正常结束」收口，照样落证据与统计。
         collector.expect_turn()
-        await agent.send(text)
+        agent.followup(text)
         try:
             await collector.wait_turn(ctx.turn_timeout)
         except asyncio.TimeoutError as e:

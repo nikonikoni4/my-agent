@@ -243,7 +243,7 @@ class LoopFixture:
 
         # EventService 弱引用持有回调：具名局部函数在测试期间存活，弱引用有效
         self.event_service.register(TURN_END.name, on_turn_end)
-        await self.loop.send(prompt, "next_turn")
+        self.loop.followup(prompt)
         await asyncio.wait_for(done.wait(), timeout=10)
 
 

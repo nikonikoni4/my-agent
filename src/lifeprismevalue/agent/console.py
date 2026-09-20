@@ -140,7 +140,7 @@ async def _main() -> None:
                 agent.cancel()
                 print("[console] 已取消当前输出，可继续输入")
                 continue
-            await agent.send(line)
+            agent.followup(line)
     finally:
         agent.cancel()
         print("已退出控制台")
