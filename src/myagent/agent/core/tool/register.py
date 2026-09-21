@@ -319,11 +319,11 @@ class ToolRegister:
                 error_type=ToolErrorType.Permission_Denied,
                 duration_ms = int((time.perf_counter() - started) * 1000)
             )
-            tool = self._tools[call.name]
-            if result.is_error:
+            # 护栏按硬编码工具名表拦截、不看注册表：工具已 unregister 而模型仍
+            # 调用时这里查不到，跳过计数（无熔断对象，同 TOOL_NOT_FOUND 语义）
+            tool = self._tools.get(call.name)
+            if tool is not None:
                 self._on_failure(tool, result)
-            else:
-                self._consecutive_failures[tool.name] = 0
             return result
         result = await self._execute(call)
         result.duration_ms = int((time.perf_counter() - started) * 1000)
