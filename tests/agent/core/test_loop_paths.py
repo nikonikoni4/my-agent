@@ -35,6 +35,7 @@ P6b 达到 step_limit 且订阅方授予额外步数 → 落 agent/grant，预�
 P6c 每步都触顶：每次授予各落一条，预算是授予的合计（按 steps 求和，不是数条数）
 P6d 触顶后订阅方给 break → 不落授予记录，跳出本 turn 但循环继续
 P6e 触顶后 break 带 as_error → 原样上抛该错误，turn 记 error（与 P6d 相区别）
+P6f 触顶后 break 不带 as_error → 被策略停下：turn 记 interrupted（非 success）
 P7  LLM 调用超时（TimeoutError）→ 无人认领 → AgentUnclaimedError
 P8  401 认证失败（配置类错误，策略表不再覆盖）→ 无人认领 → AgentUnclaimedError，不等待
 P9  429 限流 backoff_retry → 记 llm/retry + 退避；超限 → RetryExhaustedError（cause 为限流）
@@ -54,6 +55,9 @@ R5  turn/end 的 error_type 承载"终止本 turn 的类别"（成功空串 / �
     原错误只留在 reason_text 链里
 R6  无人认领时类别也可查：error_type=AgentUnclaimedError，cause 在 reason_text 链中
 R7  tool/call 的 arguments 按拿到时的形态落盘：解析成功的存 dict、未解析的存原文
+R8  每走一次 request/error 都落一条 agent/error-handle（含无人认领的 "unclaimed"）：
+    错误类型 + 决策 + 异常链文本；超限那轮没有 step/end，它是唯一留痕
+R9  agent/error-handle（处置口径）与 llm/retry（重试次数口径）是两条独立记录
 
 请求组装的用例（System Prompt / System Reminder / runtime context 的落点）见文件末尾"请求组装"一节。
 
@@ -740,6 +744,27 @@ async def test_P6e_触顶后break带as_error_原样上抛并记error():
     assert "达到最大步数" in turn_end.data.reason_text
 
 
+@pytest.mark.asyncio
+async def test_P6f_触顶后break不带as_error_turn记interrupted():
+    """触发触顶后订阅方给 break 但不带 as_error：这轮是被策略停下的，不是正常
+    完成——turn 记 interrupted（与 P6d 那个记 success 的旧行为相区别），
+    且 reason_text 指认是哪个错误引发的终止"""
+    script = [tool_round(f"c{i}") for i in range(3)]
+    loop, provider, session = make_loop(script, tools=OkTool(), step_limit=2)
+
+    async def deny(payload, nxt):
+        return {"decision": "break"}
+
+    loop._event_service.register(REQUEST_ERROR.name, deny)
+
+    await loop.turn(user_message())
+
+    turn_end = last(session, "turn/end")
+    assert turn_end.data.reason_type == "interrupted", "策略终止不是成功"
+    assert turn_end.data.reason_text == "策略终止：MaxStepsExceededError"
+    assert turn_end.data.error_type == ""
+
+
 # ===========================================================================
 # 终止出口：异常上抛（step/turn 均先归一化终态）
 # ===========================================================================
@@ -1049,6 +1074,42 @@ async def test_R7_tool_call的arguments按解析结果存形态():
         {"city": "北京"},
         '{"city": "北京"',
     ]
+
+
+@pytest.mark.asyncio
+async def test_R8_每次错误处置都落error_handle():
+    """超限无人认领：落一条 agent/error-handle，decision 记 "unclaimed"，带上错误
+    类型与异常链文本。超限那轮在开步前就被拒、没有 step/end，此记录是唯一留痕"""
+    script = [tool_round(f"c{i}") for i in range(3)]
+    loop, provider, session = make_loop(script, tools=OkTool(), step_limit=2)
+
+    with pytest.raises(AgentUnclaimedError):
+        await loop.turn(user_message())
+
+    handles = session.error_handles(session.turn)
+    assert len(handles) == 1, "一次错误处置落一条"
+    assert handles[0].error_type == "MaxStepsExceededError"
+    assert handles[0].decision == "unclaimed"
+    assert "达到最大步数" in handles[0].error_message
+
+
+@pytest.mark.asyncio
+async def test_R9_处置记录与重试记录是两条独立事实():
+    """限流重试：llm/retry 记"第几次重试"（次数口径），agent/error-handle 记
+    "这个错误被怎么处置了"（处置口径）——同一件事的两个面，各落各的"""
+    strategy = LLMRerty()
+    script = [LLMRateLimitError("429 限流"), LLMResponse(content="成功", usage=Usage())]
+    loop, provider, session = make_loop(script, max_retry_count=3, retry_strategy=strategy)
+    install_recording_delay(loop)
+
+    await loop.turn(user_message())
+
+    handles = session.error_handles(session.turn)
+    assert [(h.error_type, h.decision) for h in handles] == [
+        ("LLMRateLimitError", "backoff_retry")
+    ]
+    assert session.llm_retry_count(session.turn) == 1
+    assert last(session, "turn/end").data.reason_type == "success", "重试后收敛即正常完成"
 
 
 # ===========================================================================

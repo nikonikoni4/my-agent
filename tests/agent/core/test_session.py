@@ -15,6 +15,7 @@ from myagent.agent.core.session.types import (
     CompactionEndData,
     CompactionSummaryData,
     AgentGrantData,
+    AgentErrorHandleData,
 )
 
 
@@ -510,6 +511,56 @@ class TestGrantedSteps:
         session.append("step/start", StepStartData())
         session.append("agent/grant", AgentGrantData(steps=2, reason="continue"))
         assert session.granted_steps(session.turn) == 2
+
+
+class TestErrorHandles:
+    """测试 error_handles：按 turn 拉取 agent/error-handle 的 data 列表（落盘序）。
+
+    turn 的终态就取自这个列表的最后一条（见 ReActAgentLoop._resolve_reason_type），
+    故"按落盘顺序"本身是契约的一部分，不只是实现细节。
+    """
+
+    @pytest.mark.asyncio
+    async def test_empty_session_returns_empty(self, make_session):
+        """测试场景：没有任何处置记录时返回空列表"""
+        session = make_session()
+        assert session.error_handles(1) == []
+
+    @pytest.mark.asyncio
+    async def test_returns_data_in_order(self, make_session):
+        """测试场景：同 turn 多条按落盘顺序返回，且拿到的是 data 本身"""
+        session = make_session()
+        session.append("turn/start", TurnStartData())
+        session.append("agent/error-handle",
+                       AgentErrorHandleData(error_type="MaxStepsExceededError", decision="continue"))
+        session.append("agent/error-handle",
+                       AgentErrorHandleData(error_type="LLMRateLimitError", decision="backoff_retry"))
+        handles = session.error_handles(session.turn)
+        assert [h.error_type for h in handles] == ["MaxStepsExceededError", "LLMRateLimitError"]
+        assert [h.decision for h in handles] == ["continue", "backoff_retry"]
+
+    @pytest.mark.asyncio
+    async def test_counts_only_requested_turn(self, make_session):
+        """测试场景：按 turn 过滤，上一轮的处置记录不混入本轮"""
+        session = make_session()
+        session.append("turn/start", TurnStartData())
+        session.append("agent/error-handle",
+                       AgentErrorHandleData(error_type="A", decision="break"))
+        prev_turn = session.turn
+        session.append("turn/start", TurnStartData())
+        assert session.error_handles(session.turn) == []
+        assert len(session.error_handles(prev_turn)) == 1
+
+    @pytest.mark.asyncio
+    async def test_ignores_other_types_in_same_turn(self, make_session):
+        """测试场景：同 turn 内的其他类型记录不混入（只认 agent/error-handle）"""
+        session = make_session()
+        session.append("turn/start", TurnStartData())
+        session.append("step/start", StepStartData())
+        session.append("agent/grant", AgentGrantData(steps=2, reason="continue"))
+        session.append("agent/error-handle",
+                       AgentErrorHandleData(error_type="A", decision="continue"))
+        assert [h.error_type for h in session.error_handles(session.turn)] == ["A"]
 
 
 class TestCompactNotImplemented:

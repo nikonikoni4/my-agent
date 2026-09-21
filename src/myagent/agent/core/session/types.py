@@ -283,3 +283,22 @@ class AgentGrantData(SessionData):
     steps : int # 本次授予的额外步数
     reason : str # 触发本次授予的决策（continue）
     error_type : str = "" # 触发本次授予的错误类名
+
+
+@dataclass
+class AgentErrorHandleData(SessionData):
+    """agent/error-handle：一次错误处置的记录（什么错误、被处置成了什么）。
+
+    每走到一次 request/error 都先写一条，**无论订阅方是否认领**——它既是"这个错误
+    被谁怎么处置了"的唯一留痕，也是 turn 判定终态的依据（Session.error_handles）。
+
+    为什么无人认领也写：落盘放在 hand_decision 之前，才能让 as_error 上抛与无人
+    认领上抛这两条路径同样留下记录——恰恰是最该留痕的两种情况。
+
+    as_error 只对终止档（break）有意义：它区分"只是停下"与"停下并按失败上报"，
+    读回记录推终态时靠的就是这一位（见 ReActAgentLoop._resolve_reason_type）。
+    """
+    error_type : str # 触发本次处置的错误类名
+    decision : str # waterfall 的原始决策；无人认领记 "unclaimed"
+    as_error : bool = False # 终止档是否声明按失败上报
+    error_message : str = "" # 触发本次处置的错误信息（异常链文本）

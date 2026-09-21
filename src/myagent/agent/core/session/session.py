@@ -3,7 +3,7 @@ from myagent.agent.core.session.types import (
     SessionMetaData,SessionData,AssistantChunkData,AssistantMessageData, StepEndData,CompactionStartData,
     SessionRecordData,ToolCallData,ToolResultData,TurnEndData,CompactionSummaryData,
     TurnStartData,StepStartData,UserMessageData,RequestHeaderData,CompactionEndData,LLMRetryData,
-    AgentGrantData
+    AgentGrantData,AgentErrorHandleData
 )
 from myagent.infra.events.service import EventService
 from myagent.infra.events.eventspec import SESSION_EVENT,SessionEventPayload
@@ -33,7 +33,8 @@ class Session:
         "compaction/summary": CompactionSummaryData,
         "compaction/end": CompactionEndData,
         "llm/retry" : LLMRetryData,
-        "agent/grant": AgentGrantData
+        "agent/grant": AgentGrantData,
+        "agent/error-handle": AgentErrorHandleData
     }
 
     # 信封上 step 记为 None 的事件：不属于任何 step（轮边界事件与压缩事务）
@@ -110,6 +111,21 @@ class Session:
             for record in self.record_list
             if record.turn == turn and record.type == "agent/grant"
         )
+
+    def error_handles(self, turn: int) -> list[AgentErrorHandleData]:
+        """按 turn 拉取 agent/error-handle 的 data 列表，保持落盘顺序。
+
+        顺序是本接口契约的一部分：turn 的终态取自**最后一条**（前面的历史处置不该
+        影响这一轮怎么收场），所以调用方要靠"最后一条是最新的"这一点定位。
+
+        与 granted_steps / llm_retry_count 同源——都是从账本事实折叠出运行态信息，
+        只是这里要整段历史而非一个聚合值。该 turn 无处置记录时返回空列表。
+        """
+        return [
+            record.data
+            for record in self.record_list
+            if record.turn == turn and record.type == "agent/error-handle"
+        ]
 
     def _build_record(self,data:SessionData,event_type,surface_op = None,source_event_seqs:list |None=None)->SessionRecordData:
         if event_type == "turn/start":

@@ -11,7 +11,7 @@ from myagent.agent.core.session.types import (
     AssistantChunkData,AssistantMessageData, StepEndData,
     ToolCallData,ToolResultData,TurnEndData,
     TurnStartData,StepStartData,UserMessageData,RequestHeaderData,
-    LLMRetryData,AgentGrantData,
+    LLMRetryData,AgentGrantData,AgentErrorHandleData,
 )
 from myagent.agent.core.session.session import Session
 
@@ -438,6 +438,8 @@ class ReActAgentLoop:
             self._event_service.emit(TURN_START.name,TurnStartPayload())
             # 步骤 3：进入 step 循环（重试与终止由 step 内部决策）
             await self.step(user_message)
+            # step 正常返回（未上抛）：终态从账本读回——见 _resolve_reason
+            final_result.reason_type,final_result.reason_text = self._resolve_reason()
         # 步骤 4：取消——记 interrupted 后原样上抛
         except asyncio.CancelledError as e:
             final_result.reason_type = "interrupted"
@@ -454,6 +456,31 @@ class ReActAgentLoop:
             # 步骤 6：无论成败都写 turn/end 并广播（一并触发工具熔断复位）
             self._session.append("turn/end",TurnEndData(reason_type=final_result.reason_type,reason_text=final_result.reason_text,error_type=final_result.error_type))
             self._event_service.emit(TURN_END.name,TurnEndPayload())
+
+    def _resolve_reason(self) -> tuple[str,str]:
+        """step 正常返回（没有上抛异常）时，本 turn 的终态：读本 turn 的处置账本。
+
+        能走到这里的只有两种情形：一路无事，或错误被处置成了"继续"（retry 退避后
+        重试、grant 放宽预算后继续）并最终收敛——两种都算正常完成。无人认领与
+        as_error 都会在 hand_decision 里上抛，根本到不了这里。
+
+        唯一需要辨认的是"被策略停下"：step 被 break 掉但没上抛（人在回路选取消
+        之类）。它不是正常完成，也不该记 error（没人把它上报为失败），故记
+        interrupted，并在 reason_text 里指出是哪个错误引发的终止。
+
+        Returns:
+            (reason_type, reason_text) 二元组，供 turn 写 turn/end 使用。
+        """
+        # 步骤 1：没有任何处置记录 → 一路无事
+        handles = self._session.error_handles(self._session.turn)
+        if not handles:
+            return "success",""
+        # 步骤 2：最后一次处置是"终止但不按失败上报" → 被策略停下
+        last_handle = handles[-1]
+        if last_handle.decision == "break" and not last_handle.as_error:
+            return "interrupted",f"策略终止：{last_handle.error_type}"
+        # 步骤 3：其余（含 continue 档）→ 正常完成
+        return "success",""
 
     def _request_header(self,user_message : Message | None) -> list[Message]:
         """装配本次请求的消息面：system、system-reminder、运行时上下文与会话派生历史。
@@ -825,7 +852,10 @@ class ReActAgentLoop:
         # 步骤 3：触发 request/error waterfall，取裁决值。返回值是无类型 dict，key 名
         # 只在本点出现——在此拆成具名参数，下游不必再知道 dict 里有什么
         verdict = await self._event_service.waterfall(REQUEST_ERROR.name,RequestErrorPayLoad(error_type=step_error)) or {}
-        # 步骤 4：集中处理 decision，最终返回 continue or break
+        # 步骤 4：先落盘再处置——hand_decision 有两条上抛路径（as_error / 无人认领），
+        # 落盘若放在它之后，恰恰是这两种最该留痕的情况会丢记录
+        self._record_error_handle(step_error,verdict)
+        # 步骤 5：集中处理 decision，最终返回 continue or break
         return await self.hand_decision(
             step_error,
             decision = verdict.get("decision"),
@@ -942,6 +972,38 @@ class ReActAgentLoop:
             steps=grant["steps"],
             reason=decision,
             error_type=type(error).__name__,
+        ))
+
+    def _record_error_handle(self,error,verdict:dict) -> None:
+        """落一条 agent/error-handle：这个错误被处置成了什么。
+
+        **无论订阅方是否认领都写**——无人认领记 "unclaimed"，随后 hand_decision 会
+        抛 AgentUnclaimedError 终止本 turn。超限那类错误在开步前就被拒、没有
+        step/end，此记录是它在 session 上唯一的留痕，故 error_message 必须带上。
+
+        as_error 一并记下：turn 读回记录推终态时，靠它区分"停一下"与"停下并按失败
+        上报"这两种 break（见 _resolve_reason）。
+
+        Args:
+            error: 触发本次处置的异常。
+            verdict: waterfall 的原始裁决值；空 dict 表示无人认领。
+
+        Returns:
+            None。
+
+        Events:
+            写 agent/error-handle 记录（经 session 触发 session/event）。
+
+        Raises:
+            ValueError / TypeError: session.append 的入参校验失败。
+        """
+        # 步骤 1：无人认领没有 decision，记字面量，查询时不必额外处理空值
+        decision = verdict.get("decision") or "unclaimed"
+        self._session.append("agent/error-handle",AgentErrorHandleData(
+            error_type=type(error).__name__,
+            decision=decision,
+            as_error=bool(verdict.get("as_error",False)),
+            error_message=_format_error_chain(error),
         ))
 
     async def retry_delay(self,error,policy:RetryPolicy,attempt:int)->float:
