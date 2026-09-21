@@ -26,6 +26,9 @@ logger = logging.getLogger(__name__)
 
 
 class ReadFileTool(Tool):
+
+    # def __init__(self):
+    #     super().__init__(max_consecutive_failures=5,raise_on_break=True)
     @property
     def name(self) -> str:
         return "read_file"

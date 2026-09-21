@@ -314,11 +314,17 @@ class ToolRegister:
         started = time.perf_counter()
         if not permission_passed:
             # 没有通过权限检查
-            return ToolResult(
+            result = ToolResult(
                 f"status : error\n message : 工具调用({call.name})被权限护栏拦截。 deny_reason : {deny_reason}",
                 error_type=ToolErrorType.Permission_Denied,
                 duration_ms = int((time.perf_counter() - started) * 1000)
             )
+            tool = self._tools[call.name]
+            if result.is_error:
+                self._on_failure(tool, result)
+            else:
+                self._consecutive_failures[tool.name] = 0
+            return result
         result = await self._execute(call)
         result.duration_ms = int((time.perf_counter() - started) * 1000)
         return result
