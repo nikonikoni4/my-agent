@@ -138,6 +138,40 @@ def test_unregister_removes_system_reminder(sp):
     assert "待清除提醒" not in sp.assemble("coder").system_reminder
 
 
+# ---------- 上下文条目的参数注入 ----------
+
+def test_reminder_callback_renders_with_params(sp):
+    """测试场景：reminder 注册为 callback 时，按其 name 取参数注入后进消息面"""
+    sp.register_system_reminder(
+        "coder",
+        lambda data_path: f"规则文件在 {data_path}/agent/chat/rules.md",
+        name="custom_prompt",
+    )
+    assembly = sp.assemble("coder", {"custom_prompt": {"data_path": "/srv/data"}})
+    assert assembly.system_reminder == "规则文件在 /srv/data/agent/chat/rules.md"
+
+
+def test_reminder_callback_without_params_is_skipped(sp):
+    """测试场景：callback reminder 缺注入参数时跳过该条，不影响其他条目"""
+    sp.register_system_reminder("coder", lambda data_path: f"渲染了{data_path}", name="custom_prompt")
+    sp.register_system_reminder("coder", "静态提醒")
+    assert sp.assemble("coder").system_reminder == "静态提醒"
+
+
+def test_reminder_str_ignores_params(sp):
+    """测试场景：str reminder 不吃参数，给了参数也原样输出（与 section 同约定）"""
+    sp.register_system_reminder("coder", "带 {data_path} 的原文")
+    assembly = sp.assemble("coder", {"custom_prompt": {"data_path": "/srv"}})
+    assert assembly.system_reminder == "带 {data_path} 的原文"
+
+
+def test_context_callback_renders_with_params(sp):
+    """测试场景：runtime-context 与 reminder 走同一条注入约定，不是只管 reminder"""
+    sp.register_context("coder", lambda now: f"当前时间: {now}", name="runtime")
+    assembly = sp.assemble("coder", {"runtime": {"now": "2026-09-21"}})
+    assert assembly.context == "当前时间: 2026-09-21"
+
+
 # ---------- 注销 ----------
 
 def test_unregister_removes_agent_content(sp):

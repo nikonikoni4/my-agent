@@ -500,7 +500,9 @@ class ReActAgentLoop:
             ValueError / TypeError: session.append 的入参校验失败（类型不在记录表内）。
         """
         # 步骤 1：装配系统提示词与运行时提醒（每次请求都重新渲染）
-        assembly_prompt : AssemblyPrompt = self.system_prompt.assemble(self.name)
+        # 注入参数要同时给 assemble（渲染 system-reminder / runtime-context 条目）
+        # 与 render（渲染 section），两个入口共用同一份 prompt_render_parame
+        assembly_prompt : AssemblyPrompt = self.system_prompt.assemble(self.name,self.prompt_render_parame)
         system_prompt = self.system_prompt.render(assembly_prompt,self.prompt_render_parame)
         system_reminder = assembly_prompt.system_reminder
 

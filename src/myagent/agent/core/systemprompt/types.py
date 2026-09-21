@@ -30,12 +30,17 @@ class ContextItem:
     """一条带类型标注的上下文。
 
     Attributes:
-        text: 上下文文本内容。
+        text: 上下文文本内容。可调用时视为「待注入参数的模板」，签名
+            `render(**params) -> str`，由 assemble 从 params[name] 展开调用；
+            与 PrompSection.text 是同一套约定，只是参数键取自 name 而非段名。
         context_type: 上下文类型（System Reminder / Runtime）。
+        name: 参数注入键，对应 assemble 的 params 外层键（如 "custom_prompt"）。
+            text 为 str 时不参与注入，仅用于提示"给了参数却注入不进去"。
     """
 
-    text: str
+    text: str | Callable
     context_type: ContextType
+    name: str | None = None
 
 
 @dataclass

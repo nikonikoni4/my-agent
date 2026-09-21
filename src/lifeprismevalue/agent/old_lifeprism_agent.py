@@ -12,8 +12,10 @@
 前四段（identity / soul / agent / tool）从 `lifeprismData/prompts/agent_prompts.yaml`
 按版本取（见 lifeprismevalue.prompts）：**切换提示词版本就是改该文件的
 active_version**，不需要动代码。后三段（skill-list / user / recent_state）是运行时
-扫描与用户数据，不进版本库。其中 agent 段含 {agent_path} 等参数，注册为 callback
-section，由 SystemPrompt.render 在组装请求时通过 prompt_render_parame 注入。
+扫描与用户数据，不进版本库。其中 agent 段与 custom_prompt.md 都含 {data_path}
+一类参数，各自包成 callback 后注册，由 SystemPrompt 在组装请求时按
+prompt_render_parame 注入——两者注入键分别是段名 "agent" 与 reminder 的 name
+"custom_prompt"，故 prompt_render_parame 里要给两份参数。
 
 create_old_agent() 返回组装好的 ReActAgentLoop（提示词、工具、会话、重试策略均已接线）。
 """
@@ -55,8 +57,11 @@ class _SafeDict(dict):
         return "{" + key + "}"
 
 
-def _placeholder_section(content: str):
-    """把含 {占位符} 的段包成 callback section：渲染时注入参数，缺参数则原样保留。
+def _placeholder_text(content: str):
+    """把含 {占位符} 的文本包成 callback：渲染时注入参数，缺参数则原样保留。
+
+    section 与 system-reminder 共用本函数——两者的 text 都要能是 callback
+    （PrompSection.text / ContextItem.text 同为 str | Callable），注入形状也一致。
 
     用 _SafeDict 而不是 str.format：正文里可能含并非占位符的花括号（如
     `{skill同名文件.md}`），缺参数时原样保留，不会抛 KeyError。
@@ -95,8 +100,13 @@ def _build_expand_dir(data_path: Path) -> str:
 
 
 def _agent_md_params(data_path: Path) -> dict[str, str]:
-    """agent.md 的占位符注入参数（对齐旧 Context._build_bootstrap）。"""
+    """提示词占位符的注入参数（对齐旧 Context._build_bootstrap）。
+
+    agent 段（agent.md）与 custom_prompt.md 共用这一份：两者都在正文里写
+    `{data_path}/...` 之类的路径，改写提示词时不必再往数据文件里写死本机绝对路径。
+    """
     return {
+        "data_path": str(data_path),
         "agent_path": str(data_path / "agent"),
         "user_path": str(data_path / "user"),
         "diary_path": str(data_path / "diary"),
@@ -199,7 +209,7 @@ def build_chat_system_prompt(
             )
         # agent 段含 {agent_path}/{user_path}/{diary_path}/{expand_dir} 占位符：
         # 注册为 callback，参数由 SystemPrompt.render 注入（见 create_old_agent）
-        text = _placeholder_section(content) if section_name == "agent" else content
+        text = _placeholder_text(content) if section_name == "agent" else content
         system_prompt.register_section(
             AGENT_NAME, PrompSection(name=section_name, order=order, text=text)
         )
@@ -226,9 +236,13 @@ def build_chat_system_prompt(
         )
 
     # System Reminder：作为 Message List 第二位注入（System Prompt 之后、正常对话之前）
+    # 同样包成 callback 做参数注入：这份文件里会写到 budget_rules.md 等文件的绝对
+    # 路径，包起来后随 data_path 走，换机器/换数据根不用改数据文件
     custom_prompt = _read_prompt_file(chat_dir / "custom_prompt.md")
     if custom_prompt is not None:
-        system_prompt.register_system_reminder(AGENT_NAME, custom_prompt)
+        system_prompt.register_system_reminder(
+            AGENT_NAME, _placeholder_text(custom_prompt), name="custom_prompt"
+        )
 
     return system_prompt
 
@@ -277,8 +291,15 @@ def create_old_agent(
         agent_config,
         llm_client,
         name=name,
-        # agent.md 的占位符参数，交给 SystemPrompt.render 在组装请求时注入
-        prompt_render_parame={"agent": _agent_md_params(data_path)},
+        # 提示词占位符参数，组装请求时分别注入给 SystemPrompt.assemble（条目：
+        # system-reminder / runtime-context）与 render（section）。
+        # 结构为 {注入键: {占位符名: 值}}：外层 "agent" 是 section 名、
+        # "custom_prompt" 是 register_system_reminder 时声明的 name，内层键即
+        # 各自正文里 {占位符} 的名字，见 _agent_md_params
+        prompt_render_parame={
+            "agent": _agent_md_params(data_path),
+            "custom_prompt": _agent_md_params(data_path),
+        },
     )
     # EventService 以弱引用持有订阅者：retry 策略对象必须由外部强引用，否则会被回收
     agent_loop.llm_retry = llm_retry
