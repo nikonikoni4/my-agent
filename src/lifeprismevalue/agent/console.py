@@ -264,16 +264,16 @@ async def _aio_input(prompt: str) -> str:
 
 async def _main() -> None:
     agent = create_old_agent(step_limit=HITL_STEP_LIMIT)
-    # event_service 由 create_old_agent 内部创建并被 loop 持有；这里取来挂监控。
+    # agent 的 ctx 由 create_old_agent 内部创建并被 loop 持有；这里取来挂监控。
     # monitor 必须保持强引用（见 ConsoleMonitor.__init__ 的弱引用说明），
     # 它是 _main 的局部变量，函数存活期间不会被回收。
-    monitor = ConsoleMonitor(agent._event_service)
+    monitor = ConsoleMonitor(agent._ctx)
 
     # 挂路径护栏：订阅 tool/call（waterfall 语义），在工具执行前逐条裁决文件路径。
-    # 同 monitor，它也必须由 _main 的局部变量强引用——EventService 存的是 WeakMethod，
-    # 没人强引用的话注册当场失效（不报错，只是护栏永远不生效）。
+    # 同 monitor，它也必须由 _main 的局部变量强引用——ctx 内的 EventService 存的是
+    # WeakMethod，没人强引用的话注册当场失效（不报错，只是护栏永远不生效）。
     tool_use_guard = ToolUseGuard({"allow_path": ALLOW_PATH})
-    agent._event_service.register(TOOL_CALL.name, tool_use_guard.file_sys_path_guard)
+    agent._ctx.register(TOOL_CALL.name, tool_use_guard.file_sys_path_guard)
 
     # 挂人在回路：request/error 上按序接两个订阅方。两者管辖的错误类型不重叠
     # （step 超限 / 工具熔断），前面那个不认领时会 await _next() 交给下一个；
@@ -281,8 +281,8 @@ async def _main() -> None:
     # 强引用要求同 monitor：hitl 由局部变量持有，channel 由 hitl 持有。
     channel = ConsoleChannel()
     hitl = HITL(channel, grant_steps=HITL_GRANT_STEPS, timeout=HITL_TIMEOUT)
-    agent._event_service.register(REQUEST_ERROR.name, hitl.maxstep_continue)
-    agent._event_service.register(REQUEST_ERROR.name, hitl.tool_breaker_continue)
+    agent._ctx.register(REQUEST_ERROR.name, hitl.maxstep_continue)
+    agent._ctx.register(REQUEST_ERROR.name, hitl.tool_breaker_continue)
 
     agent.start()
     print("=== lifeprism agent 控制台 ===")

@@ -30,8 +30,8 @@ from myagent.agent.core.systemprompt.types import PrompSection
 from myagent.agent.core.tool.tool import Tool, ToolErrorType
 from myagent.agent.llm.openai_provider import OpenAIProvider
 from myagent.evaluate import ToolEvaluate
+from myagent.infra.events import EventService
 from myagent.infra.events.eventspec import TURN_END
-from myagent.infra.events.service import EventService
 
 AGENT_NAME = "eval_mock"
 STEP_LIMIT = 20
@@ -211,8 +211,9 @@ class FlakyInterceptTool(Tool):
 class LoopFixture:
     def __init__(self, tmp_path):
         self.event_service = EventService()
-        self.store = SessionStore(tmp_path / "sessions", self.event_service)
+        self.store = SessionStore(tmp_path / "sessions")
         self.session = self.store.create("eval-mock-会话", tmp_path / "proj")
+        self.session.bind(self.event_service)
 
         system_prompt = SystemPrompt()
         system_prompt.register_section(AGENT_NAME, PrompSection(

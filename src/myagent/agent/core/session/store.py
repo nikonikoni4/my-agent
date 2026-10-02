@@ -15,6 +15,11 @@ SessionMetaData + list[SessionRecordData]，供上层构造 Session。
 文件格式（与 SessionPresist 写入约定一致）：
   第 1 行：SessionMetaData.meta_data() 的 dict
   第 2 行起：SessionRecordData.to_record_dict() 的 dict
+
+不持有事件总线：create/load 只做数据装配，返回未绑定的 Session。纯数据访问
+（读记录、derive_messages）不需要事件循环；运行装配方在启动 loop 前调用
+Session.bind 接入总线并创建持久化组件。见 ADR
+docs/adr/2026-10-02-AgentContext组件归属与事件隔离.md 决策 5/6。
 """
 
 import json
@@ -23,10 +28,8 @@ import datetime
 from pathlib import Path
 
 from myagent.agent.core.session.session import Session
-from myagent.agent.core.session.persistence import SessionPresist
 from myagent.agent.core.session.types import SessionMetaData, SessionRecordData, AssistantChunkData
 from myagent.agent.core.provider import Message, RawToolCall, ChatParams, Usage, StreamChunk
-from myagent.infra.events import EventService
 from myagent.utils.helper import project_path_to_session_folder
 
 logger = logging.getLogger(__name__)
@@ -38,19 +41,18 @@ class SessionStore:
     session 的存储方法：应该是一个可扩展的存储方式，目前只支持从文件获取，但是要能够实现可扩展性，比如未来支持sqlite存储
     """
 
-    def __init__(self, session_folder: Path,event_service:EventService):
+    def __init__(self, session_folder: Path):
         self.session_folder = session_folder
-        self._event_service = event_service
 
     def _session_file(self, session_id: str, project_path: Path) -> Path:
         """按 session_id + project_path 定位会话文件：项目路径编码为 session_folder 下的项目子文件夹"""
         return project_path_to_session_folder(project_path, self.session_folder) / f"{session_id}.jsonl"
 
     def create(self, name: str, project_path: Path) -> Session:
-        """新建一个空会话，返回组装好的 Session。
+        """新建一个空会话，返回未绑定的 Session。
 
-        SessionPresist 在构造时订阅 session/event，后续 session.append 触发
-        事件后由它异步落盘；meta 行随首批记录自动写入。
+        本类只负责算出落盘路径。Session 构造只保存数据，不创建持久化组件、
+        不启动后台任务；调用方显式 bind 后才接入事件并按路径创建持久化组件。
 
         Args:
             name: 会话名称，为空串时 SessionMetaData 自动回退为 session_id。
@@ -58,21 +60,20 @@ class SessionStore:
         """
         meta = SessionMetaData(cwd=str(project_path), name=name)
         session_file = self._session_file(meta.session_id, project_path)
-        presist = SessionPresist(self._event_service, session_file, meta)
-        return Session(self._event_service, meta, [], presistence=presist)
+        return Session(meta, [], session_file=session_file)
 
     def load(self, session_id: str, project_path: Path) -> Session | None:
-        """按 session_id + project_path 加载会话，直接返回可用的 Session。
+        """按 session_id + project_path 加载会话，返回未绑定的 Session。
 
-        文件内容还原为 meta 与记录列表后组装 Session（含持久化组件），
-        恢复结果与写入前的内存形态一致，可直接传入 AgentLoop 开启对话。
+        文件内容还原为 meta 与记录列表后组装 Session，恢复结果与写入前的内存
+        形态一致。返回的 Session 尚未接入总线；调用方 bind 后即可传入 AgentLoop。
 
         Args:
             session_id: 会话 id，定位 {project_path 编码后的项目文件夹}/{session_id}.jsonl。
             project_path: 项目路径，编码为 session_folder 下的项目子文件夹。
 
         Returns:
-            组装好的 Session；文件不存在或为空时 warning 并返回 None。
+            未绑定的 Session；文件不存在或为空时 warning 并返回 None。
         """
         session_file = self._session_file(session_id, project_path)
         if not session_file.exists():
@@ -115,8 +116,7 @@ class SessionStore:
                 surface_op=record_d.get("surface_op"),
                 source_event_seqs=record_d.get("source_event_seqs"),
             ))
-        presist = SessionPresist(self._event_service, session_file, meta)
-        return Session(self._event_service, meta, records, presistence=presist)
+        return Session(meta, records, session_file=session_file)
 
     def fork(self, fork_from_session_id):
         """暂时不实现"""

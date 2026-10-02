@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from myagent.agent.agent_context import AgentContext
 from myagent.agent.core.agent.loop import ReActAgentLoop
 from myagent.agent.core.agent.types import AgentConfig
 from myagent.agent.core.session import Session, SessionStore
@@ -19,7 +20,6 @@ from myagent.agent.core.systemprompt import PrompSection, SystemPrompt
 from myagent.agent.llm.llm_retry import LLMRerty
 from myagent.agent.llm.openai_provider import OpenAIProvider
 from myagent.config.system_config import get_llm_api_key, get_llm_base_url, get_llm_model
-from myagent.infra.events import EventService
 from myagent.infra.events.eventspec import REQUEST_ERROR
 
 from lifeprismevalue.config import get_lifeprism_data_path
@@ -145,11 +145,11 @@ def create_judge_agent(
     """
     data_path = (data_path or get_lifeprism_data_path()).resolve()
 
-    event_service = EventService()
+    ctx = AgentContext(name=name)
     llm_retry = LLMRerty()
-    event_service.register(REQUEST_ERROR.name, llm_retry.request_error_event)
+    ctx.register(REQUEST_ERROR.name, llm_retry.request_error_event)
 
-    store = SessionStore(session_folder, event_service)
+    store = SessionStore(session_folder, ctx)
     session: Session | None = store.load(session_id, data_path) if session_id else None
     if session is None:
         session = store.create(name, data_path)
@@ -161,13 +161,12 @@ def create_judge_agent(
     )
     agent_config = AgentConfig(step_limit=step_limit, max_retry_count=max_retry_count)
     agent_loop = ReActAgentLoop(
-        event_service,
+        ctx,
         session,
         build_judge_system_prompt(name),
         agent_config,
         llm_client,
-        name=name,
     )
-    # EventService 以弱引用持有订阅者：retry 策略对象必须由外部强引用
+    # ctx 内的 EventService 以弱引用持有订阅者：retry 策略对象必须由外部强引用
     agent_loop.llm_retry = llm_retry
     return agent_loop

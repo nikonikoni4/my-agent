@@ -80,6 +80,11 @@ class FakeProvider(LLMProvider):
 
 
 class NoopPersistence:
+    """替身持久化：Session.append 投喂记录、loop.persist_session_now 触发落盘，均不做事。"""
+
+    def cache_data(self, record):
+        pass
+
     def presist(self):
         pass
 
@@ -87,7 +92,7 @@ class NoopPersistence:
 def make_loop(tool: Tool, rounds: list[list], step_limit: int):
     """组装被测 ReActAgentLoop：真实 SystemPrompt + 假 Provider + 熔断工具。"""
     event_service = EventService()
-    session = Session(EventService(), SessionMetaData(cwd="."))
+    session = Session(SessionMetaData(cwd="."))
     session.presistence = NoopPersistence()
     config = AgentConfig(step_limit=step_limit, max_retry_count=2)
     provider = FakeProvider(rounds)

@@ -26,6 +26,7 @@ import json
 import logging
 from pathlib import Path
 
+from myagent.agent.agent_context import AgentContext
 from myagent.agent.core.agent.loop import ReActAgentLoop
 from myagent.agent.core.agent.types import AgentConfig
 from myagent.agent.core.session import Session, SessionStore
@@ -33,7 +34,6 @@ from myagent.agent.core.systemprompt import PrompSection, SystemPrompt
 from myagent.agent.llm.llm_retry import LLMRerty
 from myagent.agent.llm.openai_provider import OpenAIProvider
 from myagent.config.system_config import get_llm_api_key, get_llm_base_url, get_llm_model
-from myagent.infra.events import EventService
 from myagent.infra.events.eventspec import REQUEST_ERROR
 
 from lifeprismevalue.config import get_lifeprism_data_path
@@ -268,12 +268,12 @@ def create_old_agent(
     """
     data_path = (data_path or get_lifeprism_data_path()).resolve()
 
-    event_service = EventService()
+    ctx = AgentContext(name=name)
     # 重试策略：订阅 request/error（waterfall 语义），沿用 lifeprism 的错误分类与退避
     llm_retry = LLMRerty()
-    event_service.register(REQUEST_ERROR.name, llm_retry.request_error_event)
+    ctx.register(REQUEST_ERROR.name, llm_retry.request_error_event)
 
-    store = SessionStore(session_folder, event_service)
+    store = SessionStore(session_folder, ctx)
     session: Session | None = store.load(session_id, data_path) if session_id else None
     if session is None:
         session = store.create(name, data_path)
@@ -285,12 +285,11 @@ def create_old_agent(
     )
     agent_config = AgentConfig(step_limit=step_limit, max_retry_count=max_retry_count)
     agent_loop = ReActAgentLoop(
-        event_service,
+        ctx,
         session,
         build_chat_system_prompt(data_path),
         agent_config,
         llm_client,
-        name=name,
         # 提示词占位符参数，组装请求时分别注入给 SystemPrompt.assemble（条目：
         # system-reminder / runtime-context）与 render（section）。
         # 结构为 {注入键: {占位符名: 值}}：外层 "agent" 是 section 名、
@@ -301,7 +300,7 @@ def create_old_agent(
             "custom_prompt": _agent_md_params(data_path),
         },
     )
-    # EventService 以弱引用持有订阅者：retry 策略对象必须由外部强引用，否则会被回收
+    # ctx 内的 EventService 以弱引用持有订阅者：retry 策略对象必须由外部强引用，否则会被回收
     agent_loop.llm_retry = llm_retry
 
     agent_loop.tool_register.register(build_lifeprism_tools())

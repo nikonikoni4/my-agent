@@ -25,7 +25,7 @@ from myagent.agent.core.session.types import (
 
 @pytest.fixture
 def event_service():
-    """每个测试独立的空事件服务，Session 构造必需。"""
+    """每个测试独立的空事件服务，由工厂显式绑定。"""
     return EventService()
 
 
@@ -37,13 +37,11 @@ def meta_data():
 
 @pytest.fixture
 def make_session(event_service, meta_data):
-    """工厂固件：构造 Session。
-
-    SessionPresist 构造时需要运行中的事件循环，所以必须在
-    async 测试体内部调用本工厂，不能在 fixture 里直接构造。
-    """
+    """工厂固件：构造内存态 Session 并显式绑定事件服务。"""
     def _make(record_list: list[SessionRecordData] | None = None) -> Session:
-        return Session(event_service, meta_data, record_list)
+        session = Session(meta_data, record_list)
+        session.bind(event_service)
+        return session
     return _make
 
 
@@ -53,7 +51,7 @@ def add_exchange(make_session):
 
     每轮写入 turn/start（不进可见面）+ user/message + assistant/message（surface_op="append"）。
     data 只带事件内容，turn/step 由 Session 写在信封上。
-    Session 必须在事件循环内构造，所以测试要先调用本工厂再操作。
+    工厂返回已绑定的内存态会话。
     """
     def _setup():
         session = make_session()
@@ -113,7 +111,7 @@ class TestSessionInit:
     def test_meta_data_is_required(self, event_service):
         """测试场景：meta_data 必填（cwd 是必填字段），缺省构造直接报 TypeError"""
         with pytest.raises(TypeError):
-            Session(event_service)
+            Session()
 
     @pytest.mark.asyncio
     async def test_init_with_loaded_records(self, make_session):
@@ -279,7 +277,7 @@ class TestResumeTurn:
         """测试场景：用已有记录重建会话后，下一轮 turn/start 从上次轮次继续递增"""
         session, add = add_exchange()
         add("u1", "a1")
-        resumed = Session(session._event_service, session.meta_data, session.record_list)
+        resumed = Session(session.meta_data, session.record_list)
         resumed.append("turn/start", TurnStartData(), None, None)
         assert resumed.record_list[-1].turn == 2
 

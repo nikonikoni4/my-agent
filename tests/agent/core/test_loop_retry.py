@@ -54,6 +54,11 @@ class ScriptedErrorProvider(LLMProvider):
 
 
 class NoopPersistence:
+    """替身持久化：Session.append 投喂记录、loop.persist_session_now 触发落盘，均不做事。"""
+
+    def cache_data(self, record):
+        pass
+
     def presist(self):
         pass
 
@@ -64,7 +69,7 @@ def make_loop(script: list, max_retry_count: int, strategy: LLMRerty):
     strategy 由调用方持有，保证 EventService 的弱引用注册在用例期间不失效。
     """
     event_service = EventService()
-    session = Session(EventService(), SessionMetaData(cwd="."))
+    session = Session(SessionMetaData(cwd="."))
     session.presistence = NoopPersistence()
     config = AgentConfig(step_limit=10, max_retry_count=max_retry_count)
     provider = ScriptedErrorProvider(script)
@@ -172,3 +177,26 @@ async def test_用户取消_step与turn记为interrupted():
     turn_end = last_record(session, "turn/end")
     assert turn_end.data.reason_type == "interrupted"
     assert turn_end.data.reason_text == "用户主动打断"
+
+
+@pytest.mark.asyncio
+async def test_stop_等待在途turn收尾后才返回():
+    """stop() 返回时后台循环已结束、在途 turn 已落成 interrupted 终态
+
+    cancel() 只登记取消请求，投递到挂起点才生效；stop() 补上"等到结束"这一步，
+    关闭编排靠它保证"先结束执行、再停持久化"的顺序。若 stop 提前返回，后台任务会
+    残留，且收尾期间的 step/turn 终态记录还没写完。
+    """
+    strategy = LLMRerty()
+    loop, provider, session = make_loop(["hang"], max_retry_count=3, strategy=strategy)
+    baseline = asyncio.all_tasks()
+
+    loop.followup(user_message("你好"))
+    await asyncio.sleep(0.01)  # 让后台循环进入挂起的模型调用
+    assert len(asyncio.all_tasks() - baseline) == 1, "前置条件：后台循环已启动"
+
+    await loop.stop()
+
+    assert asyncio.all_tasks() == baseline, "stop 返回后后台循环任务已结束、无残留"
+    assert [r.data.reason_type for r in session.record_list if r.type == "step/end"] == ["interrupted"]
+    assert last_record(session, "turn/end").data.reason_type == "interrupted"

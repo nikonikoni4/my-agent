@@ -5,11 +5,15 @@ from myagent.agent.core.session.types import (
     TurnStartData,StepStartData,UserMessageData,RequestHeaderData,CompactionEndData,LLMRetryData,
     AgentGrantData,AgentErrorHandleData
 )
+from myagent.agent.execption import SessionReBindError
 from myagent.infra.events.service import EventService
 from myagent.infra.events.eventspec import SESSION_EVENT,SessionEventPayload
 from myagent.agent.core.session.surface import SurfaceManager
 from myagent.agent.core.session.persistence import SessionPresist
+from pathlib import Path
 import copy
+
+
 class Session:
     """
     
@@ -43,16 +47,19 @@ class Session:
         "compaction/start", "compaction/summary", "compaction/end",
     })
 
-    def __init__(self,event_service :EventService,meta_data :SessionMetaData,record_list:list[SessionRecordData] | None =None ,presistence : SessionPresist | None = None  ):
+    def __init__(self,meta_data :SessionMetaData,record_list:list[SessionRecordData] | None =None ,session_file : Path | None = None  ):
 
 
         self.meta_data = meta_data
         self.record_list : list[SessionRecordData] = record_list if record_list else []
-        self._event_service = event_service
+        self._event_service: EventService | None = None
         self.surface_manager = SurfaceManager(record_list)
-        # 持久化组件由 SessionStore 组装注入：Session 只负责 append 触发 session/event，
-        # SessionPresist 订阅该事件后异步落盘
-        self.presistence = presistence
+        # 构造只恢复数据；bind 时才接入事件并启动持久化。
+        # None 路径表示内存态会话，绑定后也不创建持久化组件。
+        self._session_file = session_file
+        self.presistence: SessionPresist | None = None
+        # 构造时已有的记录来自加载，不重复落盘；未绑定期间追加的记录首次绑定时补入缓冲。
+        self._initial_record_count = len(self.record_list)
         # 恢复坐标：轮间压缩的记录 turn 为 None，向前找最近一条带 turn 的记录
         self.turn = 0
         for record in reversed(self.record_list):
@@ -60,7 +67,33 @@ class Session:
                 self.turn = record.turn
                 break
         self.step = 0
-        
+
+    def bind(self, event_service: EventService) -> None:
+        """一次性绑定运行依赖，并在有文件路径时创建持久化组件。
+
+        Args:
+            event_service: 当前 agent 的事件总线。
+
+        绑定是一次性的：已绑定的 Session 拒绝再次绑定（包括同一总线），
+        原总线、持久化组件与后台任务一律保留不动，调用方重新装配即得此异常。
+        文件态会话必须在运行中的事件循环内绑定；未绑定时可同步读取和追加数据。
+        绑定前新增记录补入持久化缓冲，加载的历史记录不重写，也不补发历史事件。
+
+        Raises:
+            SessionReBindError: 本 Session 已绑定过总线。
+        """
+        if self._event_service is not None:
+            raise SessionReBindError(f"Session {self.meta_data.session_id} 已绑定，拒绝重复绑定")
+
+
+        persistence = None
+        if self._session_file is not None:
+            persistence = SessionPresist(self._session_file, self.meta_data)
+            for record in self.record_list[self._initial_record_count:]:
+                persistence.cache_data(copy.deepcopy(record))
+        self.presistence = persistence
+        self._event_service = event_service
+
     @property
     def record_list_seq(self):
         return len(self.record_list)
@@ -162,11 +195,20 @@ class Session:
             raise ValueError(f"{event_type} 不属于session 记录范围")
         if not isinstance(data,self.RECORD_DATA_TYPES[event_type]):
             raise TypeError(f"传入的数据类型不符合要求,应该为:{self.RECORD_DATA_TYPES[event_type].__name__}")
-        # TODO node不处理surface_op 
+        # TODO node不处理surface_op
         record = self._build_record(data,event_type,surface_op,source_event_seqs)
         self.record_list.append(record)
         self.surface_manager.refresh_node(self.record_list)
-        self._event_service.emit(SESSION_EVENT.name,SessionEventPayload(copy.deepcopy(record)))
+        # 快照一份：缓冲与广播共用同一对象，与改造前"emit 里 deepcopy 一次"的行为一致
+        snapshot = copy.deepcopy(record)
+        # 落盘：直连持久化组件，不经事件总线——总线是进程内共享的，经它中转会把
+        # 本会话的记录灌进同总线上其他会话的缓冲（见 docs/known-limitations
+        # 2026-09-11-event-service无隔离机制.md 第 1 节）
+        if self.presistence is not None:
+            self.presistence.cache_data(snapshot)
+        # 观测：只有显式绑定后才广播，不补发绑定前的记录。
+        if self._event_service is not None:
+            self._event_service.emit(SESSION_EVENT.name,SessionEventPayload(snapshot))
 
     def compact(self):
         pass 

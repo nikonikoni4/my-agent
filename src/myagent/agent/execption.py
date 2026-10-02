@@ -158,3 +158,9 @@ class AgentUnclaimedError(MyAgentError):
 
     —— 本类型由原 `LLmError` 改名而来 ——
     """
+
+
+class SessionReBindError(MyAgentError):
+    """
+    session绑定eventservice时重复绑定事件总线
+    """

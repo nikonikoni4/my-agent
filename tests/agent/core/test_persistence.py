@@ -29,6 +29,50 @@ from myagent.agent.core.session.types import SessionMetaData
 # 测试替身与工具
 # ---------------------------------------------------------------------------
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("started", [False, True])
+async def test_stop_等待任务结束并保存剩余缓冲(tmp_path, started):
+    comp = SessionPresist(tmp_path / "stop.jsonl", SessionMetaData(cwd="."))
+    comp.cache_data(FakeRecord("pending"))
+    if started:
+        await asyncio.sleep(0)
+    try:
+        await comp.stop()
+        assert comp._presist_loop.done()
+        lines = comp.file_path.read_text(encoding="utf-8").splitlines()
+        assert json.loads(lines[1])["data"] == "pending"
+        before = comp.file_path.read_bytes()
+        await comp.stop()
+        assert comp.file_path.read_bytes() == before
+    finally:
+        comp._presist_loop.cancel()
+        await asyncio.gather(comp._presist_loop, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_stop_落盘失败抛出并保留记录以便重试(tmp_path, monkeypatch):
+    comp = SessionPresist(tmp_path / "stop.jsonl", SessionMetaData(cwd="."))
+    comp.cache_data(FakeRecord("pending"))
+    real_open = pathlib.Path.open
+
+    def failing_open(path, mode="r", *args, **kwargs):
+        if path == comp.file_path and mode == "a":
+            raise OSError("write failed")
+        return real_open(path, mode, *args, **kwargs)
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(pathlib.Path, "open", failing_open)
+            with pytest.raises(OSError, match="write failed"):
+                await comp.stop()
+        assert comp._presist_loop.done()
+        await comp.stop()
+        lines = comp.file_path.read_text(encoding="utf-8").splitlines()
+        assert json.loads(lines[1])["data"] == "pending"
+    finally:
+        comp._presist_loop.cancel()
+        await asyncio.gather(comp._presist_loop, return_exceptions=True)
+
 class FakeRecord:
     """持久化组件需要的最小接口：to_record_dict() 返回可 JSON 化的 dict。
 

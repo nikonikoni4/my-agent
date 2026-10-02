@@ -217,6 +217,40 @@ class ReActAgentLoop:
         # 步骤 3：清空收件箱，避免残留消息在重启后被消费
         self.inbox = {"next_turn":[],"next_step":[]}
 
+    async def stop(self):
+        """停止后台循环，并等待它真正结束。
+
+        与 `cancel()` 的差别只在"等"：`cancel()` 只登记取消请求，投递时机由事件循环
+        决定，调用方不让出控制权就一直不投递；本方法让出控制权并等到任务收场，返回时
+        在途 turn 的 interrupted 终态已经写好。关闭编排（AgentContext.close）靠它保证
+        "先结束执行、再停持久化"的顺序——若提前返回，收尾期间的记录会写不进文件。
+
+        循环正常情况下会吞掉取消并 break，任务以正常结束收场；只有"任务尚未开始就被
+        取消"这一种收场会让 await 抛 CancelledError，这里消化掉。
+
+        Args:
+            无。
+
+        Returns:
+            None。
+
+        Events:
+            间接：在途 turn 收尾时触发 step/turn 的 interrupted 终态事件。
+
+        Raises:
+            无。循环自身的取消不上抛；调用方自身的取消请求原样传播。
+        """
+        self.cancel()
+        # 无任务视为空操作（循环从未启动，或已结束且未再 send）
+        if self._task is None:
+            return
+        try:
+            await self._task
+        except asyncio.CancelledError:
+            # 只消化"任务未及开始就被取消"的收场，不吞掉调用方自身的取消请求。
+            if asyncio.current_task().cancelling():
+                raise
+
     async def _loop ( self ):
         """后台循环：被唤醒后按 next_step、next_turn 顺序逐条消费收件箱。
 

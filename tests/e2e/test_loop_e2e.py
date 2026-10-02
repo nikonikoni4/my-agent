@@ -15,6 +15,7 @@
 3. 整个流程是否跑通（SessionStore.load 还原后与内存态一致）
 """
 
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -31,7 +32,8 @@ from myagent.agent.core.systemprompt.systemprompt import SystemPrompt
 from myagent.agent.core.systemprompt.types import PrompSection
 from myagent.agent.core.tool.tool import Tool
 from myagent.agent.llm.openai_provider import OpenAIProvider
-from myagent.infra.events.service import EventService
+from myagent.infra.events import EventService
+from myagent.infra.events.eventspec import TURN_END
 from myagent.utils.helper import project_path_to_session_folder
 
 load_dotenv()
@@ -117,13 +119,15 @@ def check(cond, msg):
 def build_agent(session_folder: Path, project_path: Path, session_name: str):
     """组装一套 e2e 组件，返回 (agent_loop, session, store)。
 
-    每次调用都新建 EventService：SessionPresist 按事件名订阅 session/event，
-    两个会话共享同一条总线会互相把记录写进对方的持久化 buffer。
+    每次调用都新建自己的 EventService，agent 之间的事件互不互通（见 ADR
+    docs/adr/2026-10-02-AgentContext组件归属与事件隔离.md 决策 1）。
+    Store 只做数据加载，运行依赖由这里显式 bind 接入。
     会话文件落在 tmp_path 下，不污染 localData/sessions。
     """
     event_service = EventService()
-    store = SessionStore(session_folder, event_service)
+    store = SessionStore(session_folder)
     session = store.create(session_name, project_path)
+    session.bind(event_service)
 
     system_prompt = SystemPrompt()
     system_prompt.register_section(AGENT_NAME, PrompSection(
@@ -140,14 +144,32 @@ def build_agent(session_folder: Path, project_path: Path, session_name: str):
     )
     agent_config = AgentConfig(
         step_limit=20,  # 步数兜底（单轮 2 工具 + 汇总回复约 3 步）；采样参数由 provider 的 chat_params 提供
+        max_retry_count=2,
     )
     agent_loop = ReActAgentLoop(
         event_service, session, system_prompt,
-        agent_config, llm_client, name=AGENT_NAME,
+        agent_config, llm_client,
+        name=AGENT_NAME,
         prompt_render_parame={},  # 渲染参数是 loop 构造参数，不归 AgentConfig
     )
     agent_loop.tool_register.register([WeatherTool(), AddressTool()])
-    return agent_loop, session, store
+    return agent_loop, session, store, event_service
+
+
+async def run_turn(agent_loop: ReActAgentLoop, event_service: EventService, prompt: str) -> None:
+    """发一条消息并等到 turn 结束。
+
+    followup 只入队并唤醒后台循环，不等待本轮跑完；直接断言落盘内容会跑在被消费之前。
+    这里挂一次 TURN_END 订阅（具名局部函数，EventService 持弱引用）等到轮次真正收尾。
+    """
+    done = asyncio.Event()
+
+    def on_turn_end(_payload):
+        done.set()
+
+    event_service.register(TURN_END.name, on_turn_end)
+    agent_loop.followup(prompt)
+    await asyncio.wait_for(done.wait(), timeout=120)
 
 
 def session_file_of(store: SessionStore, session, project_path: Path) -> Path:
@@ -172,9 +194,9 @@ async def test_单轮_真实LLM完整链路_保存与还原(tmp_path):
     3. 流程跑通：load 还原后与内存态一致
     """
     project_path = tmp_path / "proj"
-    agent_loop, session, store = build_agent(tmp_path / "sessions", project_path, "e2e单轮链路")
+    agent_loop, session, store, event_service = build_agent(tmp_path / "sessions", project_path, "e2e单轮链路")
 
-    agent_loop.followup(SINGLE_TURN_PROMPT)
+    await run_turn(agent_loop, event_service, SINGLE_TURN_PROMPT)
     # 收尾：强制把 buffer 里剩余记录（工具结果、step/end、turn/end 等）落盘
     session.presistence.presist()
 
@@ -233,10 +255,13 @@ async def test_单轮_真实LLM完整链路_保存与还原(tmp_path):
     check(restored is not None, "load 成功还原会话")
     check([r.type for r in restored.record_list] == [r.type for r in session.record_list], "还原后记录类型序列一致")
     check([r.seq for r in restored.record_list] == [r.seq for r in session.record_list], "还原后 seq 序列一致")
-    check(restored.presistence is not None, "还原的会话带持久化组件（可继续对话）")
+    check(restored.presistence is None, "load 返回未绑定的会话（装配方 bind 后才启用事件与持久化）")
+    restored.bind(EventService())
+    check(restored.presistence is not None, "bind 后还原的会话带持久化组件（可继续对话）")
     mem_msgs, restored_msgs = session.derive_messages(), restored.derive_messages()
     check([m.role for m in restored_msgs] == [m.role for m in mem_msgs], f"还原后消息面一致: {[m.role for m in mem_msgs]}")
-    check(restored_msgs == mem_msgs, "还原后消息逐条内容一致（user/assistant/tool 全对齐）")
+    check(restored_msgs == mem_msgs,
+          f"还原后消息逐条内容一致（user/assistant/tool 全对齐）\n内存: {mem_msgs}\n还原: {restored_msgs}")
     # 最终回答引用了工具结果（模型真的看到了工具返回）
     check("晴" in mem_msgs[-1].content and "运河东大街" in mem_msgs[-1].content, "最终回复引用了两个工具的结果")
 
@@ -253,12 +278,12 @@ async def test_多轮_跨轮上下文与session累积(tmp_path):
     - load 还原后三轮消息面一致
     """
     project_path = tmp_path / "proj"
-    agent_loop, session, store = build_agent(tmp_path / "sessions", project_path, "e2e多轮链路")
+    agent_loop, session, store, event_service = build_agent(tmp_path / "sessions", project_path, "e2e多轮链路")
 
     # ---- 逐轮对话：每轮前后对比消息面，验证历史只增不改 ----
     for i, prompt in enumerate(MULTI_TURN_PROMPTS, 1):
         before = session.derive_messages()
-        agent_loop.followup(prompt)
+        await run_turn(agent_loop, event_service, prompt)
         # 每轮结束强制把剩余记录（工具结果、step/end、turn/end 等）落盘
         session.presistence.presist()
         after = session.derive_messages()
@@ -316,4 +341,5 @@ async def test_多轮_跨轮上下文与session累积(tmp_path):
     check([r.type for r in restored.record_list] == [r.type for r in session.record_list], "还原后记录类型序列一致")
     check([r.seq for r in restored.record_list] == [r.seq for r in session.record_list], "还原后 seq 序列一致")
     mem_msgs, restored_msgs = session.derive_messages(), restored.derive_messages()
-    check(restored_msgs == mem_msgs, "还原后三轮消息面逐条内容一致")
+    check(restored_msgs == mem_msgs,
+          f"还原后三轮消息面逐条内容一致\n内存: {mem_msgs}\n还原: {restored_msgs}")
