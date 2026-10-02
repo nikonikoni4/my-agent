@@ -130,7 +130,7 @@ def build_agent(session_folder: Path, project_path: Path, session_name: str):
     session.bind(event_service)
 
     system_prompt = SystemPrompt()
-    system_prompt.register_section(AGENT_NAME, PrompSection(
+    system_prompt.register_section(PrompSection(
         name="tool_guide",
         order=PROMPT_SECTION_ORDER,
         text="你可以调用工具查询天气与地址。拿到工具结果后，用中文简洁地汇总回答用户。",

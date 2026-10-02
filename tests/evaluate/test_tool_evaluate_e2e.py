@@ -216,7 +216,7 @@ class LoopFixture:
         self.session.bind(self.event_service)
 
         system_prompt = SystemPrompt()
-        system_prompt.register_section(AGENT_NAME, PrompSection(
+        system_prompt.register_section(PrompSection(
             name="tool_guide",
             order=50,
             text="按用户要求调用工具。",

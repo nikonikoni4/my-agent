@@ -1143,7 +1143,7 @@ async def test_请求组装_system_reminder置第二位并落request_header():
     """注册 system reminder：第 2 位是 role=user 的 <system-reminder> 包裹消息，
     内容同时以 request/header 事件落盘（不新增 message 记录）"""
     loop, provider, session = make_loop([LLMResponse(content="好的", finish_reason="stop")])
-    loop.system_prompt.register_system_reminder(loop.name, "请遵守编码规范")
+    loop.system_prompt.register_system_reminder("请遵守编码规范")
 
     await loop.turn(user_message("你好"))
 
@@ -1172,7 +1172,7 @@ async def test_请求组装_runtime_context合并进用户消息并落盘():
     """runtime context 作为追加文本块合并进当前用户消息，并随 user/message 落盘，
     保证每一步的输入都可由 session 复现"""
     loop, provider, session = make_loop([LLMResponse(content="好的", finish_reason="stop")])
-    loop.system_prompt.register_context(loop.name, "当前时间: 2026-09-12")
+    loop.system_prompt.register_context("当前时间: 2026-09-12")
 
     await loop.turn(user_message("你好"))
 
@@ -1216,9 +1216,9 @@ async def test_请求组装_自定义提示词与落盘还原(tmp_path):
     session.bind(event_service)
 
     system_prompt = SystemPrompt()
-    system_prompt.register_section("coder", PrompSection(name="tool_guide", order=10, text="你可以使用工具查询天气。"))
-    system_prompt.register_system_reminder("coder", "请遵守编码规范")
-    system_prompt.register_context("coder", "当前时间: 2026-09-12")
+    system_prompt.register_section(PrompSection(name="tool_guide", order=10, text="你可以使用工具查询天气。"))
+    system_prompt.register_system_reminder("请遵守编码规范")
+    system_prompt.register_context("当前时间: 2026-09-12")
 
     provider = ScriptedProvider([LLMResponse(content="好的", finish_reason="stop")])
     config = AgentConfig(step_limit=10, max_retry_count=2)
@@ -1273,7 +1273,7 @@ async def test_请求组装_提示词变化写change快照():
     assert len(headers) == 1 and headers[0].data.reason == "initial"
 
     # 遮蔽全局 identity：换一段提示词，组装结果随之变化
-    loop.system_prompt.register_section(loop.name, PrompSection(name="identity", order=-100, text="你是新助手"))
+    loop.system_prompt.register_section(PrompSection(name="identity", order=-100, text="你是新助手"))
     await loop.turn(user_message("第二轮"))
 
     headers = records(session, "request/header")
