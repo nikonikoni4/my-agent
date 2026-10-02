@@ -72,7 +72,6 @@ import pytest
 from myagent.agent.core.agent.loop import ReActAgentLoop, _format_error_chain
 from myagent.agent.core.agent.types import AgentConfig
 from myagent.agent.core.provider import (
-    LLMProvider,
     LLMResponse,
     Message,
     RawToolCall,
@@ -87,14 +86,12 @@ from myagent.agent.core.systemprompt.types import PrompSection
 from myagent.agent.core.tool.tool import Tool
 from myagent.agent.execption import (
     AgentUnclaimedError,
-    LLMAuthError,
-    LLMCallError,
-    LLMRateLimitError,
     MaxStepsExceededError,
     RetryExhaustedError,
     ToolConsecutiveFailureError,
 )
-from myagent.agent.llm.llm_retry import LLMRerty
+from lifeprismevalue.llm.exceptions import LLMAuthError, LLMCallError, LLMRateLimitError
+from lifeprismevalue.llm.llm_retry import LLMRerty
 from myagent.infra.events.eventspec import REQUEST_ERROR
 from myagent.infra.events.service import EventService
 
@@ -106,7 +103,7 @@ LOOP_LOGGER = "myagent.agent.core.agent.loop"
 # ---------------------------------------------------------------------------
 
 
-class ScriptedProvider(LLMProvider):
+class ScriptedProvider:
     """按脚本逐次产出结果的假 Provider。
 
     脚本元素含义（每次模型调用消费一个）：
@@ -120,7 +117,8 @@ class ScriptedProvider(LLMProvider):
     """
 
     def __init__(self, script: list):
-        super().__init__(model="fake-model")
+        self.model = "fake-model"
+        self.params = None
         self._script = list(script)
         self.calls = 0
         self.seen_messages: list[list] = []

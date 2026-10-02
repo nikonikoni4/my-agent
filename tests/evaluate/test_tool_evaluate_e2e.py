@@ -28,7 +28,7 @@ from myagent.agent.core.session.store import SessionStore
 from myagent.agent.core.systemprompt.systemprompt import SystemPrompt
 from myagent.agent.core.systemprompt.types import PrompSection
 from myagent.agent.core.tool.tool import Tool, ToolErrorType
-from myagent.agent.llm.openai_provider import OpenAIProvider
+from lifeprismevalue.llm.openai_provider import OpenAIProvider
 from myagent.evaluate import ToolEvaluate
 from myagent.infra.events import EventService
 from myagent.infra.events.eventspec import TURN_END

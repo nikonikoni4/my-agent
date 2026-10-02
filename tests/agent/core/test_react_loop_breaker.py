@@ -17,7 +17,6 @@ import pytest
 from myagent.agent.core.agent.loop import ReActAgentLoop
 from myagent.agent.core.agent.types import AgentConfig
 from myagent.agent.core.provider import (
-    LLMProvider,
     LLMResponse,
     Message,
     RawToolCall,
@@ -60,11 +59,12 @@ class FlakyTool(Tool):
         raise RuntimeError("总是失败")
 
 
-class FakeProvider(LLMProvider):
+class FakeProvider:
     """按脚本逐轮返回的假 Provider：每轮返回一次工具调用或纯文本。"""
 
     def __init__(self, rounds: list[list]):
-        super().__init__(model="fake-model")
+        self.model = "fake-model"
+        self.params = None
         self._rounds = list(rounds)
         self.calls = 0
 

@@ -1,8 +1,8 @@
 import pytest
 from unittest.mock import AsyncMock
 from myagent.agent.core.provider import RawToolCall, Usage
-from myagent.agent.llm.openai_provider import OpenAIProvider,LLMCallError
-from myagent.agent.llm.openai_provider import LLMConnectionError
+from lifeprismevalue.llm.openai_provider import OpenAIProvider,LLMCallError
+from lifeprismevalue.llm.openai_provider import LLMConnectionError
 from myagent.agent.core.provider import Message
 from types import SimpleNamespace
 import httpx
@@ -143,7 +143,7 @@ async def test_HTTP状态错误不被误判为连接类(provider):
 @pytest.mark.asyncio
 async def test_连接类错误进入退避重试档():
     """闭环：归一后的 LLMConnectionError 被重试策略识别为 backoff_retry（延迟重试）"""
-    from myagent.agent.llm.llm_retry import LLMRerty
+    from lifeprismevalue.llm.llm_retry import LLMRerty
     from myagent.infra.events.payload import RequestErrorPayLoad
 
     async def _next():

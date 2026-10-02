@@ -16,8 +16,8 @@ from myagent.agent.agent_context import AgentContext, AgentPolicySpec
 from myagent.agent.core.agent.types import AgentConfig
 from myagent.agent.core.session import Session, SessionStore
 from myagent.agent.core.systemprompt import PrompSection, SystemPrompt
-from myagent.agent.llm.llm_retry import LLMRerty
-from myagent.agent.llm.openai_provider import OpenAIProvider
+from lifeprismevalue.llm.llm_retry import LLMRerty
+from lifeprismevalue.llm.openai_provider import OpenAIProvider
 from myagent.config.system_config import get_llm_api_key, get_llm_base_url, get_llm_model
 from myagent.infra.events.eventspec import REQUEST_ERROR
 

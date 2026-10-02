@@ -13,27 +13,27 @@ import pytest
 
 from myagent.agent.core.agent.loop import ReActAgentLoop
 from myagent.agent.core.agent.types import AgentConfig
-from myagent.agent.core.provider import LLMProvider, LLMResponse, Message, Usage
+from myagent.agent.core.provider import LLMResponse, Message, Usage
 from myagent.agent.core.session.session import Session
 from myagent.agent.core.session.types import SessionMetaData
 from myagent.agent.core.systemprompt.systemprompt import SystemPrompt
 from myagent.agent.execption import (
     AgentUnclaimedError,
-    LLMAuthError,
-    LLMRateLimitError,
     RetryExhaustedError,
 )
-from myagent.agent.llm.llm_retry import LLMRerty
+from lifeprismevalue.llm.exceptions import LLMAuthError, LLMRateLimitError
+from lifeprismevalue.llm.llm_retry import LLMRerty
 from myagent.infra.events.eventspec import REQUEST_ERROR
 from myagent.infra.events.service import EventService
 
 
-class ScriptedErrorProvider(LLMProvider):
+class ScriptedErrorProvider:
     """按脚本逐次给出结果的假 Provider：异常则抛出、LLMResponse 则产出、
     字符串 "hang" 则挂起（供取消用例触发 CancelledError）。"""
 
     def __init__(self, script: list):
-        super().__init__(model="fake-model")
+        self.model = "fake-model"
+        self.params = None
         self._script = list(script)
         self.calls = 0
 

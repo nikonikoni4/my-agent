@@ -2,12 +2,13 @@
 version: 2.5
 created_at: 2026-09-03
 updated_at: 2026-10-02
-last_updated: 更新 AgentContext ADR 至 v1.1（Session 显式绑定，重复绑定抛异常）
+last_updated: 更新 AgentContext ADR 至 v1.1；新增《内核 provider 解耦与错误决策输出收口》ADR
 abstract: agent 项目架构决策索引。
 ---
 
 | 日期 | 决策标题 | 状态 | 项目名 | 详情 |
 |------|---------|------|--------|------|
+| 2026-10-02 | 内核 provider 解耦与错误决策输出收口（Protocol 化 + provider/LLM 异常外移 lifeprismevalue + ErrorVerdict 收口） | decided | agent | [详情](2026-10-02-内核契约Protocol化与provider外移.md) |
 | 2026-10-02 | AgentContext 组件归属与事件隔离 v1.1（完整组件持有 + Session 显式绑定 + 重复绑定抛异常） | decided | agent | [详情](2026-10-02-AgentContext组件归属与事件隔离.md) |
 | 2026-09-15 | agent loop 错误处理重构（2 个 except + finally 三阶段 + 终止统一抛出 + 预算检查并入） | decided | agent | [详情](.\2026-09-15-agent-loop错误处理重构.md) |
 | 2026-09-15 | 异常分类树新增策略域与未知域（AgentPolicyError 窄域 + AgentUnknownError 兜底 + 一级域按"终结路径"划分） | decided | agent | [详情](.\2026-09-15-异常分类树新增策略域与未知域.md) |

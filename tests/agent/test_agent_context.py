@@ -11,7 +11,7 @@ import pytest
 
 from myagent.agent.agent_context import AgentContext
 from myagent.agent.core.agent.types import AgentConfig
-from myagent.agent.core.provider import LLMProvider, RawToolCall
+from myagent.agent.core.provider import RawToolCall
 from myagent.agent.core.session.session import Session
 from myagent.agent.core.session.types import SessionMetaData
 from myagent.agent.core.tool.tool import Tool, ToolErrorType
@@ -44,11 +44,12 @@ class FlakyTool(Tool):
         raise RuntimeError("总是失败")
 
 
-class NoopProvider(LLMProvider):
+class NoopProvider:
     """占位 Provider：本测试不驱动模型，任何调用都视为错误。"""
 
     def __init__(self):
-        super().__init__(model="noop")
+        self.model = "noop"
+        self.params = None
 
     async def chat(self, messages, tools=None):
         raise AssertionError("本测试不应调用模型")

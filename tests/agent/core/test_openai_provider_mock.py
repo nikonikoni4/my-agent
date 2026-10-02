@@ -18,7 +18,7 @@ import openai
 import pytest
 
 from myagent.agent.core.provider import LLMResponse, Message, Usage
-from myagent.agent.execption import (
+from lifeprismevalue.llm.exceptions import (
     LLMAuthError,
     LLMCallError,
     LLMConnectionError,
@@ -27,7 +27,7 @@ from myagent.agent.execption import (
     LLMQuotaError,
     LLMRateLimitError,
 )
-from myagent.agent.llm.openai_provider import (
+from lifeprismevalue.llm.openai_provider import (
     OpenAIProvider,
     _classify_openai_error,
     _retry_after,

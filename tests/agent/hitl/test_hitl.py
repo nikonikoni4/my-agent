@@ -12,10 +12,10 @@ import asyncio
 import pytest
 
 from myagent.agent.execption import (
-    LLMRateLimitError,
     MaxStepsExceededError,
     ToolConsecutiveFailureError,
 )
+from lifeprismevalue.llm.exceptions import LLMRateLimitError
 from myagent.agent.hitl.hitl import HITL
 from myagent.agent.hitl.types import HumanReturn
 from myagent.infra.events.payload import RequestErrorPayLoad
