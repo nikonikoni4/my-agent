@@ -342,7 +342,7 @@ class OpenAIProvider:
 
 if __name__ == "__main__":
     import asyncio
-    from myagent.config.system_config import get_llm_api_key, get_llm_base_url, get_llm_model
+    from lifeprismevalue.llm.config import get_llm_api_key, get_llm_base_url, get_llm_model
     from myagent.agent.core.tool.tool import Tool
     from typing import Any
     class WeatherTool(Tool):

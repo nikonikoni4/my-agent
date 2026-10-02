@@ -18,7 +18,7 @@ from myagent.agent.core.session import Session, SessionStore
 from myagent.agent.core.systemprompt import PrompSection, SystemPrompt
 from lifeprismevalue.llm.llm_retry import LLMRerty
 from lifeprismevalue.llm.openai_provider import OpenAIProvider
-from myagent.config.system_config import get_llm_api_key, get_llm_base_url, get_llm_model
+from lifeprismevalue.llm.config import get_llm_api_key, get_llm_base_url, get_llm_model
 from myagent.infra.events.eventspec import REQUEST_ERROR
 
 from lifeprismevalue.config import get_lifeprism_data_path
