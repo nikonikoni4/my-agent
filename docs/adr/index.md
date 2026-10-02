@@ -1,13 +1,14 @@
 ---
-version: 2.3
+version: 2.4
 created_at: 2026-09-03
-updated_at: 2026-09-19
-last_updated: 同步"工具调用解析与截断处置移入工具层"条目为 v2.1（payload 改整批 + session 的 arguments 按拿到时的形态落盘）
+updated_at: 2026-10-02
+last_updated: 新增 AgentContext 组件归属与事件隔离 ADR
 abstract: agent 项目架构决策索引。
 ---
 
 | 日期 | 决策标题 | 状态 | 项目名 | 详情 |
 |------|---------|------|--------|------|
+| 2026-10-02 | AgentContext 组件归属与事件隔离（完整组件持有 + 独立总线 + 直接依赖注入 + 后台任务收尾） | decided | agent | [详情](2026-10-02-AgentContext组件归属与事件隔离.md) |
 | 2026-09-15 | agent loop 错误处理重构（2 个 except + finally 三阶段 + 终止统一抛出 + 预算检查并入） | decided | agent | [详情](.\2026-09-15-agent-loop错误处理重构.md) |
 | 2026-09-15 | 异常分类树新增策略域与未知域（AgentPolicyError 窄域 + AgentUnknownError 兜底 + 一级域按"终结路径"划分） | decided | agent | [详情](.\2026-09-15-异常分类树新增策略域与未知域.md) |
 | 2026-09-15 | session 错误信息记录策略（类别 + 异常链文本 + 限深 3 层；llm/retry 只记真正重试） | decided | agent | [详情](.\2026-09-15-session错误信息记录策略.md) |
@@ -20,3 +21,10 @@ abstract: agent 项目架构决策索引。
 | 2026-09-07 | 会话文件夹命名与读取分类（有损名 + uuid 后缀 + 扫描 meta） | decided | agent | [详情](.\2026-09-07-会话文件夹命名与读取分类.md) |
 | 2026-09-04 | Session 持久化写入两级回滚（with 非原子前提下的整批原子性） | decided | agent | [详情](.\2026-09-04-session持久化写入两级回滚.md) |
 | 2026-09-03 | Session 承担过程日志职责（从仅存 Message 到过程日志） | decided | agent | [详情](.\2026-09-03-session承担过程日志职责.md) |
+
+## AgentContext 组件归属与事件隔离
+
+- updated_at: 2026-10-02
+- path: docs/adr/2026-10-02-AgentContext组件归属与事件隔离.md
+- 触发规则：调整 agent 装配、事件作用域或组件生命周期前读取。
+- 内容摘要：完整 ctx 持有组件；组件依赖独立总线；执行与持久化任务收尾后释放 ctx。

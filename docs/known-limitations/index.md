@@ -27,10 +27,10 @@ abstract: known-limitations 目录索引；收录当前系统"这样运作是有
 ## 索引
 
 ## event-service-无隔离机制
-- updated_at : 2026-09-11
+- updated_at : 2026-10-01
 - path: `docs/known-limitations/2026-09-11-event-service无隔离机制.md`
-- 触发规则：改动 `EventService` 订阅/派发逻辑、多 agent 共享事件总线、或排查 agent 间状态串扰时阅读
-- 内容摘要：EventService 仅以事件名分组、无 agent/session 隔离与解绑机制，多 agent 共享实例时订阅互相串扰；列出当前生效的两个订阅节点（`turn/end`、`session/event`）与已触发但无订阅方的事件
+- 触发规则：改动 `EventService` 订阅/派发逻辑、多 agent 共享事件总线、设计 agent 上下文（ctx）隔离容器、或排查 agent 间状态串扰时阅读
+- 内容摘要：EventService 仅以事件名分组、无 agent/session 隔离与解绑机制，多 agent 共享实例时订阅互相串扰；第 7 节记录已定方向——每个 agent 私有持有一份 EventService 的 ctx 隔离容器，EventService 自身不改、只改持有关系；含 4 项待定
 
 ## 工具熔断抛错时机与人在回路挂点缺失
 - updated_at : 2026-09-11
