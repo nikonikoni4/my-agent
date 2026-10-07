@@ -111,6 +111,8 @@ class SessionStore:
             updated_at=datetime.datetime.fromisoformat(meta_d["updated_at"]) if meta_d.get("updated_at") else None,
             format_version=meta_d.get("format_version", 1),
             parent_session_id=meta_d.get("parent_session_id"),
+            # 旧版文件没有 extra 行键，缺失或显式为 null 时回落为空 dict
+            extra=meta_d.get("extra") or {},
         )
 
         records: list[SessionRecordData] = []

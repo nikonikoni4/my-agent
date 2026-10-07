@@ -5,6 +5,7 @@ user/message），再用 store.load 还原为 Session 并逐项断言。meta 行
 的 meta_data 参数提供。store.load/create 只还原数据，不创建后台任务。
 """
 import datetime
+import json
 
 from conftest import make_chunk_record_list
 from myagent.agent.core.session.store import SessionStore
@@ -161,3 +162,52 @@ def test_flat_load_与create同规则往返(tmp_path):
     assert session.meta_data.session_id == "s1"
     assert [r.type for r in session.record_list] == ["user/message"]
     assert session.record_list[0].data.message.content == "hi"
+
+
+def test_meta_extra_自定义字段往返(tmp_path):
+    """meta 的 extra 自定义字段：落盘后在首行原样写出，load 原样还原。"""
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    path = session_dir / "s1.jsonl"
+
+    meta = SessionMetaData(
+        cwd="", session_id="s1", name="s1",
+        extra={"run_id": "r-42", "tags": ["a", "b"], "nested": {"k": 1}},
+    )
+    comp = make_presist(path, meta)
+    comp._buffer.append(SessionRecordData(
+        type="user/message", seq=1, turn=1, step=1, surface_op="append",
+        data=UserMessageData(message=Message(role="user", content="hi")),
+    ))
+    comp.presist()
+
+    first_line = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
+    assert first_line["extra"] == {"run_id": "r-42", "tags": ["a", "b"], "nested": {"k": 1}}
+    # extra 是首行最后一个键：自定义字段不散在顶层，也不与内置字段争位
+    assert list(first_line)[-1] == "extra"
+
+    session = SessionStore(session_dir, flat=True).load("s1", tmp_path / "proj")
+    assert session is not None
+    assert session.meta_data.extra == {"run_id": "r-42", "tags": ["a", "b"], "nested": {"k": 1}}
+
+
+def test_meta_extra_旧文件缺失或为null回落空dict(tmp_path):
+    """旧版首行没有 extra 键、或显式写成 null 时，load 都回落为空 dict 而不报错。"""
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    base = {
+        "type": "meta_data", "format_version": 1, "cwd": "", "name": "legacy",
+        "created_at": datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc).isoformat(),
+        "updated_at": datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc).isoformat(),
+        "parent_session_id": None,
+    }
+    # 旧版：整体没有 extra 行键
+    (session_dir / "old.jsonl").write_text(
+        json.dumps({**base, "session_id": "old"}, ensure_ascii=False) + "\n", encoding="utf-8")
+    # 边界：extra 行键存在但为 null
+    (session_dir / "null.jsonl").write_text(
+        json.dumps({**base, "session_id": "null", "extra": None}, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    store = SessionStore(session_dir, flat=True)
+    assert store.load("old", tmp_path / "proj").meta_data.extra == {}
+    assert store.load("null", tmp_path / "proj").meta_data.extra == {}

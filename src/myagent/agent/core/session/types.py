@@ -11,7 +11,7 @@ turn/step 是记录在时间轴上的定位信息，统一放在信封 SessionRe
 """
 
 from dataclasses import dataclass, field, asdict
-from typing import Literal
+from typing import Any, Literal
 from myagent.agent.core.provider import ChatParams, Message, Usage, StreamChunk
 import datetime,uuid
 
@@ -191,6 +191,9 @@ class SessionMetaData:
     updated_at : datetime.datetime | None = None
     format_version : int = 1
     parent_session_id : str | None = None
+    # 调用方自定义字段的容器：放在已有字段之后、命名上不与内置字段争位，避免将来
+    # 新增内置字段时撞名。值必须能被 json.dumps 序列化，否则会在后台持久化循环里抛错。
+    extra : dict[str, Any] = field(default_factory=dict)
     def __post_init__(self):
         """name 为空时回退为 session_id，保证每个会话总有可读的名称。"""
         if not self.name:
@@ -204,7 +207,9 @@ class SessionMetaData:
                 实例也为空则取当前 UTC 时间。
 
         Returns:
-            含 type/session_id/name/last_compact_loc/created_at/updated_at 的 dict。
+            含 type/format_version/session_id/cwd/name/created_at/updated_at/
+            parent_session_id/extra 的 dict；extra 恒为最后一个键，调用方的自定义
+            字段都在它里面，不散在顶层。
         """
         if updated_at is None:
             updated_at = self.updated_at if self.updated_at else datetime.datetime.now(datetime.timezone.utc)
@@ -217,6 +222,7 @@ class SessionMetaData:
             "created_at":self.created_at.isoformat(),
             "updated_at":updated_at.isoformat(),
             "parent_session_id" : self.parent_session_id,
+            "extra" : self.extra,
         }
 @dataclass
 class SessionRecordData:
