@@ -1,11 +1,12 @@
-"""LLM 调用的契约层：定义消息、采样参数和 Provider 接口。
+"""LLM 调用的契约层：定义消息、采样参数与模型调用接口 LLMClient。
 
 本模块属于 core/，只依赖标准库和 typing。
-具体实现（如 OpenAI 兼容接口）由 llm/ 层提供，通过构造函数注入。
+LLMClient 是结构化契约（Protocol）；具体实现由使用方提供并注入，
+内核不依赖任何供应商 SDK，也不解释供应商异常。
 """
-from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator
 from dataclasses import dataclass,field
-from typing import Any
+from typing import Any,Protocol
 import datetime
 import json
 
@@ -212,28 +213,24 @@ class ChatParams:
     top_k: int | None = None
     max_tokens: int | None = None
 
+class LLMClient(Protocol):
+    """内核消费的模型调用契约（结构化类型，实现方无需继承）。
 
-
-
-
-class LLMProvider(ABC):
-    """LLM 调用接口，由上层注入具体实现（依赖倒置）"""
-    def __init__(self,model: str,params: ChatParams | None = None):
-        self._params = params if params else None
-        self._model = model
+    LLMClient 由使用方实现并注入。model / params 是内核的只读快照，仅供写
+    request/header trace，不代表内核理解供应商的配置、路由或鉴权。
+    """
 
     @property
     def model(self) -> str:
-        """本次使用的模型名，供调用方写 request/header 快照"""
-        return self._model
+        """本次使用的模型名，内核只读，用于 request/header 快照"""
+        ...
 
     @property
     def params(self) -> ChatParams | None:
-        """采样参数，None 表示全部使用供应商默认值"""
-        return self._params
+        """采样参数，内核只读；None 表示全部使用供应商默认值"""
+        ...
 
-    @abstractmethod
-    async def chat(self, messages: list[Message],tools : list[dict] | None = None ) -> LLMResponse:
+    async def chat(self, messages: list[Message], tools: list[dict] | None = None) -> LLMResponse:
         """发送消息列表，返回模型回复
 
         Args:
@@ -243,9 +240,15 @@ class LLMProvider(ABC):
         Returns:
             LLMResponse: 模型回复及结束原因、token 用量
         """
-    @abstractmethod
-    def stream_chat(self, messages: list[Message], tools: list[dict] | None = None):
+        ...
+
+    def stream_chat(
+        self, messages: list[Message], tools: list[dict] | None = None
+    ) -> AsyncIterator[StreamChunk | LLMResponse]:
         """流式发送消息列表，逐步返回增量片段
+
+        契约：正常耗尽时，最后一项必为 LLMResponse 且恰好出现一次；中途异常
+        表示本次调用失败，已发出的片段不可撤回。
 
         Args:
             messages: 完整的对话消息列表，按时间顺序排列
@@ -255,36 +258,4 @@ class LLMProvider(ABC):
             StreamChunk: 正文或推理过程的增量片段
             LLMResponse: 流结束时的最终完整结果，含工具调用、finish_reason、token 用量
         """
-
-    def extract_tool_calls(self,response_message,finish_reason : str | None = None)->list[RawToolCall] | None:
-        """把 SDK 响应里的 tool_calls 提取为 RawToolCall 列表，并尽力解析 arguments。
-
-        解析是**尽力而为、静默失败**：只有 json.loads 的结果是 JSON 对象时才把
-        arguments 换成 dict；非法 JSON、以及解析成数组/数字/null 等非对象的情况
-        一律保持原字符串。不抛异常、不设标志位——类型本身就是标志。
-
-        schema 校验、解析失败的话术与回喂仍由工具层 ToolRegister 承接（信任
-        边界没变，只是把"能解析的顺手解析掉"，让护栏等上游拿得到结构化参数）。
-
-        Args:
-            response_message: SDK 响应中的 choices[0].message 对象，
-                可为 None（部分供应商无工具调用时该位置为空）。
-            finish_reason: 本次响应的结束原因，"length" 表示输出被截断。
-
-        Returns:
-            RawToolCall 列表；无工具调用时返回 None（输入为 None）或空列表。
-        """
-        if not response_message:
-            return None
-        calls = [
-            RawToolCall.from_wire(
-                id=tool_call.id,
-                name=tool_call.function.name,
-                raw_arguments=tool_call.function.arguments,
-            )
-            for tool_call in response_message.tool_calls
-        ]
-        if finish_reason == "length":
-            for call in calls:
-                call.truncated = True
-        return calls
+        ...

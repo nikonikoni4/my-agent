@@ -3,6 +3,7 @@ import asyncio
 from myagent.agent.hitl.base import HITLChannel
 from myagent.agent.hitl.types import HumanChoice,HITLMessage,HumanReturn
 from myagent.agent.execption import MaxStepsExceededError,ToolConsecutiveFailureError
+from myagent.agent.core.agent.types import ErrorVerdict
 from myagent.infra.events.payload import RequestErrorPayLoad
 class HITL:
     """
@@ -37,7 +38,7 @@ class HITL:
         self.grant_steps = grant_steps
         self.timeout = timeout
 
-    async def maxstep_continue(self,payload:RequestErrorPayLoad,_next:callable):
+    async def maxstep_continue(self,payload:RequestErrorPayLoad,_next:callable) -> ErrorVerdict | None:
         """
         当超过最大步数之后，会raise MaxStepsExceededError 由当前函数进行处理
 
@@ -61,13 +62,13 @@ class HITL:
         try:
             result : HumanReturn =await asyncio.wait_for(self.channel.ask_human(message),self.timeout)
             if result.choice_id == "continue":
-                return {"decision": "continue","grant": {"steps": self.grant_steps}}
+                return ErrorVerdict(decision="continue",grant={"steps": self.grant_steps})
             else:
-                return {"decision": "break"}
+                return ErrorVerdict(decision="break")
         except asyncio.TimeoutError:
-            return {"decision": "break"}
+            return ErrorVerdict(decision="break")
 
-    async def tool_breaker_continue(self,payload:RequestErrorPayLoad,_next:callable):
+    async def tool_breaker_continue(self,payload:RequestErrorPayLoad,_next:callable) -> ErrorVerdict | None:
         """工具熔断的处置：raise_on_break 配置下，单个工具连续失败达阈值时
         ToolRegister 抛 ToolConsecutiveFailureError——含义是"该工具已不可用、
         需要外部介入"，故交人工决定这一步怎么走。
@@ -93,10 +94,10 @@ class HITL:
         try:
             result : HumanReturn =await asyncio.wait_for(self.channel.ask_human(message),self.timeout)
             if result.choice_id == "continue":
-                return {"decision": "continue"}
-            return {"decision": "break","as_error": True}
+                return ErrorVerdict(decision="continue")
+            return ErrorVerdict(decision="break",as_error=True)
         except asyncio.TimeoutError:
-            return {"decision": "break","as_error": True}
+            return ErrorVerdict(decision="break",as_error=True)
 
     @staticmethod
     def _is_tool_breaker(error) -> bool:

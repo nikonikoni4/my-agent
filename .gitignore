@@ -12,3 +12,6 @@ lifeprismData
 lifeprismTestData/
 src/myagent/agent/core/agent/loopcopy.py
 evaluate
+
+# Claude Code 本地运行日志（工具自动生成，不参与版本控制）
+.claude/logs/

@@ -1,14 +1,15 @@
 ---
-version: 2.4
+version: 2.5
 created_at: 2026-09-03
 updated_at: 2026-10-02
-last_updated: 新增 AgentContext 组件归属与事件隔离 ADR
+last_updated: 更新 AgentContext ADR 至 v1.1；新增《内核 provider 解耦与错误决策输出收口》ADR
 abstract: agent 项目架构决策索引。
 ---
 
 | 日期 | 决策标题 | 状态 | 项目名 | 详情 |
 |------|---------|------|--------|------|
-| 2026-10-02 | AgentContext 组件归属与事件隔离（完整组件持有 + 独立总线 + 直接依赖注入 + 后台任务收尾） | decided | agent | [详情](2026-10-02-AgentContext组件归属与事件隔离.md) |
+| 2026-10-02 | 内核 provider 解耦与错误决策输出收口（Protocol 化 + provider/LLM 异常外移 lifeprismevalue + ErrorVerdict 收口） | decided | agent | [详情](2026-10-02-内核契约Protocol化与provider外移.md) |
+| 2026-10-02 | AgentContext 组件归属与事件隔离 v1.1（完整组件持有 + Session 显式绑定 + 重复绑定抛异常） | decided | agent | [详情](2026-10-02-AgentContext组件归属与事件隔离.md) |
 | 2026-09-15 | agent loop 错误处理重构（2 个 except + finally 三阶段 + 终止统一抛出 + 预算检查并入） | decided | agent | [详情](.\2026-09-15-agent-loop错误处理重构.md) |
 | 2026-09-15 | 异常分类树新增策略域与未知域（AgentPolicyError 窄域 + AgentUnknownError 兜底 + 一级域按"终结路径"划分） | decided | agent | [详情](.\2026-09-15-异常分类树新增策略域与未知域.md) |
 | 2026-09-15 | session 错误信息记录策略（类别 + 异常链文本 + 限深 3 层；llm/retry 只记真正重试） | decided | agent | [详情](.\2026-09-15-session错误信息记录策略.md) |
@@ -27,4 +28,4 @@ abstract: agent 项目架构决策索引。
 - updated_at: 2026-10-02
 - path: docs/adr/2026-10-02-AgentContext组件归属与事件隔离.md
 - 触发规则：调整 agent 装配、事件作用域或组件生命周期前读取。
-- 内容摘要：完整 ctx 持有组件；组件依赖独立总线；执行与持久化任务收尾后释放 ctx。
+- 内容摘要：完整 ctx 持有组件；Store 只加载数据，Session 首次显式绑定才启用事件与持久化；重复绑定抛 SessionReBindError 并拒绝。

@@ -72,7 +72,6 @@ import pytest
 from myagent.agent.core.agent.loop import ReActAgentLoop, _format_error_chain
 from myagent.agent.core.agent.types import AgentConfig
 from myagent.agent.core.provider import (
-    LLMProvider,
     LLMResponse,
     Message,
     RawToolCall,
@@ -87,14 +86,12 @@ from myagent.agent.core.systemprompt.types import PrompSection
 from myagent.agent.core.tool.tool import Tool
 from myagent.agent.execption import (
     AgentUnclaimedError,
-    LLMAuthError,
-    LLMCallError,
-    LLMRateLimitError,
     MaxStepsExceededError,
     RetryExhaustedError,
     ToolConsecutiveFailureError,
 )
-from myagent.agent.llm.llm_retry import LLMRerty
+from lifeprismevalue.llm.exceptions import LLMAuthError, LLMCallError, LLMRateLimitError
+from lifeprismevalue.llm.llm_retry import LLMRerty
 from myagent.infra.events.eventspec import REQUEST_ERROR
 from myagent.infra.events.service import EventService
 
@@ -106,7 +103,7 @@ LOOP_LOGGER = "myagent.agent.core.agent.loop"
 # ---------------------------------------------------------------------------
 
 
-class ScriptedProvider(LLMProvider):
+class ScriptedProvider:
     """按脚本逐次产出结果的假 Provider。
 
     脚本元素含义（每次模型调用消费一个）：
@@ -120,7 +117,8 @@ class ScriptedProvider(LLMProvider):
     """
 
     def __init__(self, script: list):
-        super().__init__(model="fake-model")
+        self.model = "fake-model"
+        self.params = None
         self._script = list(script)
         self.calls = 0
         self.seen_messages: list[list] = []
@@ -150,7 +148,11 @@ class ScriptedProvider(LLMProvider):
 
 
 class NoopPersistence:
-    """替身持久化：loop.persist_session_now 会调用它，测试中不做落盘。"""
+    """替身持久化：Session.append 投喂记录、loop.persist_session_now 触发落盘，
+    测试中两者都不做事。"""
+
+    def cache_data(self, record):
+        pass
 
     def presist(self):
         pass
@@ -210,10 +212,10 @@ def make_loop(script, *, tools=None, step_limit=10, max_retry_count=2, retry_str
 
     session.presistence 必须给替身：persist_session_now 只吞 OSError，
     为 None 时抛 AttributeError 会被当成 turn 级异常，污染用例语义。
-    retry_strategy 由调用方持有（EventService 弱引用，否则注册立即失效）。
+    retry_strategy 由调用方持有（EventService 存的是弱引用，否则注册立即失效）。
     """
     event_service = EventService()
-    session = Session(EventService(), SessionMetaData(cwd="."))
+    session = Session(SessionMetaData(cwd="."))
     session.presistence = NoopPersistence()
     config = AgentConfig(step_limit=step_limit, max_retry_count=max_retry_count)
     provider = ScriptedProvider(script)
@@ -659,7 +661,7 @@ async def test_P6b_触顶经授予额外步数后继续收敛():
             return {"decision": "continue", "grant": {"steps": 2}}
         return await nxt()
 
-    loop._event_service.register(REQUEST_ERROR.name, grant_steps)
+    loop._event_service.register(REQUEST_ERROR.name,grant_steps)
 
     await loop.turn(user_message())
 
@@ -689,7 +691,7 @@ async def test_P6c_每次触顶各授予一次_按合计抬高预算():
             return {"decision": "continue", "grant": {"steps": 1}}
         return await nxt()
 
-    loop._event_service.register(REQUEST_ERROR.name, grant_one)
+    loop._event_service.register(REQUEST_ERROR.name,grant_one)
 
     await loop.turn(user_message())
 
@@ -710,7 +712,7 @@ async def test_P6d_触顶后选break_不落授予记录():
     async def deny(payload, nxt):
         return {"decision": "break"}
 
-    loop._event_service.register(REQUEST_ERROR.name, deny)
+    loop._event_service.register(REQUEST_ERROR.name,deny)
 
     await loop.turn(user_message())
 
@@ -730,7 +732,7 @@ async def test_P6e_触顶后break带as_error_原样上抛并记error():
     async def abandon(payload, nxt):
         return {"decision": "break", "as_error": True}
 
-    loop._event_service.register(REQUEST_ERROR.name, abandon)
+    loop._event_service.register(REQUEST_ERROR.name,abandon)
 
     with pytest.raises(MaxStepsExceededError) as excinfo:
         await loop.turn(user_message())
@@ -755,7 +757,7 @@ async def test_P6f_触顶后break不带as_error_turn记interrupted():
     async def deny(payload, nxt):
         return {"decision": "break"}
 
-    loop._event_service.register(REQUEST_ERROR.name, deny)
+    loop._event_service.register(REQUEST_ERROR.name,deny)
 
     await loop.turn(user_message())
 
@@ -861,7 +863,7 @@ async def test_P11_工具熔断抛错_经ExceptionGroup上抛():
     tool = FlakyTool(max_consecutive_failures=5, raise_on_break=True)
     script = [tool_round(f"c{i}", tool_name="flaky") for i in range(5)]
     loop, provider, session = make_loop(script, tools=tool, step_limit=20)
-    loop._event_service.register(REQUEST_ERROR.name, on_error)
+    loop._event_service.register(REQUEST_ERROR.name,on_error)
 
     with pytest.raises(AgentUnclaimedError) as excinfo:
         await loop.turn(user_message())
@@ -1139,7 +1141,7 @@ async def test_请求组装_system_reminder置第二位并落request_header():
     """注册 system reminder：第 2 位是 role=user 的 <system-reminder> 包裹消息，
     内容同时以 request/header 事件落盘（不新增 message 记录）"""
     loop, provider, session = make_loop([LLMResponse(content="好的", finish_reason="stop")])
-    loop.system_prompt.register_system_reminder(loop.name, "请遵守编码规范")
+    loop.system_prompt.register_system_reminder("请遵守编码规范")
 
     await loop.turn(user_message("你好"))
 
@@ -1168,7 +1170,7 @@ async def test_请求组装_runtime_context合并进用户消息并落盘():
     """runtime context 作为追加文本块合并进当前用户消息，并随 user/message 落盘，
     保证每一步的输入都可由 session 复现"""
     loop, provider, session = make_loop([LLMResponse(content="好的", finish_reason="stop")])
-    loop.system_prompt.register_context(loop.name, "当前时间: 2026-09-12")
+    loop.system_prompt.register_context("当前时间: 2026-09-12")
 
     await loop.turn(user_message("你好"))
 
@@ -1207,13 +1209,14 @@ async def test_请求组装_自定义提示词与落盘还原(tmp_path):
     且落盘还原后能重建出与请求一致的消息列表（每一步输入可复现）"""
     event_service = EventService()
     project_path = tmp_path / "proj"
-    store = SessionStore(tmp_path / "sessions", event_service)
+    store = SessionStore(tmp_path / "sessions")
     session = store.create("请求组装落盘", project_path)
+    session.bind(event_service)
 
     system_prompt = SystemPrompt()
-    system_prompt.register_section("coder", PrompSection(name="tool_guide", order=10, text="你可以使用工具查询天气。"))
-    system_prompt.register_system_reminder("coder", "请遵守编码规范")
-    system_prompt.register_context("coder", "当前时间: 2026-09-12")
+    system_prompt.register_section(PrompSection(name="tool_guide", order=10, text="你可以使用工具查询天气。"))
+    system_prompt.register_system_reminder("请遵守编码规范")
+    system_prompt.register_context("当前时间: 2026-09-12")
 
     provider = ScriptedProvider([LLMResponse(content="好的", finish_reason="stop")])
     config = AgentConfig(step_limit=10, max_retry_count=2)
@@ -1221,7 +1224,8 @@ async def test_请求组装_自定义提示词与落盘还原(tmp_path):
                           name="coder", prompt_render_parame={})
 
     await loop.turn(user_message("你好"))
-    session.presistence.presist()
+    # 收尾用 stop：既把缓冲落盘，也结束持久化后台任务，避免用例残留任务
+    await session.presistence.stop()
 
     # 组装正确：第 1 位 system（全局 + 自定义段按 order 有序），第 2 位 reminder，第 3 位用户消息
     seen = provider.seen_messages[0]
@@ -1267,7 +1271,7 @@ async def test_请求组装_提示词变化写change快照():
     assert len(headers) == 1 and headers[0].data.reason == "initial"
 
     # 遮蔽全局 identity：换一段提示词，组装结果随之变化
-    loop.system_prompt.register_section(loop.name, PrompSection(name="identity", order=-100, text="你是新助手"))
+    loop.system_prompt.register_section(PrompSection(name="identity", order=-100, text="你是新助手"))
     await loop.turn(user_message("第二轮"))
 
     headers = records(session, "request/header")

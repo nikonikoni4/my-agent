@@ -2,15 +2,11 @@
 
 往返链路：SessionPresist 落盘（首次写入自动补 meta 行 + chunk 固件归并 + 一条
 user/message），再用 store.load 还原为 Session 并逐项断言。meta 行由 presist
-的 meta_data 参数提供。store.load/create 内部构造 SessionPresist（依赖运行中
-事件循环），测试体为 async。
+的 meta_data 参数提供。store.load/create 只还原数据，不创建后台任务。
 """
 import datetime
 
-import pytest
-
 from conftest import make_chunk_record_list
-from myagent.infra.events.service import EventService
 from myagent.agent.core.session.store import SessionStore
 from myagent.agent.core.session.persistence import SessionPresist
 from myagent.agent.core.session.types import (
@@ -31,12 +27,11 @@ def make_presist(path, meta) -> SessionPresist:
 
 
 def test_load_文件不存在返回None(tmp_path):
-    store = SessionStore(tmp_path / "session", EventService())
+    store = SessionStore(tmp_path / "session")
     assert store.load("no-such-id", tmp_path / "proj") is None
 
 
-@pytest.mark.asyncio
-async def test_load_往返_解包chunk_还原嵌套消息(tmp_path):
+def test_load_往返_解包chunk_还原嵌套消息(tmp_path):
     session_dir = tmp_path / "session"
     session_dir.mkdir()
     project_path = tmp_path / "proj"
@@ -52,14 +47,13 @@ async def test_load_往返_解包chunk_还原嵌套消息(tmp_path):
     comp._buffer.extend([*make_chunk_record_list(), user_rec])
     comp.presist()
 
-    session = SessionStore(session_dir, EventService()).load("s1", project_path)
+    session = SessionStore(session_dir).load("s1", project_path)
     assert session is not None
     meta_restored = session.meta_data
     records = session.record_list
-    # 组装断言：load 直接返回可用 Session，持久化组件随装配注入
-    assert session._event_service is not None
-    assert session.presistence is not None
-    assert session.presistence.file_path == path
+    # load 可在无事件循环环境下读取数据，事件与持久化留待显式绑定。
+    assert session._event_service is None
+    assert session.presistence is None
 
     # meta 行由 presist 首次写入自动补写，load 还原字段一致
     assert meta_restored.session_id == "s1"
@@ -113,19 +107,57 @@ async def test_load_往返_解包chunk_还原嵌套消息(tmp_path):
         assert r.uuid
 
 
-@pytest.mark.asyncio
-async def test_create_返回空会话并绑定持久化(tmp_path):
+def test_create_返回未绑定空会话(tmp_path):
     session_dir = tmp_path / "session"
     session_dir.mkdir()
     project_path = tmp_path / "proj"
-    store = SessionStore(session_dir, EventService())
+    store = SessionStore(session_dir)
 
     session = store.create("新会话", project_path)
 
     assert session.record_list == []
     assert session.meta_data.name == "新会话"
     assert session.meta_data.cwd == str(project_path)
-    assert session.presistence is not None
-    # 文件路径在项目编码子文件夹下，meta 行随首批记录才写入，此时文件尚不存在
-    assert session.presistence.file_path == project_path_to_session_folder(project_path, session_dir) / f"{session.meta_data.session_id}.jsonl"
-    assert not session.presistence.file_path.exists()
+    assert session.presistence is None
+    assert session._event_service is None
+    # create 只计算路径，绑定前不创建项目编码子目录或文件。
+    assert not store._session_file(session.meta_data.session_id, project_path).parent.exists()
+
+
+def test_flat_session_folder即存储位置(tmp_path):
+    """flat=True 时不编码 project_path，会话文件直接落在 session_folder 下。"""
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    project_path = tmp_path / "proj"
+    store = SessionStore(session_dir, flat=True)
+
+    session = store.create("平铺会话", project_path)
+
+    # 路径只有 session_folder 一层，不含项目编码子目录
+    assert store._session_file(session.meta_data.session_id, project_path) == \
+        session_dir / f"{session.meta_data.session_id}.jsonl"
+    # 项目信息仍以 meta.cwd 为准，只是不参与定位
+    assert session.meta_data.cwd == str(project_path)
+
+
+def test_flat_load_与create同规则往返(tmp_path):
+    """flat=True 时 load 与 create 用同一路径规则，写出的文件能被读回。"""
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    project_path = tmp_path / "proj"
+    path = session_dir / "s1.jsonl"
+
+    meta = SessionMetaData(cwd="", session_id="s1", name="s1")
+    comp = make_presist(path, meta)
+    comp._buffer.append(SessionRecordData(
+        type="user/message", seq=1, turn=1, step=1, surface_op="append",
+        data=UserMessageData(message=Message(role="user", content="hi")),
+    ))
+    comp.presist()
+
+    session = SessionStore(session_dir, flat=True).load("s1", project_path)
+
+    assert session is not None
+    assert session.meta_data.session_id == "s1"
+    assert [r.type for r in session.record_list] == ["user/message"]
+    assert session.record_list[0].data.message.content == "hi"

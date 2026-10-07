@@ -17,7 +17,6 @@ import pytest
 from myagent.agent.core.agent.loop import ReActAgentLoop
 from myagent.agent.core.agent.types import AgentConfig
 from myagent.agent.core.provider import (
-    LLMProvider,
     LLMResponse,
     Message,
     RawToolCall,
@@ -60,11 +59,12 @@ class FlakyTool(Tool):
         raise RuntimeError("总是失败")
 
 
-class FakeProvider(LLMProvider):
+class FakeProvider:
     """按脚本逐轮返回的假 Provider：每轮返回一次工具调用或纯文本。"""
 
     def __init__(self, rounds: list[list]):
-        super().__init__(model="fake-model")
+        self.model = "fake-model"
+        self.params = None
         self._rounds = list(rounds)
         self.calls = 0
 
@@ -80,6 +80,11 @@ class FakeProvider(LLMProvider):
 
 
 class NoopPersistence:
+    """替身持久化：Session.append 投喂记录、loop.persist_session_now 触发落盘，均不做事。"""
+
+    def cache_data(self, record):
+        pass
+
     def presist(self):
         pass
 
@@ -87,7 +92,7 @@ class NoopPersistence:
 def make_loop(tool: Tool, rounds: list[list], step_limit: int):
     """组装被测 ReActAgentLoop：真实 SystemPrompt + 假 Provider + 熔断工具。"""
     event_service = EventService()
-    session = Session(EventService(), SessionMetaData(cwd="."))
+    session = Session(SessionMetaData(cwd="."))
     session.presistence = NoopPersistence()
     config = AgentConfig(step_limit=step_limit, max_retry_count=2)
     provider = FakeProvider(rounds)

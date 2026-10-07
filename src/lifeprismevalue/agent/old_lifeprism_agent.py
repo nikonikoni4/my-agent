@@ -17,7 +17,8 @@ active_version**，不需要动代码。后三段（skill-list / user / recent_s
 prompt_render_parame 注入——两者注入键分别是段名 "agent" 与 reminder 的 name
 "custom_prompt"，故 prompt_render_parame 里要给两份参数。
 
-create_old_agent() 返回组装好的 ReActAgentLoop（提示词、工具、会话、重试策略均已接线）。
+create_old_agent() 返回装配完成的 AgentContext（提示词、工具、会话、重试策略均已接线）。
+驱动走 ctx.agent_loop（start / followup / cancel），收尾走 await ctx.close()。
 """
 
 from __future__ import annotations
@@ -26,14 +27,13 @@ import json
 import logging
 from pathlib import Path
 
-from myagent.agent.core.agent.loop import ReActAgentLoop
+from myagent.agent.agent_context import AgentContext, AgentPolicySpec
 from myagent.agent.core.agent.types import AgentConfig
 from myagent.agent.core.session import Session, SessionStore
 from myagent.agent.core.systemprompt import PrompSection, SystemPrompt
-from myagent.agent.llm.llm_retry import LLMRerty
-from myagent.agent.llm.openai_provider import OpenAIProvider
-from myagent.config.system_config import get_llm_api_key, get_llm_base_url, get_llm_model
-from myagent.infra.events import EventService
+from lifeprismevalue.llm.llm_retry import LLMRerty
+from lifeprismevalue.llm.openai_provider import OpenAIProvider
+from lifeprismevalue.llm.config import get_llm_api_key, get_llm_base_url, get_llm_model
 from myagent.infra.events.eventspec import REQUEST_ERROR
 
 from lifeprismevalue.config import get_lifeprism_data_path
@@ -154,10 +154,16 @@ def _build_skill_list(data_path: Path) -> str:
     return "# skill-list\n\n" + "\n\n".join(entries)
 
 
-def build_chat_system_prompt(
-    data_path: Path | None = None, prompt_version: str | None = None
-) -> SystemPrompt:
-    """复刻旧 chat 模式的提示词组装，返回注册完成的 SystemPrompt。
+def register_chat_system_prompt(
+    system_prompt: SystemPrompt,
+    *,
+    data_path: Path | None = None,
+    prompt_version: str | None = None,
+) -> None:
+    """把旧 chat 模式的提示词段注册进传入的 SystemPrompt。
+
+    注册目标是调用方给的对象：工厂传 ctx.system_prompt——ctx 是 SystemPrompt 的
+    持有者，它建的那一份就是 loop 实际用来组装请求的那一份。工厂自己再造一份没人用。
 
     分段顺序与旧 chat 模式一致（order 从 0 开始），来源分两类：
 
@@ -170,10 +176,11 @@ def build_chat_system_prompt(
     - agent 段：含占位符，注册为 callback section，参数由 SystemPrompt.render 注入
     - custom_prompt.md：注册为 System Reminder，不进 System Prompt（评测时是变量）
 
-    注意：渲染 agent 段需要给 ReActAgentLoop 传 prompt_render_parame
+    注意：渲染 agent 段需要给 AgentContext 传 prompt_render_parame
     （见 create_old_agent），否则 render 会因缺少参数而跳过该段。
 
     Args:
+        system_prompt: 注册目标，通常传 `ctx.system_prompt`。
         data_path: lifeprism 数据根目录，默认取 lifeprismevalue.config 的配置。
         prompt_version: 提示词版本名；为空取版本库的 active_version。
 
@@ -183,8 +190,6 @@ def build_chat_system_prompt(
     """
     data_path = (data_path or get_lifeprism_data_path()).resolve()
     chat_dir = data_path / "agent" / "chat"
-
-    system_prompt = SystemPrompt()
 
     # ---- 版本库段：(section 名, order, 版本库里的段名) ----
     loader = PromptLoader.for_data_path(data_path)
@@ -211,7 +216,7 @@ def build_chat_system_prompt(
         # 注册为 callback，参数由 SystemPrompt.render 注入（见 create_old_agent）
         text = _placeholder_text(content) if section_name == "agent" else content
         system_prompt.register_section(
-            AGENT_NAME, PrompSection(name=section_name, order=order, text=text)
+            PrompSection(name=section_name, order=order, text=text)
         )
 
     # ---- 运行时段 ----
@@ -219,7 +224,7 @@ def build_chat_system_prompt(
     skill_list = _build_skill_list(data_path)
     if skill_list:
         system_prompt.register_section(
-            AGENT_NAME, PrompSection(name="skill_list", order=4, text=skill_list)
+            PrompSection(name="skill_list", order=4, text=skill_list)
         )
 
     # user / recent_state 是用户数据，按原方式从文件读取
@@ -232,7 +237,7 @@ def build_chat_system_prompt(
         if content is None:
             continue
         system_prompt.register_section(
-            AGENT_NAME, PrompSection(name=name, order=order, text=content)
+            PrompSection(name=name, order=order, text=content)
         )
 
     # System Reminder：作为 Message List 第二位注入（System Prompt 之后、正常对话之前）
@@ -241,10 +246,8 @@ def build_chat_system_prompt(
     custom_prompt = _read_prompt_file(chat_dir / "custom_prompt.md")
     if custom_prompt is not None:
         system_prompt.register_system_reminder(
-            AGENT_NAME, _placeholder_text(custom_prompt), name="custom_prompt"
+            _placeholder_text(custom_prompt), name="custom_prompt"
         )
-
-    return system_prompt
 
 
 def create_old_agent(
@@ -255,28 +258,23 @@ def create_old_agent(
     session_id: str | None = None,
     step_limit: int = 20,
     max_retry_count: int = 3,
-) -> ReActAgentLoop:
-    """创建一个复刻旧 lifeprism chat 模式配置的 agent loop。
+) -> AgentContext:
+    """创建一个复刻旧 lifeprism chat 模式配置的 agent。
+
+    Returns:
+        装配完成的 AgentContext。总线、会话、提示词、重试策略与工具都已接线；
+        驱动执行走 `ctx.agent_loop`，收尾走 `await ctx.close()`。
 
     Args:
         data_path: lifeprism 数据根目录，默认取 lifeprismevalue.config 的配置。
         session_folder: 会话落盘根目录；data_path 会编码为其下的一层项目子目录。
-        name: agent 名称，同时作为 SystemPrompt 的注册名（隔离/遮蔽的键）。
+        name: agent 语义名，同时用作会话名。SystemPrompt 不按名字分键——一个实例
+            只服务一个 agent，遮蔽只在实例内部发生。
         session_id: 传入则尝试 load 已有会话，找不到时新建。
         step_limit: 单 turn 最大 step 数（步数兜底）。
         max_retry_count: LLM 调用错误的最大重试次数。
     """
     data_path = (data_path or get_lifeprism_data_path()).resolve()
-
-    event_service = EventService()
-    # 重试策略：订阅 request/error（waterfall 语义），沿用 lifeprism 的错误分类与退避
-    llm_retry = LLMRerty()
-    event_service.register(REQUEST_ERROR.name, llm_retry.request_error_event)
-
-    store = SessionStore(session_folder, event_service)
-    session: Session | None = store.load(session_id, data_path) if session_id else None
-    if session is None:
-        session = store.create(name, data_path)
 
     llm_client = OpenAIProvider(
         model=get_llm_model(),
@@ -284,13 +282,18 @@ def create_old_agent(
         base_url=get_llm_base_url(),
     )
     agent_config = AgentConfig(step_limit=step_limit, max_retry_count=max_retry_count)
-    agent_loop = ReActAgentLoop(
-        event_service,
-        session,
-        build_chat_system_prompt(data_path),
-        agent_config,
-        llm_client,
-        name=name,
+
+    # store 只做数据加载：create/load 返回未绑定的 Session，绑定由 AgentContext 构造完成
+    store = SessionStore(session_folder)
+    session: Session | None = store.load(session_id, data_path) if session_id else None
+    if session is None:
+        session = store.create(name, data_path)
+
+    ctx = AgentContext(
+        agent_name=name,
+        session=session,
+        agent_config=agent_config,
+        llm_client=llm_client,
         # 提示词占位符参数，组装请求时分别注入给 SystemPrompt.assemble（条目：
         # system-reminder / runtime-context）与 render（section）。
         # 结构为 {注入键: {占位符名: 值}}：外层 "agent" 是 section 名、
@@ -301,8 +304,13 @@ def create_old_agent(
             "custom_prompt": _agent_md_params(data_path),
         },
     )
-    # EventService 以弱引用持有订阅者：retry 策略对象必须由外部强引用，否则会被回收
-    agent_loop.llm_retry = llm_retry
+    # 提示词注册进 ctx 持有的那一份 SystemPrompt——loop 组装请求用的就是它
+    register_chat_system_prompt(ctx.system_prompt, data_path=data_path)
 
-    agent_loop.tool_register.register(build_lifeprism_tools())
-    return agent_loop
+    # 重试策略：订阅 request/error（waterfall 语义），沿用 lifeprism 的错误分类与退避。
+    # 对象由 ctx 强引用保活（EventService 存的是弱引用），无需再手工挂到 loop 上
+    llm_retry = LLMRerty()
+    ctx.register_policy(AgentPolicySpec(REQUEST_ERROR, [llm_retry.request_error_event], llm_retry))
+
+    ctx.agent_loop.tool_register.register(build_lifeprism_tools())
+    return ctx

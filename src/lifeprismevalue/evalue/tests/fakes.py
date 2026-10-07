@@ -1,9 +1,13 @@
 """假 agent 与假 session 文件：让用例级测试不碰 LLM。
 
-`FakeAgent` 只暴露 driver 真正用到的那几样（`_event_service` / `_session` / `followup` /
-`persist_session_now` / `cancel`）；`FileFakeAgent` 额外把 session 落成真文件，用来验
-「跑完复制改名」；`WriteFakeAgent` 在 followup 时按回调往数据根写东西（模拟落库 / 落盘）；
-`TurnEndAgent` 可以让某一轮以 error / interrupted 收场。
+`FakeAgent` 同时扮演新工厂返回值的两个角色，只暴露 driver 真正用到的那几样：
+
+- ctx 侧：`event_service`（观测事件）、`session`（取 session_id）、`agent_loop`（驱动入口）
+- loop 侧：`followup` / `persist_session_now` / `cancel`，以及内部用的 `_event_service` / `_session`
+
+`FileFakeAgent` 额外把 session 落成真文件，用来验「跑完复制改名」；`WriteFakeAgent` 在
+followup 时按回调往数据根写东西（模拟落库 / 落盘）；`TurnEndAgent` 可以让某一轮以
+error / interrupted 收场。
 """
 
 from __future__ import annotations
@@ -42,6 +46,12 @@ class FakeAgent:
         self.sent: list[str] = []
         self.persisted = False
         self.cancelled = False
+        # 替身同时扮演 ctx 与 loop：driver 只用 ctx 的 event_service/session 与 loop 的
+        # 三个方法，自指就够，不必为这几个成员再造一层代理对象。子类因此只需覆盖
+        # followup（经 agent_loop 派发回本体）即可。
+        self.agent_loop = self
+        self.event_service = self._event_service
+        self.session = self._session
 
     def followup(self, text: str) -> None:
         self.sent.append(text)

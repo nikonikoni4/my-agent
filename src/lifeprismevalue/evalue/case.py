@@ -124,7 +124,7 @@ class CaseContext:
 class TurnCollector:
     """订阅 session/event，等待 turn/end 并收集 assistant 正文。
 
-    `ReActAgentLoop.followup()` 只是把消息入队并唤醒，turn 在后台跑；完成信号是 session
+    `ctx.agent_loop.followup()` 只是把消息入队并唤醒，turn 在后台跑；完成信号是 session
     记录里的 `turn/end`（session 每次 append 都会触发 session/event）。
     用法：`expect_turn()` → `followup()` → `await wait_turn(timeout)`。
 
@@ -393,7 +393,11 @@ class CaseExecutor:
         当前只实现 `input_mode=scripted`（按 `turns` 顺序注入）；
         `input_mode=agent`（simulator 驱动）留待后续。
 
-        收尾固定两件事：先 flush 落盘（`persist_session_now`），再 `cancel()` 停掉后台循环。
+        收尾固定两件事：先 flush 落盘（`agent_loop.persist_session_now`），再
+        `cancel()` 停掉后台循环。
+
+        工厂返回的是 AgentContext（一个 agent 的全部组件），驱动执行走它的 agent_loop，
+        观测事件走它的 event_service。
         """
         if ctx.case.uses_simulator:
             raise NotImplementedError(f"TODO: input_mode=agent 的 simulator 驱动（用例 {ctx.case.id}）")
@@ -401,23 +405,26 @@ class CaseExecutor:
         agent = self._agent_factory(
             data_path=ctx.env_root,
             session_folder=ctx.session_folder,
-            # 注意：不要传 name——lifeprism 复刻 agent 的 SystemPrompt 按固定名注册，
-            # 改 name 会导致提示词查不到（提示词为空）。
+            # 不传 name：name 现在只决定会话名——提示词不再按名字分键，隔离由
+            # "一个 SystemPrompt 实例只服务一个 agent" 保证。
         )
         ctx.sessions[UNDER_TEST] = agent
-        collector = TurnCollector(agent._event_service)
+        collector = TurnCollector(agent.event_service)
         try:
             await self._drive_scripted(ctx, agent, collector)
         finally:
-            agent.persist_session_now()
-            agent.cancel()
+            agent.agent_loop.persist_session_now()
+            agent.agent_loop.cancel()
 
         return _session_id_of(agent)
 
     async def _drive_scripted(
         self, ctx: CaseContext, agent: Any, collector: TurnCollector
     ) -> None:
-        """按 `turns` 顺序逐轮注入（带 `trigger` 的条件注入尚未实现）。"""
+        """按 `turns` 顺序逐轮注入（带 `trigger` 的条件注入尚未实现）。
+
+        `agent` 是工厂返回的 AgentContext。
+        """
         case = ctx.case
         if not case.turns:
             logger.warning("用例 %s 没有 turns，未执行任何一轮", case.id)
@@ -440,12 +447,12 @@ class CaseExecutor:
     async def _send_and_wait(
         self, ctx: CaseContext, agent: Any, collector: TurnCollector, text: str
     ) -> None:
-        """发送一轮用户消息并等待本轮 turn/end。"""
+        """发送一轮用户消息并等待本轮 turn/end（`agent` 是 AgentContext）。"""
         # TODO: 超时路径与「运行未正常结束」不一致——这里抛错会冒到 run() 的兜底，
         # 该用例只剩 error，i~j（裁判 / 统计）不执行。待统一：超时也应走
         # 「运行未正常结束」收口，照样落证据与统计。
         collector.expect_turn()
-        agent.followup(text)
+        agent.agent_loop.followup(text)
         try:
             await collector.wait_turn(ctx.turn_timeout)
         except asyncio.TimeoutError as e:
@@ -510,12 +517,12 @@ class CaseExecutor:
             session_folder=ctx.session_folder,
         )
         ctx.sessions[JUDGE] = agent
-        collector = TurnCollector(agent._event_service)
+        collector = TurnCollector(agent.event_service)
         try:
             await self._send_and_wait(ctx, agent, collector, prompt_text)
         finally:
-            agent.persist_session_now()
-            agent.cancel()
+            agent.agent_loop.persist_session_now()
+            agent.agent_loop.cancel()
 
         raw = collector.last_assistant_text
         verdict = {
@@ -593,14 +600,18 @@ def execute_case(payload: dict, env: Any) -> dict:
 
 
 def default_under_test_agent_factory(**kwargs: Any) -> Any:
-    """默认的被测评 agent：lifeprism 复刻 agent（延迟导入，避免拖入重依赖）。"""
+    """默认的被测评 agent：lifeprism 复刻 agent（延迟导入，避免拖入重依赖）。
+
+    返回 AgentContext；driver 从它取 `agent_loop` 驱动、`event_service` 观测、
+    `session` 取 session_id。
+    """
     from lifeprismevalue.agent.old_lifeprism_agent import create_old_agent
 
     return create_old_agent(**kwargs)
 
 
 def default_judge_agent_factory(**kwargs: Any) -> Any:
-    """默认的裁判 agent：judge_agent（延迟导入）。"""
+    """默认的裁判 agent：judge_agent（延迟导入）。返回 AgentContext。"""
     from lifeprismevalue.agent.judge_agent import create_judge_agent
 
     return create_judge_agent(**kwargs)
@@ -959,7 +970,11 @@ def read_session_id(session_path: Path) -> str:
 
 
 def _session_id_of(agent: Any) -> str:
-    """从 agent 上取 session_id（agent._session.meta_data.session_id）。"""
-    session = getattr(agent, "_session", None)
+    """从 agent（AgentContext）上取 session_id（agent.session.meta_data.session_id）。
+
+    用 getattr 兜住"对象上没有 session"的情况（测试替身可能只有一部分成员），
+    取不到就返回空串，由调用方跳过落盘。
+    """
+    session = getattr(agent, "session", None)
     meta = getattr(session, "meta_data", None)
     return getattr(meta, "session_id", "") or ""

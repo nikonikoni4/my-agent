@@ -1,12 +1,12 @@
 from dataclasses import dataclass
 from typing import Literal
 import uuid
-from myagent.agent.core.agent.types import AgentConfig, FinalResult
+from myagent.agent.core.agent.types import AgentConfig, ErrorVerdict, FinalResult
 from myagent.agent.core.systemprompt import AssemblyPrompt, SystemPrompt
 from myagent.infra.events import EventService
 from myagent.agent.core.tool.register import ToolRegister
-from myagent.agent.execption import AgentUnclaimedError, LLMCallError, MaxStepsExceededError, RetryExhaustedError
-from myagent.agent.core.provider import LLMProvider,LLMResponse,Message
+from myagent.agent.execption import AgentUnclaimedError, MaxStepsExceededError, RetryExhaustedError
+from myagent.agent.core.provider import LLMClient,LLMResponse,Message
 from myagent.agent.core.session.types import (
     AssistantChunkData,AssistantMessageData, StepEndData,
     ToolCallData,ToolResultData,TurnEndData,
@@ -102,7 +102,7 @@ def _format_error_chain(error:BaseException,max_depth:int = ERROR_CHAIN_MAX_DEPT
 class RetryPolicy:
     """一档重试的退避参数：第 n 次重试等待 min(base_delay * multiplier^(n-1), cap) 秒。
 
-    参数值由策略注册表（LLMRerty）以 dict 形式给出，loop 在此承接为本结构再计算退避。
+    参数值由策略注册表（使用方注册，如 LLMRerty）以 dict 形式给出，loop 在此承接为本结构再计算退避。
 
     Attributes:
         base_delay: 第 1 次重试的基准等待秒数。
@@ -127,7 +127,7 @@ class ReActAgentLoop:
         session :Session,
         system_prompt : SystemPrompt,
         agent_config :AgentConfig,
-        llm_client:LLMProvider,
+        llm_client:LLMClient,
         name :str | None = None,
         prompt_render_parame :dict |None = None):
         """装配 ReAct 循环：注入依赖、初始化运行态、接线 turn 收尾回调。
@@ -216,6 +216,40 @@ class ReActAgentLoop:
         self._task.cancel()
         # 步骤 3：清空收件箱，避免残留消息在重启后被消费
         self.inbox = {"next_turn":[],"next_step":[]}
+
+    async def stop(self):
+        """停止后台循环，并等待它真正结束。
+
+        与 `cancel()` 的差别只在"等"：`cancel()` 只登记取消请求，投递时机由事件循环
+        决定，调用方不让出控制权就一直不投递；本方法让出控制权并等到任务收场，返回时
+        在途 turn 的 interrupted 终态已经写好。关闭编排（AgentContext.close）靠它保证
+        "先结束执行、再停持久化"的顺序——若提前返回，收尾期间的记录会写不进文件。
+
+        循环正常情况下会吞掉取消并 break，任务以正常结束收场；只有"任务尚未开始就被
+        取消"这一种收场会让 await 抛 CancelledError，这里消化掉。
+
+        Args:
+            无。
+
+        Returns:
+            None。
+
+        Events:
+            间接：在途 turn 收尾时触发 step/turn 的 interrupted 终态事件。
+
+        Raises:
+            无。循环自身的取消不上抛；调用方自身的取消请求原样传播。
+        """
+        self.cancel()
+        # 无任务视为空操作（循环从未启动，或已结束且未再 send）
+        if self._task is None:
+            return
+        try:
+            await self._task
+        except asyncio.CancelledError:
+            # 只消化"任务未及开始就被取消"的收场，不吞掉调用方自身的取消请求。
+            if asyncio.current_task().cancelling():
+                raise
 
     async def _loop ( self ):
         """后台循环：被唤醒后按 next_step、next_turn 顺序逐条消费收件箱。
@@ -502,7 +536,7 @@ class ReActAgentLoop:
         # 步骤 1：装配系统提示词与运行时提醒（每次请求都重新渲染）
         # 注入参数要同时给 assemble（渲染 system-reminder / runtime-context 条目）
         # 与 render（渲染 section），两个入口共用同一份 prompt_render_parame
-        assembly_prompt : AssemblyPrompt = self.system_prompt.assemble(self.name,self.prompt_render_parame)
+        assembly_prompt : AssemblyPrompt = self.system_prompt.assemble(self.prompt_render_parame)
         system_prompt = self.system_prompt.render(assembly_prompt,self.prompt_render_parame)
         system_reminder = assembly_prompt.system_reminder
 
@@ -738,32 +772,28 @@ class ReActAgentLoop:
             ASSISTANT_MESSAGE（写 assistant/message）；均另触发 session/event。
 
         Raises:
-            LLMCallError: 模型层领域异常，原样上抛交由 step 决策。
-            Exception: provider 层其它异常原样上抛。
+            Exception: provider 层异常原样上抛，交由 step 决策。
             UnboundLocalError: 流未产出任何 LLMResponse 时，返回处的 response 未绑定。
         """
-        try:
-            # 步骤 1：逐块消费模型流（工具 schema 每次现取，含熔断过滤）
-            async for item in self._llm_client.stream_chat(messages,self.tool_register.to_schemas()):
-                # 步骤 2a：终态响应——写 assistant/message 并广播
-                if isinstance(item, LLMResponse):
-                    response = item
-                    self._session.append("assistant/message",AssistantMessageData(Message(
-                        role = "assistant",
-                        content = response.content,
-                        tool_calls=response.tool_call_requests,
-                        reasoning_content=response.reasoning_content,
-                    ),usage=response.usage),surface_op="append",source_event_seqs=[])
-                    self._event_service.emit(ASSISTANT_MESSAGE.name,AssistantMessagePayload())
-                # 步骤 2b：流式增量——写 assistant/chunk 并广播
-                else:
-                    self._session.append("assistant/chunk",AssistantChunkData(item))
-                    self._event_service.emit(ASSISTANT_CHUNK.name,AssistantChunkPayload())
-        # 步骤 3：模型层错误原样上抛（此处不补记，交由 step 决策）
-        except LLMCallError:
-            raise
+        # 步骤 1：逐块消费模型流（工具 schema 每次现取，含熔断过滤）
+        # 模型层异常不在此拦截——原样上抛，交由 step 的决策链处置
+        async for item in self._llm_client.stream_chat(messages,self.tool_register.to_schemas()):
+            # 步骤 2a：终态响应——写 assistant/message 并广播
+            if isinstance(item, LLMResponse):
+                response = item
+                self._session.append("assistant/message",AssistantMessageData(Message(
+                    role = "assistant",
+                    content = response.content,
+                    tool_calls=response.tool_call_requests,
+                    reasoning_content=response.reasoning_content,
+                ),usage=response.usage),surface_op="append",source_event_seqs=[])
+                self._event_service.emit(ASSISTANT_MESSAGE.name,AssistantMessagePayload())
+            # 步骤 2b：流式增量——写 assistant/chunk 并广播
+            else:
+                self._session.append("assistant/chunk",AssistantChunkData(item))
+                self._event_service.emit(ASSISTANT_CHUNK.name,AssistantChunkPayload())
 
-        # 步骤 4：返回流末响应
+        # 步骤 3：返回流末响应
         return response
 
     def _complete_session(self,step_error):
@@ -851,9 +881,9 @@ class ReActAgentLoop:
         # 步骤 2：取消不进决策链，原样上抛
         if isinstance(step_error,asyncio.CancelledError):
             raise step_error
-        # 步骤 3：触发 request/error waterfall，取裁决值。返回值是无类型 dict，key 名
-        # 只在本点出现——在此拆成具名参数，下游不必再知道 dict 里有什么
-        verdict = await self._event_service.waterfall(REQUEST_ERROR.name,RequestErrorPayLoad(error_type=step_error)) or {}
+        # 步骤 3：触发 request/error waterfall，取裁决值。契约为 ErrorVerdict（见
+        # core/agent/types.py）——在此拆成具名参数，下游不必再知道 dict 里有什么
+        verdict: ErrorVerdict = await self._event_service.waterfall(REQUEST_ERROR.name,RequestErrorPayLoad(error_type=step_error)) or {}
         # 步骤 4：先落盘再处置——hand_decision 有两条上抛路径（as_error / 无人认领），
         # 落盘若放在它之后，恰恰是这两种最该留痕的情况会丢记录
         self._record_error_handle(step_error,verdict)
@@ -976,7 +1006,7 @@ class ReActAgentLoop:
             error_type=type(error).__name__,
         ))
 
-    def _record_error_handle(self,error,verdict:dict) -> None:
+    def _record_error_handle(self,error,verdict:ErrorVerdict) -> None:
         """落一条 agent/error-handle：这个错误被处置成了什么。
 
         **无论订阅方是否认领都写**——无人认领记 "unclaimed"，随后 hand_decision 会
@@ -988,7 +1018,7 @@ class ReActAgentLoop:
 
         Args:
             error: 触发本次处置的异常。
-            verdict: waterfall 的原始裁决值；空 dict 表示无人认领。
+            verdict: waterfall 的原始裁决值（ErrorVerdict）；空表示无人认领。
 
         Returns:
             None。

@@ -1,16 +1,19 @@
-"""OpenAI 兼容格式的 LLM 实现。
+"""OpenAI 兼容格式的 LLM 实现（消费方侧）。
 
 任何提供 chat.completions 兼容接口的供应商都可用，
 火山方舟只需 base_url 传入 https://ark.cn-beijing.volces.com/api/v3。
+
+本实现不再继承 myagent 内核的抽象基类，而是结构化满足
+myagent.agent.core.provider.LLMClient 契约（model / params / chat / stream_chat）。
 """
 from openai import AsyncOpenAI
 import httpx
 import openai
 import json
-from myagent.agent.core.provider import ChatParams, LLMProvider, LLMResponse, Message, StreamChunk, RawToolCall, Usage
+from myagent.agent.core.provider import ChatParams, LLMResponse, Message, StreamChunk, RawToolCall, Usage
 
 import logging
-from myagent.agent.execption import (
+from lifeprismevalue.llm.exceptions import (
     LLMCallError,
     LLMAuthError,
     LLMModelError,
@@ -104,8 +107,11 @@ def _classify_openai_error(e: openai.APIError) -> LLMCallError:
     )
 
 
-class OpenAIProvider(LLMProvider):
-    """基于 openai SDK 的实现，model 和 base_url 由调用方指定"""
+class OpenAIProvider:
+    """基于 openai SDK 的实现，model 和 base_url 由调用方指定。
+
+    结构化满足 LLMClient 契约，不继承内核基类。
+    """
 
     def __init__(self, model: str, api_key: str, base_url: str  ,chat_params:ChatParams|None = None):
         """
@@ -114,8 +120,19 @@ class OpenAIProvider(LLMProvider):
             api_key: 供应商的 API Key
             base_url: 兼容接口地址，None 表示使用 OpenAI 官方地址
         """
-        super().__init__(model,chat_params)
+        self._model = model
+        self._params = chat_params if chat_params else None
         self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+
+    @property
+    def model(self) -> str:
+        """本次使用的模型名，内核只读，用于 request/header 快照"""
+        return self._model
+
+    @property
+    def params(self) -> ChatParams | None:
+        """采样参数，内核只读；None 表示全部使用供应商默认值"""
+        return self._params
 
     async def chat(self, messages: list[Message], tools : list[dict] | None = None) -> LLMResponse:
         """发送消息列表，返回模型回复
@@ -168,7 +185,6 @@ class OpenAIProvider(LLMProvider):
             logger.debug(f"llm call 传输错误 {e}")
             raise _classify_transport_error(e) from e
 
-        print(completion)
         return LLMResponse(
             content=choice.message.content,
             reasoning_content=choice.message.reasoning_content,
@@ -291,9 +307,42 @@ class OpenAIProvider(LLMProvider):
             usage=usage,
         )
 
+    def extract_tool_calls(self,response_message,finish_reason : str | None = None)->list[RawToolCall] | None:
+        """把 SDK 响应里的 tool_calls 提取为 RawToolCall 列表，并尽力解析 arguments。
+
+        解析是尽力而为、静默失败：只有 json.loads 的结果是 JSON 对象时才把
+        arguments 换成 dict，非法或非对象的结果保持原字符串。不抛异常、不设
+        标志位，类型本身就是标志。
+
+        schema 校验、解析失败的话术与回喂由工具层 ToolRegister 承接。
+
+        Args:
+            response_message: SDK 响应中的 choices[0].message 对象，
+                可为 None（部分供应商无工具调用时该位置为空）。
+            finish_reason: 本次响应的结束原因，length 表示输出被截断。
+
+        Returns:
+            RawToolCall 列表；无工具调用时返回 None（输入为 None）或空列表。
+        """
+        if not response_message:
+            return None
+        calls = [
+            RawToolCall.from_wire(
+                id=tool_call.id,
+                name=tool_call.function.name,
+                raw_arguments=tool_call.function.arguments,
+            )
+            for tool_call in response_message.tool_calls
+        ]
+        if finish_reason == "length":
+            for call in calls:
+                call.truncated = True
+        return calls
+
+
 if __name__ == "__main__":
     import asyncio
-    from myagent.config.system_config import get_llm_api_key, get_llm_base_url, get_llm_model
+    from lifeprismevalue.llm.config import get_llm_api_key, get_llm_base_url, get_llm_model
     from myagent.agent.core.tool.tool import Tool
     from typing import Any
     class WeatherTool(Tool):

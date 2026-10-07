@@ -12,14 +12,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from myagent.agent.core.agent.loop import ReActAgentLoop
+from myagent.agent.agent_context import AgentContext, AgentPolicySpec
 from myagent.agent.core.agent.types import AgentConfig
 from myagent.agent.core.session import Session, SessionStore
 from myagent.agent.core.systemprompt import PrompSection, SystemPrompt
-from myagent.agent.llm.llm_retry import LLMRerty
-from myagent.agent.llm.openai_provider import OpenAIProvider
-from myagent.config.system_config import get_llm_api_key, get_llm_base_url, get_llm_model
-from myagent.infra.events import EventService
+from lifeprismevalue.llm.llm_retry import LLMRerty
+from lifeprismevalue.llm.openai_provider import OpenAIProvider
+from lifeprismevalue.llm.config import get_llm_api_key, get_llm_base_url, get_llm_model
 from myagent.infra.events.eventspec import REQUEST_ERROR
 
 from lifeprismevalue.config import get_lifeprism_data_path
@@ -98,25 +97,24 @@ Evidence_prompt = """
 """
 
 
-def build_judge_system_prompt(agent_name: str = AGENT_NAME) -> SystemPrompt:
-    """组装裁判 agent 的 System Prompt。
+def register_judge_system_prompt(system_prompt: SystemPrompt) -> None:
+    """把裁判 agent 的提示词段注册进传入的 SystemPrompt（工厂传 `ctx.system_prompt`）。
 
     注册两个 section：
     - `identity`：角色与判定规则（`Judge_prompt`），注册名用 `identity` 以遮蔽全局默认的
       「你是一个个人助手…」，避免与「评测裁判」角色冲突；
     - `evidence_input`：输入说明（`Evidence_prompt`），讲清 rubric / evidence / 对话记录
       三段输入的含义与 evidence 的结构。
+
+    Args:
+        system_prompt: 注册目标，通常传 `ctx.system_prompt`。
     """
-    system_prompt = SystemPrompt()
     system_prompt.register_section(
-        agent_name,
         PrompSection(name="identity", order=0, text=Judge_prompt),
     )
     system_prompt.register_section(
-        agent_name,
         PrompSection(name="evidence_input", order=1, text=Evidence_prompt),
     )
-    return system_prompt
 
 
 def create_judge_agent(
@@ -127,32 +125,26 @@ def create_judge_agent(
     session_id: str | None = None,
     step_limit: int = 20,
     max_retry_count: int = 3,
-) -> ReActAgentLoop:
+) -> AgentContext:
     """创建一个裁判 agent。
 
+    Returns:
+        装配完成的 AgentContext。驱动执行走 `ctx.agent_loop`，收尾走 `await ctx.close()`。
+
     注意（TODO）：
-    - System Prompt 现由 `build_judge_system_prompt` 注册（`Judge_prompt`），
+    - System Prompt 现由 `register_judge_system_prompt` 注册（`Judge_prompt`），
       当前只判"产出是否满足判分要点"；后续扩展判定内容（工具调用顺序等）时再补。
     - **暂不注册工具**：本角色只做判定，不记录数据。
 
     Args:
         data_path: lifeprism 数据根目录，默认取 lifeprismevalue.config 的配置。
         session_folder: 会话落盘根目录；data_path 会编码为其下的一层项目子目录。
-        name: agent 名称，同时作为会话名与 SystemPrompt 注册键。
+        name: agent 语义名，同时用作会话名。
         session_id: 传入则尝试 load 已有会话，找不到时新建。
         step_limit: 单 turn 最大 step 数（步数兜底）。
         max_retry_count: LLM 调用错误的最大重试次数。
     """
     data_path = (data_path or get_lifeprism_data_path()).resolve()
-
-    event_service = EventService()
-    llm_retry = LLMRerty()
-    event_service.register(REQUEST_ERROR.name, llm_retry.request_error_event)
-
-    store = SessionStore(session_folder, event_service)
-    session: Session | None = store.load(session_id, data_path) if session_id else None
-    if session is None:
-        session = store.create(name, data_path)
 
     llm_client = OpenAIProvider(
         model=get_llm_model(),
@@ -160,14 +152,24 @@ def create_judge_agent(
         base_url=get_llm_base_url(),
     )
     agent_config = AgentConfig(step_limit=step_limit, max_retry_count=max_retry_count)
-    agent_loop = ReActAgentLoop(
-        event_service,
-        session,
-        build_judge_system_prompt(name),
-        agent_config,
-        llm_client,
-        name=name,
+
+    # store 只做数据加载：create/load 返回未绑定的 Session，绑定由 AgentContext 构造完成
+    store = SessionStore(session_folder)
+    session: Session | None = store.load(session_id, data_path) if session_id else None
+    if session is None:
+        session = store.create(name, data_path)
+
+    ctx = AgentContext(
+        agent_name=name,
+        session=session,
+        agent_config=agent_config,
+        llm_client=llm_client,
+        prompt_render_parame=None,
     )
-    # EventService 以弱引用持有订阅者：retry 策略对象必须由外部强引用
-    agent_loop.llm_retry = llm_retry
-    return agent_loop
+    # 提示词注册进 ctx 持有的那一份 SystemPrompt——loop 组装请求用的就是它
+    register_judge_system_prompt(ctx.system_prompt)
+
+    # 重试策略对象由 ctx 强引用保活（EventService 存的是弱引用）
+    llm_retry = LLMRerty()
+    ctx.register_policy(AgentPolicySpec(REQUEST_ERROR, [llm_retry.request_error_event], llm_retry))
+    return ctx

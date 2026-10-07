@@ -15,13 +15,15 @@
   （tool/result 的运行时 payload 其实已填全，但为与其余几类同走一条路，仍从
   session/event 取。）
 - ConsoleChannel：把控制台本身当人在回路的应答通道（HITLChannel 实现）
-- main：读取控制台输入 -> agent.followup 入队；/cancel 调 agent.cancel() 打断当前输出。
+- main：读取控制台输入 -> ctx.agent_loop.followup 入队；/cancel 调 cancel() 打断当前输出。
 
 护栏（ToolUseGuard）只在这里挂：它是本地手工验证用的组件，不进 create_old_agent，
 免得评测/别的入口被动带上。白名单见 ALLOW_PATH，改这里就能试"拒"与"放行"两种情况。
 
 人在回路（HITL）同样只在这里挂：request/error 上接两个订阅方——step 超限与工具熔断
 ——它们都由控制台向人提问（见 ConsoleChannel）。step_limit 调成 1 便于一步触顶。
+
+两者都经 ctx.register_policy 挂到本 agent 自己的总线上，装配见 _main。
 
 控制台输入：
     普通文本  作为用户消息发送（agent 正在输出时输入会先入队，本轮结束后执行）
@@ -38,6 +40,7 @@ from __future__ import annotations
 import asyncio
 import re
 
+from myagent.agent.agent_context import AgentPolicySpec
 from myagent.agent.core.session.types import (
     AssistantMessageData,
     ToolCallData,
@@ -263,28 +266,31 @@ async def _aio_input(prompt: str) -> str:
 
 
 async def _main() -> None:
-    agent = create_old_agent(step_limit=HITL_STEP_LIMIT)
-    # event_service 由 create_old_agent 内部创建并被 loop 持有；这里取来挂监控。
-    # monitor 必须保持强引用（见 ConsoleMonitor.__init__ 的弱引用说明），
-    # 它是 _main 的局部变量，函数存活期间不会被回收。
-    monitor = ConsoleMonitor(agent._event_service)
+    # 工厂返回装配完成的 AgentContext：总线、会话、提示词、重试策略已接线
+    ctx = create_old_agent(step_limit=HITL_STEP_LIMIT)
+    loop = ctx.agent_loop
 
-    # 挂路径护栏：订阅 tool/call（waterfall 语义），在工具执行前逐条裁决文件路径。
-    # 同 monitor，它也必须由 _main 的局部变量强引用——EventService 存的是 WeakMethod，
-    # 没人强引用的话注册当场失效（不报错，只是护栏永远不生效）。
+    # monitor 订阅 ctx 的私有总线。它只是观测者、不属策略组件，故不经 register_policy，
+    # 必须由本函数局部变量强引用——EventService 存的是 WeakMethod，没人强引用时注册
+    # 当场失效（不报错，只是监控永远不生效）。
+    monitor = ConsoleMonitor(ctx.event_service)
+
+    # 路径护栏（订阅 tool/call，waterfall 语义，在工具执行前逐条裁决文件路径）与
+    # 人在回路（订阅 request/error）都经 register_policy 挂载：策略对象由
+    # ctx.policy_objects 强引用保活，不再需要靠局部变量维持。
+    # 同一对象（HITL）的两个回调必须写在同一个 AgentPolicySpec 里——register_policy
+    # 按对象身份去重，拆成两个 spec 会让第二个被当成重复注册而跳过，
+    # tool_breaker_continue 会静默失效。注册顺序即 waterfall 洋葱层级（先注册者在外层），
+    # 工厂已注册的 LLMRerty 在最外层，对这两类错误都不认领、委托给下面的订阅方。
     tool_use_guard = ToolUseGuard({"allow_path": ALLOW_PATH})
-    agent._event_service.register(TOOL_CALL.name, tool_use_guard.file_sys_path_guard)
-
-    # 挂人在回路：request/error 上按序接两个订阅方。两者管辖的错误类型不重叠
-    # （step 超限 / 工具熔断），前面那个不认领时会 await _next() 交给下一个；
-    # create_old_agent 已注册的 LLMRerty 在最外层，对这两类错误同样不认领。
-    # 强引用要求同 monitor：hitl 由局部变量持有，channel 由 hitl 持有。
     channel = ConsoleChannel()
     hitl = HITL(channel, grant_steps=HITL_GRANT_STEPS, timeout=HITL_TIMEOUT)
-    agent._event_service.register(REQUEST_ERROR.name, hitl.maxstep_continue)
-    agent._event_service.register(REQUEST_ERROR.name, hitl.tool_breaker_continue)
+    ctx.register_policy([
+        AgentPolicySpec(TOOL_CALL, [tool_use_guard.file_sys_path_guard], tool_use_guard),
+        AgentPolicySpec(REQUEST_ERROR, [hitl.maxstep_continue, hitl.tool_breaker_continue], hitl),
+    ])
 
-    agent.start()
+    loop.start()
     print("=== lifeprism agent 控制台 ===")
     print("直接输入消息对话；/cancel 取消当前输出；/exit 退出")
     try:
@@ -304,12 +310,14 @@ async def _main() -> None:
             if line == "/exit":
                 break
             if line == "/cancel":
-                agent.cancel()
+                loop.cancel()
                 print("[console] 已取消当前输出，可继续输入")
                 continue
-            agent.followup(line)
+            loop.followup(line)
     finally:
-        agent.cancel()
+        # 统一收尾：先停 loop 并等它结束（在途 turn 记 interrupted 终态），再停持久化
+        # 并把剩余缓冲写入文件。顺序由 ctx.close 保证（见 ADR 关闭顺序）。
+        await ctx.close()
         print("已退出控制台")
 
 

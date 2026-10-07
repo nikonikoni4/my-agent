@@ -1,20 +1,17 @@
-"""系统级配置。
+"""LLM 连接配置（消费方侧）。
 
-LLM 连接参数（模型 / 地址 / Key）统一从项目根 .env 读取，供所有 agent 共用：
-
+模型 / 地址 / Key 统一从项目根 .env 读取：
 - MODEL      : 模型名
 - BASE_URL   : 兼容接口地址
 - ARK_API_KEY: API Key
 
-只在这里解析一次环境变量；各 agent 通过下面的取值函数获取，不再各自硬编码模型名。
+由 myagent.config.system_config 迁入：provider 的连接参数归消费方持有，
+内核不再携带 LLM 连接配置。取值行为与迁入前一致。
 """
 
 import os
-from pathlib import Path
 
 from dotenv import load_dotenv
-
-local_data_path = Path("./localData")
 
 # 只填充进程启动时尚未设置的变量，重复调用无副作用；
 # 放在模块导入时执行，保证取值函数读到的是 .env 的值。

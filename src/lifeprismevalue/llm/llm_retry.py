@@ -1,6 +1,6 @@
 # llm_retry组建订阅agent中的request/error事件，用户判断是否重试
 
-from myagent.agent.execption import (
+from lifeprismevalue.llm.exceptions import (
     LLMConnectionError,
     LLMQuotaError,
     LLMRateLimitError,

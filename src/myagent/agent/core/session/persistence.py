@@ -5,8 +5,6 @@ import json
 import logging
 from pathlib import Path
 
-from myagent.infra.events import EventService
-from myagent.infra.events.eventspec import SessionEventPayload
 from myagent.agent.core.session.types import SessionRecordData,TextChunkData,AssistantChunkData,SessionMetaData
 
 logger = logging.getLogger(__name__)
@@ -14,20 +12,24 @@ logger = logging.getLogger(__name__)
 
 class SessionPresist:
     """
-    session的持久化组件，他订阅sesson/event （session.appen）事件进行持久化,不负责加载逻辑
+    session的持久化组件，由会话自己持有并直接投喂记录，不负责加载逻辑
     重要：
     1. 以接口的形式进行持久化，后续如果更换成数据库，jsonl等不同的保存类型，核心代码不必。 -- 暂不实现，先只写file
-    2. event事件进入后不马上写入，而是等待2秒
+    2. 记录进入后不马上写入，而是等待2秒
     3. 写入以批为单位保证不出现半批数据：先序列化整批，再记录文件原大小写入，
        失败时截断回原大小；当场截断失败则记下目标大小，下次写入前先补截断，
        补截断没完成之前绝不写入新数据
+
+    不订阅事件总线：总线是进程内共享的，靠订阅 session/event 收记录会让同总线上
+    其他会话的记录灌进本组件的缓冲，造成会话文件互相污染（见
+    docs/known-limitations/2026-09-11-event-service无隔离机制.md）。投喂入口是
+    cache_data，由 Session.append 直接调用。
     """
-    def __init__(self, event_service: EventService, file_path: Path, meta_data: SessionMetaData):
+    def __init__(self, file_path: Path, meta_data: SessionMetaData):
         self.file_path = file_path
         # 会话目录可能从未创建（新项目/新环境首次落盘），不建目录直接 append 会 FileNotFoundError
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
         self.meta_data = meta_data
-        event_service.register("session/event", self.cache_data)
         self._buffer :list[SessionRecordData] = []
         # 上次写入失败后文件应回滚到的字节数；None 表示没有待补的回滚
         self._pending_truncate: int | None = None
@@ -39,13 +41,30 @@ class SessionPresist:
         if not task.cancelled() and task.exception() is not None:
             logger.error("session 持久化循环意外终止", exc_info=task.exception())
 
-    def cache_data(self, payload: SessionEventPayload):
-        """session/event触发，写入缓存。
+    async def stop(self) -> None:
+        """停止并等待后台循环结束，然后将剩余缓冲写入文件。
 
-        事件携带的是 SessionEventPayload（内含记录的深拷贝），buffer 存的必须是
-        SessionRecordData 本体，否则 presist 时访问 record.type 会直接报错。
+        调用前应先结束会话记录的生产方，避免停止后继续追加记录。
+        可重复调用；写入失败保留缓冲并抛出异常，调用方可再次 stop 重试。
+        后台任务的非取消异常原样传播，收尾仍尝试写入剩余记录。
         """
-        self._buffer.append(payload.session_record)
+        self._presist_loop.cancel()
+        try:
+            await self._presist_loop
+        except asyncio.CancelledError:
+            # 只消化被停止任务的取消，不吞掉调用方自身的取消请求。
+            if asyncio.current_task().cancelling():
+                raise
+        finally:
+            self.presist()
+
+    def cache_data(self, record: SessionRecordData):
+        """把一条会话记录收进待写缓冲，供 loop() 整批落盘。
+
+        由 Session.append 直接调用，不经事件总线。buffer 存的是 SessionRecordData
+        本体：presist 时按其 type 归并 chunk、按 to_record_dict 序列化。
+        """
+        self._buffer.append(record)
 
     def _conserve_chunk_type(self):
         """将assistant/chunk 类型 的recorddata -> text-chunk 进行合并"""
