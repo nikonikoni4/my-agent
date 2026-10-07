@@ -39,13 +39,29 @@ class SessionStore:
     """
     作用：负责 session 的管理(load/resume，create，fork)
     session 的存储方法：应该是一个可扩展的存储方式，目前只支持从文件获取，但是要能够实现可扩展性，比如未来支持sqlite存储
+
+    目录布局由 flat 决定：默认按项目路径分层（session_folder 是根目录，其下每个项目
+    一个编码子目录）；flat=True 时 session_folder 本身就是存储位置，会话文件直接放进去。
     """
 
-    def __init__(self, session_folder: Path):
+    def __init__(self, session_folder: Path, flat: bool = False):
+        """
+        Args:
+            session_folder: 会话存储目录。flat=False 时是会话根目录，项目路径编码为其下的
+                一层项目子目录；flat=True 时它就是实际存储位置。
+            flat: 关闭按项目路径分层。默认 False，保持"每个项目一个子目录"的既有布局。
+        """
         self.session_folder = session_folder
+        self.flat = flat
 
     def _session_file(self, session_id: str, project_path: Path) -> Path:
-        """按 session_id + project_path 定位会话文件：项目路径编码为 session_folder 下的项目子文件夹"""
+        """按 session_id 定位会话文件。
+
+        flat=True 时直接拼 session_folder，project_path 不参与定位；默认下 project_path
+        编码为 session_folder 下的项目子文件夹。
+        """
+        if self.flat:
+            return self.session_folder / f"{session_id}.jsonl"
         return project_path_to_session_folder(project_path, self.session_folder) / f"{session_id}.jsonl"
 
     def create(self, name: str, project_path: Path) -> Session:
@@ -56,7 +72,8 @@ class SessionStore:
 
         Args:
             name: 会话名称，为空串时 SessionMetaData 自动回退为 session_id。
-            project_path: 项目路径，决定会话文件所在的项目子文件夹，并记入 meta 的 cwd。
+            project_path: 项目路径，记入 meta 的 cwd；非 flat 布局下还决定会话文件所在的
+                项目子文件夹，flat=True 时只记 cwd、不参与定位。
         """
         meta = SessionMetaData(cwd=str(project_path), name=name)
         session_file = self._session_file(meta.session_id, project_path)
@@ -69,8 +86,9 @@ class SessionStore:
         形态一致。返回的 Session 尚未接入总线；调用方 bind 后即可传入 AgentLoop。
 
         Args:
-            session_id: 会话 id，定位 {project_path 编码后的项目文件夹}/{session_id}.jsonl。
-            project_path: 项目路径，编码为 session_folder 下的项目子文件夹。
+            session_id: 会话 id，定位 {项目文件夹}/{session_id}.jsonl；flat=True 时直接定位
+                {session_folder}/{session_id}.jsonl。
+            project_path: 项目路径，编码为 session_folder 下的项目子文件夹；flat=True 时不使用。
 
         Returns:
             未绑定的 Session；文件不存在或为空时 warning 并返回 None。

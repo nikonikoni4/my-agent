@@ -122,3 +122,42 @@ def test_create_返回未绑定空会话(tmp_path):
     assert session._event_service is None
     # create 只计算路径，绑定前不创建项目编码子目录或文件。
     assert not store._session_file(session.meta_data.session_id, project_path).parent.exists()
+
+
+def test_flat_session_folder即存储位置(tmp_path):
+    """flat=True 时不编码 project_path，会话文件直接落在 session_folder 下。"""
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    project_path = tmp_path / "proj"
+    store = SessionStore(session_dir, flat=True)
+
+    session = store.create("平铺会话", project_path)
+
+    # 路径只有 session_folder 一层，不含项目编码子目录
+    assert store._session_file(session.meta_data.session_id, project_path) == \
+        session_dir / f"{session.meta_data.session_id}.jsonl"
+    # 项目信息仍以 meta.cwd 为准，只是不参与定位
+    assert session.meta_data.cwd == str(project_path)
+
+
+def test_flat_load_与create同规则往返(tmp_path):
+    """flat=True 时 load 与 create 用同一路径规则，写出的文件能被读回。"""
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    project_path = tmp_path / "proj"
+    path = session_dir / "s1.jsonl"
+
+    meta = SessionMetaData(cwd="", session_id="s1", name="s1")
+    comp = make_presist(path, meta)
+    comp._buffer.append(SessionRecordData(
+        type="user/message", seq=1, turn=1, step=1, surface_op="append",
+        data=UserMessageData(message=Message(role="user", content="hi")),
+    ))
+    comp.presist()
+
+    session = SessionStore(session_dir, flat=True).load("s1", project_path)
+
+    assert session is not None
+    assert session.meta_data.session_id == "s1"
+    assert [r.type for r in session.record_list] == ["user/message"]
+    assert session.record_list[0].data.message.content == "hi"
