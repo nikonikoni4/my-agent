@@ -1,4 +1,21 @@
 # 单文件，若之后内容扩充在修改为文件夹
+"""工具护栏：在 tool/call 事件链上、工具执行之前做路径白名单检测。
+
+**本模块与 lifeprism 强耦合，耦合点只有一处：`ToolUseGuard._PATH_PARAM_BY_TOOL`。**
+
+那张表把 lifeprism 文件类工具的工具名与各自的路径参数名硬编码在 myagent 内核里。
+内核本不该认识任何具体工具，这里是个例外。代价是明确的：
+
+- lifeprism 新增或改名一个带路径参数的工具时，这张表不改就漏检——白名单上直接
+  多一个洞，而且不会有任何报错提示你漏了。
+- 这张表是 myagent 内核里唯一提到具体工具名的地方（工具注册表在消费方装配）。
+  跨仓库改工具时，必须记得回来改这里。
+
+正确形态是让工具自己声明"哪个参数是路径"（schema 里标记，或注册时声明），内核
+按声明取数，从而删掉这张表。当前未做，属已知的待解耦项。表只此一处，新增带路径
+的工具时补一行即可。
+"""
+import json
 import logging
 from pathlib import Path
 
@@ -24,8 +41,8 @@ class ToolUseGuard:
     的反对并进来（见 file_sys_path_guard）。
     """
 
-    # 受管工具 -> 其路径参数名。注意这里是耦合了 lifeprism 的工具调用，但是目前仍
-    # 写在这里面；正常应该这里是直接 import 工具然后获取工具的名称而不是硬编码。
+    # 受管工具 -> 其路径参数名。这里是本模块与 lifeprism 的耦合点（见文件头说明）：
+    # 内核硬编码具体工具名，lifeprism 侧增改工具时此处必须同步。
     # 新增带路径的工具时，在这里补一行即可（只此一处）。
     _PATH_PARAM_BY_TOOL = {
         "read_file": "file_path",
@@ -99,11 +116,14 @@ class ToolUseGuard:
         param_name = self._PATH_PARAM_BY_TOOL.get(call.name)
         if param_name is None:
             return None
-        # 参数没解析成 dict：这个调用本来就走不通执行路径，跳过它不产生"绕过护栏
+        # 归一化成 dict：dict 直通，str 再解析一次（见 _parse_arguments）。护栏不能
+        # 因为上游没解析出结构就跳过检——那样"护栏只认 dict"本身就成了绕过口子。
+        arguments = self._parse_arguments(call.arguments)
+        # 连解析都拿不到对象：这个调用本来就走不通执行路径，跳过它不产生"绕过护栏
         # 执行危险动作"的口子（见 ADR: 2026-09-10-工具调用解析与截断处置移入工具层）
-        if not isinstance(call.arguments, dict):
+        if arguments is None:
             return None
-        raw_path = call.arguments.get(param_name)
+        raw_path = arguments.get(param_name)
         # 路径缺失/非字符串：不归护栏管，交工具层的参数校验去报错
         if not isinstance(raw_path, str) or not raw_path:
             return None
@@ -117,6 +137,30 @@ class ToolUseGuard:
             f"路径 {raw_path} 不在允许访问的范围内，已拒绝 {call.name} 的调用；"
             f"可访问范围：{', '.join(str(p) for p in self.allow_path)}"
         )
+
+    @staticmethod
+    def _parse_arguments(arguments: str | dict) -> dict | None:
+        """把 call.arguments 归一成 dict；拿不到对象返回 None。
+
+        dict 直通（provider 已解析成功）。str 在此再试一次 json.loads：provider
+        尽力解析失败时留的是 wire 原文，但"provider 没解析出来"不等于"这条调用
+        没有结构化参数"——session 回放等其他构造路径同样可能给出合法 JSON 字符串。
+        护栏是安全判据，判据所需的数据得自己拿得准，不能因为上游形态不同而静默免检。
+
+        解析不出对象（非法 JSON，或结果是数组/数字/null）返回 None，由调用方按
+        "跳过"处理——这类调用在工具层也会解析失败、拿不到可执行参数。
+
+        不修改输入：返回的是新对象或原对象本身，绝不写回 call.arguments。
+        """
+        if isinstance(arguments, dict):
+            return arguments
+        if not isinstance(arguments, str):
+            return None
+        try:
+            parsed = json.loads(arguments)
+        except json.JSONDecodeError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
 
     def _is_allowed(self, path: str) -> bool:
         """判断路径是否落在白名单内（任一条目为其祖先或本身即算命中）。"""

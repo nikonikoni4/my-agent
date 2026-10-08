@@ -2,8 +2,10 @@
 
 护栏面对一批 tool/call 时，对**每一条**只有两种结果，用例按其组织：
 
-- **反对**：这条 call 的路径落在白名单外 → 其 call_id 出现在裁决表里
-- **不反对**：路径在册 / 不归护栏管（非受管工具、参数没解析成 dict、路径参数缺失）
+- **反对**：这条 call 的路径落在白名单外 → 其 call_id 出现在裁决表里。
+  arguments 是 dict 还是可解析的 str 都算数：护栏自己把 str 解析一遍，不因为
+  上游没给出结构就免检
+- **不反对**：路径在册 / 不归护栏管（非受管工具、参数解析不出对象、路径参数缺失）
 
 另有两组用例守着护栏在事件链上的位置：
 
@@ -21,6 +23,7 @@ skipif 标注）。
 from __future__ import annotations
 
 import copy
+import json
 import sys
 
 import pytest
@@ -302,16 +305,47 @@ async def test_覆盖了filesystem里全部带路径参数的工具(guard, works
 
 
 @pytest.mark.asyncio
-async def test_参数未解析成功时跳过护栏(guard, workspace):
-    """provider 尽力解析后仍是 str = 这个调用本来就走不通执行路径。
+async def test_参数是合法JSON字符串时照样拦(guard, workspace):
+    """arguments 是 str 但解析得出对象：护栏自己解析后再判路径。
+
+    上游解析失败留下的 wire 原文、或 session 回放给的字符串，都可能是合法 JSON。
+    护栏必须自己拿准判据所需的数据，否则"护栏只认 dict"就成了绕过口子。
+    """
+    tail = _ChainTail()
+    r = await guard.file_sys_path_guard(
+        make_payload(
+            make_call(
+                "越界",
+                "write_file",
+                json.dumps({"file_path": str(workspace / "dataset" / "b.md"), "content": "x"}),
+            ),
+            make_call(
+                "在册",
+                "write_file",
+                json.dumps({"file_path": str(workspace / "user" / "a.md"), "content": "x"}),
+            ),
+        ),
+        tail,
+    )
+
+    assert set(r) == {"越界"}, "str 形态的合法 JSON 也要被护栏检查"
+    assert str(workspace / "dataset" / "b.md") in r["越界"]["reason"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "raw",
+    ['{"file_path": ', "not json", "[1, 2]", "123", "null", '"just a string"'],
+    ids=["截断的JSON", "非JSON文本", "数组", "数字", "null", "纯字符串"],
+)
+async def test_参数解析不出对象时跳过护栏(guard, raw):
+    """解析不出 JSON 对象 = 这个调用本来就走不通执行路径。
 
     跳过它不产生"绕过护栏执行危险动作"的口子（见 ADR 2026-09-10 决策 3），故不反对。
     """
     tail = _ChainTail()
     r = await guard.file_sys_path_guard(
-        make_payload(
-            make_call("c1", "read_file", '{"file_path": "' + str(workspace / "dataset" / "x.db"))
-        ),
+        make_payload(make_call("c1", "read_file", raw)),
         tail,
     )
 
